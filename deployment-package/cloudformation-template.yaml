@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Masquerade - High-Performance Video Processing Application CloudFormation Template'
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    ConstraintDescription: must be the name of an existing EC2 KeyPair
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+    AllowedValues:
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    Description: EC2 instance type for video processing
+
+  DBName:
+    Type: String
+    Default: maquerade
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: PostgreSQL database name
+
+  DBUsername:
+    Type: String
+    Default: postgres
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: PostgreSQL database username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9!@#$%^&*]*'
+    Description: PostgreSQL database password (min 8 characters)
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: PostgreSQL database allocated storage in GB
+
+Resources:
+  # VPC and Networking
+  MaquaradeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: maquerade-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: maquerade-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: maquerade-public-subnet-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: maquerade-private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: maquerade-private-subnet-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Tags:
+      - Key: Name
+        Value: maquerade-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MaquaradeVPC
+      Tags:
+        - Key: Name
+          Value: maquerade-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRoute1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRoute2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: maquerade-alb-sg
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref MaquaradeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: maquerade-alb-sg
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: maquerade-ec2-sg
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref MaquaradeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: maquerade-ec2-sg
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: maquerade-rds-sg
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref MaquaradeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: maquerade-rds-sg
+
+  # RDS PostgreSQL Database
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: maquerade-db-subnet-group
+
+  MaquaradeDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: maquerade-db
+      Engine: postgres
+      EngineVersion: '16.1'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      MultiAZ: false
+      StorageEncrypted: true
+      EnableIAMDatabaseAuthentication: false
+      Tags:
+        - Key: Name
+          Value: maquerade-database
+
+  # IAM Role for EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: maquerade-ec2-role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Instance
+  MaquaradeInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: MaquaradeDatabase
+    Properties:
+      ImageId: !Sub
+        - ami-${ImageId}
+        - ImageId: !If
+            - IsUSEast1
+            - '0c55b45d7c5d7a09e'  # Ubuntu 22.04 LTS
+            - '0c55b45d7c5d7a09e'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Update system
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install Node.js 20
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          apt-get install -y nodejs
+          
+          # Install FFmpeg
+          apt-get install -y ffmpeg ffmpeg-devel
+          
+          # Install PM2 globally
+          npm install -g pm2
+          
+          # Create application directory
+          mkdir -p /opt/maquerade
+          cd /opt/maquerade
+          
+          # Clone or download application (adjust this based on your repo)
+          # For now, we'll create a placeholder
+          git clone https://github.com/yourusername/maquerade.git . || echo "Clone failed, please manually deploy"
+          
+          # Install dependencies
+          cd /opt/maquerade
+          npm install
+          
+          # Set environment variables
+          cat > /opt/maquerade/.env.production << 'EOF'
+          NODE_ENV=production
+          PORT=5000
+          DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${MaquaradeDatabase.Endpoint.Address}:5432/${DBName}
+          EOF
+          
+          # Build application
+          npm run build
+          
+          # Setup PM2 startup
+          pm2 startup systemd -u ubuntu --hp /home/ubuntu
+          pm2 start ecosystem.config.js --env production
+          pm2 save
+          
+          # Create systemd service for PM2
+          systemctl enable pm2-ubuntu
+          
+          # Configure nginx as reverse proxy (optional)
+          apt-get install -y nginx
+          
+          cat > /etc/nginx/sites-available/maquerade << 'EOF'
+          upstream maquerade {
+              server localhost:5000;
+          }
+          
+          server {
+              listen 80;
+              server_name _;
+              client_max_body_size 500M;
+              
+              location / {
+                  proxy_pass http://maquerade;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          EOF
+          
+          ln -sf /etc/nginx/sites-available/maquerade /etc/nginx/sites-enabled/
+          rm -f /etc/nginx/sites-enabled/default
+          nginx -t
+          systemctl enable nginx
+          systemctl start nginx
+          
+          # Log deployment completion
+          echo "Masquerade deployment completed at $(date)" > /var/log/maquerade-deploy.log
+      Tags:
+        - Key: Name
+          Value: maquerade-app-server
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: maquerade-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: maquerade-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: maquerade-tg
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref MaquaradeVPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref MaquaradeInstance
+          Port: 5000
+      Tags:
+        - Key: Name
+          Value: maquerade-target-group
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !GetAtt ApplicationLoadBalancer.LoadBalancerArn
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !GetAtt TargetGroup.TargetGroupArn
+
+Conditions:
+  IsUSEast1: !Equals [!Ref 'AWS::Region', us-east-1]
+
+Outputs:
+  LoadBalancerURL:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerURL'
+
+  EC2InstancePublicIP:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt MaquaradeInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2PublicIP'
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt MaquaradeDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt MaquaradeDatabase.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  StackName:
+    Description: CloudFormation Stack Name
+    Value: !Ref 'AWS::StackName'
