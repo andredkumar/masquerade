@@ -7,6 +7,7 @@ import { insertVideoJobSchema, type FileInfo } from "@shared/schema";
 import { VideoProcessor } from "./services/videoProcessor";
 import { FrameExtractor } from "./services/frameExtractor";
 import { IntentParser } from "./services/intentParser";
+import { AIInferenceClient } from "./services/aiInferenceClient";
 import path from "path";
 import fs from "fs";
 
@@ -471,6 +472,98 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Intent parsing error:", error);
       res.status(500).json({
         error: error instanceof Error ? error.message : "Failed to parse intent",
+      });
+    }
+  });
+
+  // ── AI: Run inference on a single frame ──────────────────────
+  app.post("/api/ai/infer", async (req, res) => {
+    try {
+      const { jobId, frameNumber, command } = req.body;
+
+      if (!jobId || frameNumber === undefined || !command) {
+        return res.status(400).json({
+          error: "jobId, frameNumber, and command are required",
+        });
+      }
+
+      // 1. Fetch the job
+      const job = await storage.getVideoJob(jobId);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      // 2. Parse the command
+      const parser = new IntentParser();
+      const parsedIntent = await parser.parse(command.trim());
+      console.log(`🧠 Parsed intent: ${parsedIntent.intent} → ${parsedIntent.target} (confidence: ${parsedIntent.confidence})`);
+
+      if (parsedIntent.intent === 'clarify') {
+        return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
+      }
+
+      // 3. Load the frame as base64 PNG
+      //    Frames are stored at output/{jobId}/frames/frame_{number}.png
+      //    or we extract fresh from the source file
+      let imageBase64: string;
+
+      const framePath = path.join('output', jobId, 'frames', `frame_${String(frameNumber).padStart(4, '0')}.png`);
+      const altFramePath = path.join('output', jobId, 'frames', `frame_${frameNumber}.png`);
+
+      if (fs.existsSync(framePath)) {
+        imageBase64 = fs.readFileSync(framePath).toString('base64');
+      } else if (fs.existsSync(altFramePath)) {
+        imageBase64 = fs.readFileSync(altFramePath).toString('base64');
+      } else {
+        // Try extracting the frame on the fly from the source file
+        try {
+          const extractor = new FrameExtractor();
+          const frameBuffer = await extractor.extractFirstFrame(job.filePath);
+          imageBase64 = frameBuffer.toString('base64');
+        } catch (extractErr) {
+          return res.status(404).json({
+            error: `Frame ${frameNumber} not found and could not be extracted`,
+          });
+        }
+      }
+
+      // 4. Call the AI inference service
+      const aiClient = new AIInferenceClient();
+      const result = await aiClient.infer({
+        model: 'sam2',
+        imageBase64,
+        intent: parsedIntent,
+      });
+
+      // 5. Return the result
+      res.json({
+        parsedIntent,
+        maskBase64: result.maskBase64,
+        confidence: result.confidence,
+        modelUsed: result.modelUsed,
+        inferenceMs: result.inferenceMs,
+      });
+    } catch (error) {
+      console.error("AI inference error:", error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "AI inference failed",
+      });
+    }
+  });
+
+  // ── AI: Health check for the Python AI service ───────────────
+  app.get("/api/ai/status", async (_req, res) => {
+    try {
+      const aiClient = new AIInferenceClient();
+      const available = await aiClient.isAvailable();
+      res.json({
+        aiServiceAvailable: available,
+        aiServiceUrl: process.env.AI_SERVICE_URL || 'http://localhost:8000',
+      });
+    } catch (error) {
+      res.json({
+        aiServiceAvailable: false,
+        aiServiceUrl: process.env.AI_SERVICE_URL || 'http://localhost:8000',
       });
     }
   });
