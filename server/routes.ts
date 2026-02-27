@@ -6,6 +6,7 @@ import { storage } from "./storage";
 import { insertVideoJobSchema, type FileInfo } from "@shared/schema";
 import { VideoProcessor } from "./services/videoProcessor";
 import { FrameExtractor } from "./services/frameExtractor";
+import { IntentParser } from "./services/intentParser";
 import path from "path";
 import fs from "fs";
 
@@ -449,6 +450,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Download error:", error);
       res.status(500).json({ 
         error: error instanceof Error ? error.message : "Download failed" 
+      });
+    }
+  });
+
+  // ── AI: Parse natural language command into structured intent ──
+  app.post("/api/ai/parse-intent", async (req, res) => {
+    try {
+      const { command } = req.body;
+
+      if (!command || typeof command !== 'string' || command.trim().length === 0) {
+        return res.status(400).json({ error: "command is required and must be a non-empty string" });
+      }
+
+      const parser = new IntentParser();
+      const result = await parser.parse(command.trim());
+
+      res.json(result);
+    } catch (error) {
+      console.error("Intent parsing error:", error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Failed to parse intent",
       });
     }
   });

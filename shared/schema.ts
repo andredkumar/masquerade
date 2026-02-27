@@ -110,6 +110,16 @@ export interface OutputSettings {
   aspectRatioMode: 'stretch' | 'letterbox' | 'crop';
 }
 
+// AI intent parsing result
+export interface ParsedIntent {
+  intent: 'segment' | 'classify' | 'detect' | 'label' | 'export' | 'clarify';
+  target: string;          // e.g. "pleural effusion", "b-line", "view"
+  output: string;          // e.g. "mask", "label", "bounding_box"
+  temporal: boolean;       // true if the command implies tracking over time
+  confidence: number;      // 0-1, how confident the parser is
+  clarifyPrompt?: string;  // if intent === 'clarify', the question to ask the user
+}
+
 export interface ProcessingProgress {
   jobId: string;
   stage: 'uploading' | 'extracting' | 'processing' | 'exporting' | 'completed' | 'failed' | 'ready' | 'error';
