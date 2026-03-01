@@ -5,6 +5,7 @@ import MaskingCanvas from "@/components/MaskingCanvas";
 import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
+import CommandInput from "@/components/CommandInput";
 import { Settings, Video } from "lucide-react";
 import type { MaskData, OutputSettings } from "@shared/schema";
 
@@ -18,6 +19,7 @@ export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastProcessedSettings, setLastProcessedSettings] = useState<OutputSettings | null>(null);
   const [showCompletedStatus, setShowCompletedStatus] = useState(false);
+  const [currentFrame, setCurrentFrame] = useState(0);
 
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
@@ -56,6 +58,16 @@ export default function Home() {
     setIsProcessing(true);
     setLastProcessedSettings(outputSettings);
     setShowCompletedStatus(false);
+  };
+
+  const handleAiMaskGenerated = (maskBase64: string) => {
+    const aiMask: MaskData = {
+      type: 'freeform',
+      coordinates: { x: 0, y: 0, width: 0, height: 0 },
+      opacity: 75,
+      canvasDataUrl: `data:image/png;base64,${maskBase64}`,
+    };
+    handleMaskUpdate(aiMask);
   };
 
   return (
@@ -110,11 +122,26 @@ export default function Home() {
               <h2 className="text-lg font-semibold">Masking Tools</h2>
             </div>
           </div>
-          <MaskingTools 
+          <MaskingTools
             selectedTool={selectedTool}
             onToolChange={setSelectedTool}
             maskData={maskData}
             onMaskUpdate={handleMaskUpdate}
+          />
+
+          {/* AI Command */}
+          <div className="p-4 border-b border-border">
+            <div className="flex items-center gap-2 mb-2">
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-sm font-medium ${currentJob ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
+                AI
+              </div>
+              <h2 className="text-lg font-semibold">AI Command</h2>
+            </div>
+          </div>
+          <CommandInput
+            jobId={currentJob}
+            currentFrame={currentFrame}
+            onMaskGenerated={handleAiMaskGenerated}
           />
         </aside>
 
