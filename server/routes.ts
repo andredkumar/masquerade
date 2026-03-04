@@ -504,6 +504,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // 3. Extract frame in-memory from the source file (never written to disk)
       //    Privacy-first: frame buffer lives only for this request, then is GC'd
+      const resolvedPath = path.resolve(job.filePath);
+      console.log(`🔍 [AI infer] job.filePath (from DB): "${job.filePath}"`);
+      console.log(`🔍 [AI infer] process.cwd(): "${process.cwd()}"`);
+      console.log(`🔍 [AI infer] resolved absolute path: "${resolvedPath}"`);
+      console.log(`🔍 [AI infer] fs.existsSync(job.filePath): ${fs.existsSync(job.filePath)}`);
+      console.log(`🔍 [AI infer] fs.existsSync(resolvedPath): ${fs.existsSync(resolvedPath)}`);
+
       let imageBase64: string;
       try {
         const frameBuffer = await frameExtractor.extractFirstFrame(job.filePath);
