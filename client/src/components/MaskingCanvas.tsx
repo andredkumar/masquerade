@@ -11,6 +11,7 @@ interface MaskingCanvasProps {
   onMaskUpdate: (maskData: MaskData) => void;
   zoom: number;
   onZoomChange: (zoom: number) => void;
+  maskData?: MaskData | null;
 }
 
 declare global {
@@ -19,12 +20,13 @@ declare global {
   }
 }
 
-export default function MaskingCanvas({ 
-  firstFrame, 
-  selectedTool, 
-  onMaskUpdate, 
-  zoom, 
-  onZoomChange 
+export default function MaskingCanvas({
+  firstFrame,
+  selectedTool,
+  onMaskUpdate,
+  zoom,
+  onZoomChange,
+  maskData: externalMaskData
 }: MaskingCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -253,6 +255,33 @@ export default function MaskingCanvas({
       canvas.renderAll();
     });
   }, [firstFrame]);
+
+  // Render AI-generated mask overlay when externalMaskData has a canvasDataUrl
+  useEffect(() => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas || !externalMaskData?.canvasDataUrl) return;
+
+    window.fabric.Image.fromURL(externalMaskData.canvasDataUrl, (img: any) => {
+      // Remove any previous AI overlay (tagged objects)
+      const existing = canvas.getObjects().filter((o: any) => o._aiOverlay);
+      existing.forEach((o: any) => canvas.remove(o));
+
+      // Scale the mask image to match the canvas dimensions
+      img.set({
+        left: 0,
+        top: 0,
+        scaleX: canvas.width / img.width,
+        scaleY: canvas.height / img.height,
+        selectable: false,
+        evented: false,
+        opacity: 0.5,
+      });
+      (img as any)._aiOverlay = true;
+
+      canvas.add(img);
+      canvas.renderAll();
+    });
+  }, [externalMaskData]);
 
   // Handle tool changes
   useEffect(() => {
