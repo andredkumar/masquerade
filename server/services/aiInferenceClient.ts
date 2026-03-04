@@ -1,12 +1,13 @@
 import sharp from 'sharp';
 import type { ParsedIntent } from '@shared/schema';
+import type { ModelConfig } from './modelRouter';
 
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8000';
 
 // ── Interfaces ────────────────────────────────────────────────
 
 export interface InferenceRequest {
-  model: 'sam2' | 'medsam' | 'resnet50' | 'default';
+  modelConfig: ModelConfig;
   imageBase64: string;   // PNG frame as base64 string (no data: prefix)
   intent: ParsedIntent;  // from shared/schema.ts
 }
@@ -39,7 +40,7 @@ export class AIInferenceClient {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: request.model,
+          model: request.modelConfig.id,
           image_base64: request.imageBase64,
           prompt: {
             intent: request.intent.intent,
@@ -60,13 +61,13 @@ export class AIInferenceClient {
       return {
         maskBase64: data.mask_base64,
         confidence: data.confidence,
-        modelUsed: request.model,
+        modelUsed: request.modelConfig.id,
         inferenceMs: Date.now() - startMs,
       };
     } catch (err) {
       // Always return mock when AI service is unavailable
       console.warn('⚠️  AI service unavailable — returning mock mask');
-      return this.generateMockResult(request.model, startMs);
+      return this.generateMockResult(request.modelConfig.id, startMs);
     }
   }
 

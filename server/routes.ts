@@ -8,6 +8,7 @@ import { VideoProcessor } from "./services/videoProcessor";
 import { FrameExtractor } from "./services/frameExtractor";
 import { IntentParser } from "./services/intentParser";
 import { AIInferenceClient } from "./services/aiInferenceClient";
+import { ModelRouter } from "./services/modelRouter";
 import path from "path";
 import fs from "fs";
 
@@ -509,15 +510,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      // 4. Call the AI inference service
+      // 4. Route to the best model
+      const router = new ModelRouter();
+      const modelConfig = router.route(parsedIntent);
+      console.log(`🔀 Model router selected: ${modelConfig.id} (${modelConfig.name}) — type: ${modelConfig.type}, available: ${modelConfig.available}`);
+
+      // 5. Call the AI inference service
       const aiClient = new AIInferenceClient();
       const result = await aiClient.infer({
-        model: 'sam2',
+        modelConfig,
         imageBase64: frameBase64,
         intent: parsedIntent,
       });
 
-      // 5. Return the result
+      // 6. Return the result
       res.json({
         parsedIntent,
         maskBase64: result.maskBase64,
@@ -546,6 +552,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({
         aiServiceAvailable: false,
         aiServiceUrl: process.env.AI_SERVICE_URL || 'http://localhost:8000',
+      });
+    }
+  });
+
+  // ── AI: List available models ─────────────────────────────────
+  app.get("/api/ai/models", (_req, res) => {
+    try {
+      const router = new ModelRouter();
+      res.json({ models: router.listModels() });
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Failed to load model registry",
       });
     }
   });

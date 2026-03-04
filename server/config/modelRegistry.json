@@ -1,0 +1,38 @@
+[
+  {
+    "id": "sam2",
+    "name": "SAM2",
+    "type": "segmenter",
+    "intents": ["segment"],
+    "targets": ["*"],
+    "inputShape": "1024x1024",
+    "license": "Apache-2.0",
+    "gpuRequired": true,
+    "version": "1.0",
+    "available": true
+  },
+  {
+    "id": "medsam",
+    "name": "MedSAM",
+    "type": "segmenter",
+    "intents": ["segment"],
+    "targets": ["pleural effusion", "pleural line", "b-line", "pericardial effusion"],
+    "inputShape": "1024x1024",
+    "license": "Apache-2.0",
+    "gpuRequired": true,
+    "version": "1.0",
+    "available": false
+  },
+  {
+    "id": "resnet50_view",
+    "name": "ResNet50 View Classifier",
+    "type": "classifier",
+    "intents": ["classify"],
+    "targets": ["view", "*"],
+    "inputShape": "224x224",
+    "license": "Apache-2.0",
+    "gpuRequired": false,
+    "version": "1.0",
+    "available": false
+  }
+]
