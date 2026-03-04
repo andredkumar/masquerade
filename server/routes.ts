@@ -479,11 +479,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ── AI: Run inference on a single frame ──────────────────────
   app.post("/api/ai/infer", async (req, res) => {
     try {
-      const { jobId, frameNumber, command } = req.body;
+      const { jobId, command, frameBase64 } = req.body;
 
-      if (!jobId || frameNumber === undefined || !command) {
+      if (!jobId || !command) {
         return res.status(400).json({
-          error: "jobId, frameNumber, and command are required",
+          error: "jobId and command are required",
         });
       }
 
@@ -502,22 +502,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Extract frame in-memory from the source file (never written to disk)
-      //    Privacy-first: frame buffer lives only for this request, then is GC'd
-      const resolvedPath = path.resolve(job.filePath);
-      console.log(`🔍 [AI infer] job.filePath (from DB): "${job.filePath}"`);
-      console.log(`🔍 [AI infer] process.cwd(): "${process.cwd()}"`);
-      console.log(`🔍 [AI infer] resolved absolute path: "${resolvedPath}"`);
-      console.log(`🔍 [AI infer] fs.existsSync(job.filePath): ${fs.existsSync(job.filePath)}`);
-      console.log(`🔍 [AI infer] fs.existsSync(resolvedPath): ${fs.existsSync(resolvedPath)}`);
-
-      let imageBase64: string;
-      try {
-        const frameBuffer = await frameExtractor.extractFirstFrame(job.filePath);
-        imageBase64 = frameBuffer.toString('base64');
-      } catch (extractErr) {
-        return res.status(404).json({
-          error: `Frame ${frameNumber} could not be extracted from source file`,
+      // 3. Use frame base64 sent directly from the frontend (already in browser memory)
+      if (!frameBase64) {
+        return res.status(400).json({
+          error: "frameBase64 is required — the client must send the displayed frame",
         });
       }
 
@@ -525,7 +513,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const aiClient = new AIInferenceClient();
       const result = await aiClient.infer({
         model: 'sam2',
-        imageBase64,
+        imageBase64: frameBase64,
         intent: parsedIntent,
       });
 

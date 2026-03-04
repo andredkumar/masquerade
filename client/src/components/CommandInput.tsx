@@ -6,12 +6,13 @@ import { Loader2, Sparkles, AlertTriangle, CheckCircle2 } from "lucide-react";
 interface CommandInputProps {
   jobId: string | null;
   currentFrame: number;
+  firstFrameBase64: string | null;
   onMaskGenerated: (maskBase64: string) => void;
 }
 
 type Stage = 'idle' | 'parsing' | 'inferring' | 'done' | 'error' | 'clarify';
 
-export default function CommandInput({ jobId, currentFrame, onMaskGenerated }: CommandInputProps) {
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, onMaskGenerated }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
@@ -57,8 +58,8 @@ export default function CommandInput({ jobId, currentFrame, onMaskGenerated }: C
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           jobId,
-          frameNumber: currentFrame,
           command: command.trim(),
+          frameBase64: firstFrameBase64?.replace('data:image/png;base64,', ''),
         }),
       });
 

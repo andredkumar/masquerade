@@ -141,6 +141,7 @@ export default function Home() {
           <CommandInput
             jobId={currentJob}
             currentFrame={currentFrame}
+            firstFrameBase64={firstFrame}
             onMaskGenerated={handleAiMaskGenerated}
           />
         </aside>
