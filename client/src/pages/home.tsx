@@ -61,6 +61,7 @@ export default function Home() {
   };
 
   const handleAiMaskGenerated = (maskBase64: string) => {
+    console.log('🎭 handleAiMaskGenerated called:', { maskBase64Length: maskBase64?.length });
     const aiMask: MaskData = {
       type: 'freeform',
       coordinates: { x: 0, y: 0, width: 0, height: 0 },
@@ -149,12 +150,13 @@ export default function Home() {
         {/* Main Content Area */}
         <main className="flex-1 flex flex-col">
           <div className="flex-1 p-6 relative">
-            <MaskingCanvas 
+            <MaskingCanvas
               firstFrame={firstFrame}
               selectedTool={selectedTool}
               onMaskUpdate={handleMaskUpdate}
               zoom={canvasZoom}
               onZoomChange={setCanvasZoom}
+              maskData={maskData}
             />
             
             {/* Processing Started Indicator - Top Right of Canvas */}
