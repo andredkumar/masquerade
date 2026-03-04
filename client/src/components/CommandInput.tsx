@@ -8,11 +8,20 @@ interface CommandInputProps {
   currentFrame: number;
   firstFrameBase64: string | null;
   onMaskGenerated: (maskBase64: string) => void;
+  selectedTask?: string;
 }
+
+const TASK_PLACEHOLDERS: Record<string, string> = {
+  segment: 'e.g. segment the pleural effusion',
+  classify: 'e.g. classify this view',
+  detect: 'e.g. detect all b-lines',
+  label: 'e.g. label the pleural line',
+  export: 'e.g. export all labeled effusions',
+};
 
 type Stage = 'idle' | 'parsing' | 'inferring' | 'done' | 'error' | 'clarify';
 
-export default function CommandInput({ jobId, currentFrame, firstFrameBase64, onMaskGenerated }: CommandInputProps) {
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, onMaskGenerated, selectedTask = 'segment' }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
@@ -100,7 +109,7 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, on
           value={command}
           onChange={(e) => setCommand(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder='e.g. segment the pleural effusion'
+          placeholder={TASK_PLACEHOLDERS[selectedTask] || TASK_PLACEHOLDERS.segment}
           disabled={!jobId || isLoading}
           className="flex-1 text-sm"
         />

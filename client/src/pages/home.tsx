@@ -6,6 +6,7 @@ import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
+import TaskSelector from "@/components/TaskSelector";
 import { Settings, Video } from "lucide-react";
 import type { MaskData, OutputSettings } from "@shared/schema";
 
@@ -20,6 +21,7 @@ export default function Home() {
   const [lastProcessedSettings, setLastProcessedSettings] = useState<OutputSettings | null>(null);
   const [showCompletedStatus, setShowCompletedStatus] = useState(false);
   const [currentFrame, setCurrentFrame] = useState(0);
+  const [selectedTask, setSelectedTask] = useState('segment');
 
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
@@ -138,11 +140,16 @@ export default function Home() {
               <h2 className="text-lg font-semibold">AI Command</h2>
             </div>
           </div>
+          <TaskSelector
+            selectedTask={selectedTask}
+            onTaskChange={setSelectedTask}
+          />
           <CommandInput
             jobId={currentJob}
             currentFrame={currentFrame}
             firstFrameBase64={firstFrame}
             onMaskGenerated={handleAiMaskGenerated}
+            selectedTask={selectedTask}
           />
         </aside>
 
