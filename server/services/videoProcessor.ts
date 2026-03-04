@@ -333,7 +333,7 @@ export class VideoProcessor {
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
       // Create output ZIP
-      const zipPath = await this.createOutputZip(jobId, processedFrames, metadata, outputSettings);
+      const zipPath = await this.createOutputZip(jobId, processedFrames, metadata, outputSettings, maskData);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
@@ -576,7 +576,7 @@ export class VideoProcessor {
         height: firstImageDimensions.height,
         frameRate: 1,
         totalFrames: imageFiles.length
-      }, outputSettings, processedImages);
+      }, outputSettings, processedImages, maskData);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
@@ -617,7 +617,8 @@ export class VideoProcessor {
     jobId: string,
     metadata: any,
     outputSettings: OutputSettings,
-    processedImages: Array<{ imageNumber: number; buffer: Buffer; originalName: string }>
+    processedImages: Array<{ imageNumber: number; buffer: Buffer; originalName: string }>,
+    maskData?: MaskData
   ): Promise<string> {
     const zipFilename = `processed_images_${jobId}.zip`;
     const zipPath = path.join(this.outputDir, zipFilename);
@@ -653,8 +654,22 @@ export class VideoProcessor {
 
         // Get all processed images from temp folder
         const processedImagePaths = await TempFolderManager.getProcessedImages(jobId);
-        
+
         console.log(`📦 Found ${processedImagePaths.length} processed images in temp folder`);
+
+        // Add manifest.json as the FIRST entry
+        const outputSize = this.resolveOutputSize(outputSettings, metadata);
+        const frameNumbers = processedImages.map(img => img.imageNumber);
+        const manifest = this.buildManifest(
+          jobId,
+          processedImages[0]?.originalName || 'unknown',
+          frameNumbers,
+          outputSize,
+          outputSettings,
+          maskData
+        );
+        archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+        console.log(`📦 Added manifest.json`);
         
         if (processedImagePaths.length === 0) {
           console.warn(`⚠️ No processed images found in temp folder for job ${jobId}`);
@@ -685,6 +700,73 @@ export class VideoProcessor {
         reject(error);
       }
     });
+  }
+
+  /**
+   * Resolve the output dimensions from outputSettings + metadata.
+   */
+  private resolveOutputSize(
+    outputSettings: OutputSettings,
+    metadata: any
+  ): { width: number; height: number } {
+    if ((outputSettings as any).width && (outputSettings as any).height) {
+      return { width: (outputSettings as any).width, height: (outputSettings as any).height };
+    }
+    if (outputSettings.size === 'custom') {
+      return { width: outputSettings.customWidth || 512, height: outputSettings.customHeight || 512 };
+    }
+    if (outputSettings.size === 'original') {
+      return { width: metadata.width || 512, height: metadata.height || 512 };
+    }
+    if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
+      const [w, h] = outputSettings.size.split('x').map(Number);
+      return { width: w, height: h };
+    }
+    return { width: 512, height: 512 };
+  }
+
+  /**
+   * Build the manifest.json object for a ZIP export.
+   */
+  private buildManifest(
+    jobId: string,
+    sourceFilename: string,
+    frameNumbers: number[],
+    outputSize: { width: number; height: number },
+    outputSettings: OutputSettings,
+    maskData?: MaskData
+  ): Record<string, unknown> {
+    const maskType = maskData?.canvasDataUrl ? 'ai_generated' : (maskData?.type || 'rectangle');
+
+    const determineSplit = (frameNumber: number): string => {
+      const mod = frameNumber % 10;
+      if (mod <= 7) return 'train';
+      if (mod === 8) return 'val';
+      return 'test';
+    };
+
+    const frames = frameNumbers.map(frameNumber => {
+      const paddedNum = String(frameNumber).padStart(4, '0');
+      return {
+        filename: `frame_${paddedNum}.${outputSettings.format}`,
+        frame_number: frameNumber,
+        split: determineSplit(frameNumber),
+        has_mask: true,
+      };
+    });
+
+    return {
+      masquerade_version: '1.0',
+      export_timestamp: new Date().toISOString(),
+      job_id: jobId,
+      source_filename: sourceFilename,
+      total_frames: frameNumbers.length,
+      mask_type: maskType,
+      output_size: outputSize,
+      output_format: outputSettings.format,
+      splits: { train: 0.8, val: 0.1, test: 0.1 },
+      frames,
+    };
   }
 
   /**
@@ -959,13 +1041,17 @@ export class VideoProcessor {
     jobId: string,
     processedFrames: Array<{ frameNumber: number; buffer: Buffer }>,
     metadata: any,
-    outputSettings: OutputSettings
+    outputSettings: OutputSettings,
+    maskData?: MaskData
   ): Promise<string> {
     const zipFilename = `processed_frames_${jobId}.zip`;
     const zipPath = path.join(this.outputDir, zipFilename);
 
     console.log(`📦 Creating ZIP at: ${zipPath}`);
     console.log(`📦 Output directory: ${this.outputDir}`);
+
+    // Fetch job info before entering the Promise constructor
+    const job = await storage.getVideoJob(jobId);
 
     return new Promise((resolve, reject) => {
       const output = createWriteStream(zipPath);
@@ -995,11 +1081,24 @@ export class VideoProcessor {
       // Add processed frames in a frames folder - only include successful frames in ZIP
       const successfulFrames = processedFrames.filter(frame => frame.buffer.length > 0);
       console.log(`📦 Found ${successfulFrames.length} successful frames (${processedFrames.length} total attempted)`);
-      
+
       if (successfulFrames.length === 0) {
         console.warn(`⚠️ No successful frames to add to ZIP for job ${jobId}`);
       }
-      
+
+      // Add manifest.json as the FIRST entry
+      const outputSize = this.resolveOutputSize(outputSettings, metadata);
+      const manifest = this.buildManifest(
+        jobId,
+        job?.filename || 'unknown',
+        successfulFrames.map(f => f.frameNumber),
+        outputSize,
+        outputSettings,
+        maskData
+      );
+      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+      console.log(`📦 Added manifest.json`);
+
       successfulFrames.forEach(({ frameNumber, buffer }) => {
         const filename = `frames/frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
         console.log(`📦 Adding frame ${frameNumber} (${buffer.length} bytes) as ${filename}`);
