@@ -1,10 +1,6 @@
 import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import path from 'path';
 import type { ParsedIntent } from '@shared/schema';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // ── Interfaces ────────────────────────────────────────────────
 
@@ -27,7 +23,7 @@ export class ModelRouter {
   private registry: ModelConfig[];
 
   constructor() {
-    const registryPath = join(__dirname, '..', 'config', 'modelRegistry.json');
+    const registryPath = path.join(process.cwd(), 'server', 'config', 'modelRegistry.json');
     this.registry = JSON.parse(readFileSync(registryPath, 'utf-8'));
   }
 
