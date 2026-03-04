@@ -61,7 +61,6 @@ export default function Home() {
   };
 
   const handleAiMaskGenerated = (maskBase64: string) => {
-    console.log('🎭 handleAiMaskGenerated called:', { maskBase64Length: maskBase64?.length });
     const aiMask: MaskData = {
       type: 'freeform',
       coordinates: { x: 0, y: 0, width: 0, height: 0 },

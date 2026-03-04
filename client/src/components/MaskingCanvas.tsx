@@ -258,7 +258,6 @@ export default function MaskingCanvas({
 
   // Render AI-generated mask overlay when externalMaskData has a canvasDataUrl
   useEffect(() => {
-    console.log('🎨 Canvas useEffect triggered:', { hasMaskData: !!externalMaskData, hasCanvasDataUrl: !!externalMaskData?.canvasDataUrl, canvasDataUrlLength: externalMaskData?.canvasDataUrl?.length });
     const canvas = fabricCanvasRef.current;
     if (!canvas || !externalMaskData?.canvasDataUrl) return;
 

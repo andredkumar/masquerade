@@ -71,7 +71,6 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, on
       const result = await inferRes.json();
 
       if (result.maskBase64) {
-        console.log('🎭 Mask received, calling onMaskGenerated:', { maskBase64Length: result.maskBase64?.length, confidence: result.confidence, modelUsed: result.modelUsed });
         onMaskGenerated(result.maskBase64);
       }
 
