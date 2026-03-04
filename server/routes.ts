@@ -502,29 +502,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Load the frame as base64 PNG
-      //    Frames are stored at output/{jobId}/frames/frame_{number}.png
-      //    or we extract fresh from the source file
+      // 3. Extract frame in-memory from the source file (never written to disk)
+      //    Privacy-first: frame buffer lives only for this request, then is GC'd
       let imageBase64: string;
-
-      const framePath = path.join('output', jobId, 'frames', `frame_${String(frameNumber).padStart(4, '0')}.png`);
-      const altFramePath = path.join('output', jobId, 'frames', `frame_${frameNumber}.png`);
-
-      if (fs.existsSync(framePath)) {
-        imageBase64 = fs.readFileSync(framePath).toString('base64');
-      } else if (fs.existsSync(altFramePath)) {
-        imageBase64 = fs.readFileSync(altFramePath).toString('base64');
-      } else {
-        // Try extracting the frame on the fly from the source file
-        try {
-          const extractor = new FrameExtractor();
-          const frameBuffer = await extractor.extractFirstFrame(job.filePath);
-          imageBase64 = frameBuffer.toString('base64');
-        } catch (extractErr) {
-          return res.status(404).json({
-            error: `Frame ${frameNumber} not found and could not be extracted`,
-          });
-        }
+      try {
+        const frameBuffer = await frameExtractor.extractFirstFrame(job.filePath);
+        imageBase64 = frameBuffer.toString('base64');
+      } catch (extractErr) {
+        return res.status(404).json({
+          error: `Frame ${frameNumber} could not be extracted from source file`,
+        });
       }
 
       // 4. Call the AI inference service
