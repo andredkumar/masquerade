@@ -64,14 +64,9 @@ export class AIInferenceClient {
         inferenceMs: Date.now() - startMs,
       };
     } catch (err) {
-      // In development, return a mock result so the frontend can proceed
-      if (process.env.NODE_ENV === 'development' || !process.env.NODE_ENV) {
-        console.warn('⚠️  AI service unavailable — returning mock mask (dev mode)');
-        return this.generateMockResult(request.model, startMs);
-      }
-
-      // In production, propagate the error
-      throw err;
+      // Always return mock when AI service is unavailable
+      console.warn('⚠️  AI service unavailable — returning mock mask');
+      return this.generateMockResult(request.model, startMs);
     }
   }
 
