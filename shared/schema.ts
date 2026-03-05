@@ -25,6 +25,8 @@ export const videoJobs = pgTable("video_jobs", {
   jobType: text("job_type").notNull().default("video"), // video, images
   fileCount: integer("file_count").notNull().default(1),
   fileList: jsonb("file_list"), // Array of file info for image batches
+  // Session-based AI labels
+  aiLabels: jsonb("ai_labels").default([]),
 });
 
 export const frameProcessingBatches = pgTable("frame_processing_batches", {
@@ -95,6 +97,15 @@ export interface MaskData {
     offsetX: number;
     offsetY: number;
   };
+  // AI label metadata (populated when mask is AI-generated)
+  aiLabel?: {
+    intent: string;
+    target: string;
+    confidence: number | null;
+    model: string;
+  };
+  // Session-based multi-label list
+  aiLabels?: AiLabel[];
 }
 
 export interface OutputSettings {
@@ -108,6 +119,17 @@ export interface OutputSettings {
   parallelThreads: number;
   batchSize: number;
   aspectRatioMode: 'stretch' | 'letterbox' | 'crop';
+}
+
+// AI label stored per-session on the job record
+export interface AiLabel {
+  id: string;        // randomUUID
+  intent: string;
+  target: string;
+  confidence: number | null;
+  model: string;
+  timestamp: string;
+  approved: boolean;
 }
 
 // AI intent parsing result

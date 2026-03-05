@@ -7,7 +7,8 @@ interface CommandInputProps {
   jobId: string | null;
   currentFrame: number;
   firstFrameBase64: string | null;
-  onMaskGenerated: (maskBase64: string) => void;
+  onMaskGenerated: (maskBase64: string, aiLabel?: { intent: string; target: string; confidence: number | null; model: string }) => void;
+  onLabelAdded?: () => void;
   selectedTask?: string;
 }
 
@@ -21,7 +22,7 @@ const TASK_PLACEHOLDERS: Record<string, string> = {
 
 type Stage = 'idle' | 'parsing' | 'inferring' | 'done' | 'error' | 'clarify';
 
-export default function CommandInput({ jobId, currentFrame, firstFrameBase64, onMaskGenerated, selectedTask = 'segment' }: CommandInputProps) {
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
@@ -80,13 +81,21 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, on
       const result = await inferRes.json();
 
       if (result.maskBase64) {
-        onMaskGenerated(result.maskBase64);
+        onMaskGenerated(result.maskBase64, {
+          intent: parsed.intent,
+          target: parsed.target || 'unknown',
+          confidence: result.confidence ?? null,
+          model: result.modelUsed || 'unknown',
+        });
       }
 
       setConfidence(result.confidence);
       setModelUsed(result.modelUsed);
       setStage('done');
       setStatusMessage('Mask generated');
+
+      // Notify parent to refresh label list
+      onLabelAdded?.();
     } catch (err) {
       setStage('error');
       setStatusMessage(err instanceof Error ? err.message : 'Something went wrong');

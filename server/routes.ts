@@ -3,12 +3,13 @@ import { createServer, type Server } from "http";
 import { Server as SocketIOServer } from "socket.io";
 import multer from "multer";
 import { storage } from "./storage";
-import { insertVideoJobSchema, type FileInfo } from "@shared/schema";
+import { insertVideoJobSchema, type FileInfo, type AiLabel } from "@shared/schema";
 import { VideoProcessor } from "./services/videoProcessor";
 import { FrameExtractor } from "./services/frameExtractor";
 import { IntentParser } from "./services/intentParser";
 import { AIInferenceClient } from "./services/aiInferenceClient";
 import { ModelRouter } from "./services/modelRouter";
+import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
 
@@ -503,10 +504,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Use frame base64 sent directly from the frontend (already in browser memory)
-      if (!frameBase64) {
+      // 3. Resolve the frame image: prefer temp folder, fall back to request body
+      let resolvedFrameBase64 = frameBase64;
+      const tempDir = path.join(process.cwd(), 'temp_processed', jobId);
+      if (fs.existsSync(tempDir)) {
+        const pngFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.png')).sort();
+        if (pngFiles.length > 0) {
+          const firstFramePath = path.join(tempDir, pngFiles[0]);
+          resolvedFrameBase64 = fs.readFileSync(firstFramePath).toString('base64');
+          console.log(`📂 Using first frame from temp folder: ${pngFiles[0]}`);
+        }
+      }
+
+      if (!resolvedFrameBase64) {
         return res.status(400).json({
-          error: "frameBase64 is required — the client must send the displayed frame",
+          error: "No frame available — upload and process a video first, or send frameBase64",
         });
       }
 
@@ -519,17 +531,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const aiClient = new AIInferenceClient();
       const result = await aiClient.infer({
         modelConfig,
-        imageBase64: frameBase64,
+        imageBase64: resolvedFrameBase64,
         intent: parsedIntent,
       });
 
-      // 6. Return the result
+      // 6. Store the AI label on the job record
+      const existingLabels = ((job as any).aiLabels || []) as AiLabel[];
+      const newLabel: AiLabel = {
+        id: randomUUID(),
+        intent: parsedIntent.intent,
+        target: parsedIntent.target || 'unknown',
+        confidence: result.confidence ?? null,
+        model: result.modelUsed || 'unknown',
+        timestamp: new Date().toISOString(),
+        approved: true,
+      };
+      await storage.updateVideoJob(jobId, {
+        aiLabels: [...existingLabels, newLabel] as any,
+      });
+
+      // 7. Return the result
       res.json({
         parsedIntent,
         maskBase64: result.maskBase64,
         confidence: result.confidence,
         modelUsed: result.modelUsed,
         inferenceMs: result.inferenceMs,
+        label: newLabel,
       });
     } catch (error) {
       console.error("AI inference error:", error);
@@ -565,6 +593,72 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.status(500).json({
         error: error instanceof Error ? error.message : "Failed to load model registry",
       });
+    }
+  });
+
+  // ── AI Labels: CRUD for session-based labels ─────────────────
+
+  // GET all labels for a job
+  app.get("/api/ai/labels/:jobId", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+      res.json({ labels: ((job as any).aiLabels || []) as AiLabel[] });
+    } catch (error) {
+      console.error("Get labels error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to get labels" });
+    }
+  });
+
+  // PATCH toggle approved on a label
+  app.patch("/api/ai/labels/:jobId/:labelId", async (req, res) => {
+    try {
+      const { approved } = req.body;
+      if (typeof approved !== 'boolean') {
+        return res.status(400).json({ error: "approved (boolean) is required" });
+      }
+
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      const labels = ((job as any).aiLabels || []) as AiLabel[];
+      const idx = labels.findIndex(l => l.id === req.params.labelId);
+      if (idx === -1) {
+        return res.status(404).json({ error: "Label not found" });
+      }
+
+      labels[idx].approved = approved;
+      await storage.updateVideoJob(req.params.jobId, { aiLabels: labels as any });
+      res.json({ label: labels[idx] });
+    } catch (error) {
+      console.error("Patch label error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to update label" });
+    }
+  });
+
+  // DELETE a label
+  app.delete("/api/ai/labels/:jobId/:labelId", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      const labels = ((job as any).aiLabels || []) as AiLabel[];
+      const filtered = labels.filter(l => l.id !== req.params.labelId);
+      if (filtered.length === labels.length) {
+        return res.status(404).json({ error: "Label not found" });
+      }
+
+      await storage.updateVideoJob(req.params.jobId, { aiLabels: filtered as any });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete label error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete label" });
     }
   });
 

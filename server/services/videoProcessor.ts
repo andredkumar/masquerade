@@ -1,6 +1,6 @@
 import { storage } from '../storage';
 import { FrameExtractor } from './frameExtractor';
-import type { VideoJob, MaskData, OutputSettings, ProcessingProgress } from '@shared/schema';
+import type { VideoJob, MaskData, OutputSettings, ProcessingProgress, AiLabel } from '@shared/schema';
 import { Server } from 'socket.io';
 import archiver from 'archiver';
 import { createWriteStream } from 'fs';
@@ -657,6 +657,11 @@ export class VideoProcessor {
 
         console.log(`📦 Found ${processedImagePaths.length} processed images in temp folder`);
 
+        // Filter to approved AI labels only
+        const imgJob = await storage.getVideoJob(jobId);
+        const imgAllLabels = ((imgJob as any)?.aiLabels || []) as AiLabel[];
+        const imgApprovedLabels = imgAllLabels.filter(l => l.approved);
+
         // Add manifest.json as the FIRST entry
         const outputSize = this.resolveOutputSize(outputSettings, metadata);
         const frameNumbers = processedImages.map(img => img.imageNumber);
@@ -666,10 +671,11 @@ export class VideoProcessor {
           frameNumbers,
           outputSize,
           outputSettings,
-          maskData
+          maskData,
+          imgApprovedLabels
         );
         archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-        console.log(`📦 Added manifest.json`);
+        console.log(`📦 Added manifest.json (${imgApprovedLabels.length} approved labels)`);
 
         // Add README.txt as the second entry
         archive.append(this.buildReadme(manifest), { name: 'README.txt' });
@@ -692,7 +698,7 @@ export class VideoProcessor {
 
         // Add metadata CSV if requested
         if (outputSettings.includeMetadata) {
-          const csvContent = this.generateImageMetadataCSV(processedImages, metadata, outputSettings, maskData);
+          const csvContent = this.generateImageMetadataCSV(processedImages, metadata, outputSettings, maskData, imgApprovedLabels);
           archive.append(csvContent, { name: 'metadata.csv' });
           console.log(`📦 Added metadata.csv`);
         }
@@ -738,10 +744,10 @@ export class VideoProcessor {
     frameNumbers: number[],
     outputSize: { width: number; height: number },
     outputSettings: OutputSettings,
-    maskData?: MaskData
+    maskData?: MaskData,
+    approvedLabels?: AiLabel[]
   ): Record<string, unknown> {
     const maskType = maskData?.canvasDataUrl ? 'ai_generated' : (maskData?.type || 'rectangle');
-    const aiLabel = maskData?.aiLabel || null;
 
     const determineSplit = (frameNumber: number): string => {
       const mod = frameNumber % 10;
@@ -750,6 +756,16 @@ export class VideoProcessor {
       return 'test';
     };
 
+    // Build per-frame ai_labels from approved labels
+    const labelsForFrame = (approvedLabels && approvedLabels.length > 0)
+      ? approvedLabels.map(l => ({
+          intent: l.intent,
+          target: l.target,
+          confidence: l.confidence,
+          model: l.model,
+        }))
+      : null;
+
     const frames = frameNumbers.map(frameNumber => {
       const paddedNum = String(frameNumber).padStart(4, '0');
       return {
@@ -757,12 +773,7 @@ export class VideoProcessor {
         frame_number: frameNumber,
         split: determineSplit(frameNumber),
         has_mask: true,
-        ai_label: aiLabel ? {
-          intent: aiLabel.intent,
-          target: aiLabel.target,
-          confidence: aiLabel.confidence,
-          model: aiLabel.model,
-        } : null,
+        ai_labels: labelsForFrame,
       };
     });
 
@@ -776,6 +787,13 @@ export class VideoProcessor {
       output_size: outputSize,
       output_format: outputSettings.format,
       splits: { train: 0.8, val: 0.1, test: 0.1 },
+      ai_labels: approvedLabels?.map(l => ({
+        id: l.id,
+        intent: l.intent,
+        target: l.target,
+        confidence: l.confidence,
+        model: l.model,
+      })) || [],
       frames,
     };
   }
@@ -784,16 +802,22 @@ export class VideoProcessor {
    * Build a human-readable README.txt from manifest data.
    */
   private buildReadme(manifest: Record<string, unknown>): string {
-    const frames = manifest.frames as Array<{ split: string; ai_label: any }>;
+    const frames = manifest.frames as Array<{ split: string }>;
     const splitCounts = { train: 0, val: 0, test: 0 };
     for (const f of frames) {
       if (f.split in splitCounts) splitCounts[f.split as keyof typeof splitCounts]++;
     }
 
-    const aiLabel = frames[0]?.ai_label;
-    const aiLine = aiLabel
-      ? `AI Labels: ${aiLabel.target} (${aiLabel.intent}, ${aiLabel.model}, confidence ${aiLabel.confidence !== null ? (aiLabel.confidence * 100).toFixed(0) + '%' : 'N/A'})`
-      : 'AI Labels: none (manual mask)';
+    const approvedLabels = (manifest.ai_labels || []) as Array<{ target: string; intent: string; model: string; confidence: number | null }>;
+    let aiLines: string;
+    if (approvedLabels.length === 0) {
+      aiLines = 'AI Labels: none (manual mask)';
+    } else {
+      aiLines = `AI Labels (${approvedLabels.length} approved):\n` +
+        approvedLabels.map(l =>
+          `  - ${l.target} (${l.intent}, ${l.model}, confidence ${l.confidence !== null ? (l.confidence * 100).toFixed(0) + '%' : 'N/A'})`
+        ).join('\n');
+    }
 
     return [
       `Masquerade Export — masqueradeimage.com`,
@@ -801,7 +825,7 @@ export class VideoProcessor {
       `Export date: ${manifest.export_timestamp}`,
       `Source file: ${manifest.source_filename}`,
       `Total frames: ${manifest.total_frames}`,
-      aiLine,
+      aiLines,
       `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
       ``,
       `Files:`,
@@ -819,7 +843,8 @@ export class VideoProcessor {
     processedImages: Array<{ imageNumber: number; buffer: Buffer; originalName: string }>,
     metadata: any,
     outputSettings: OutputSettings,
-    maskData?: MaskData
+    maskData?: MaskData,
+    approvedLabels?: AiLabel[]
   ): string {
     const headers = [
       'filename',
@@ -852,13 +877,14 @@ export class VideoProcessor {
       outputHeight = 512;
     }
 
-    const aiTarget = maskData?.aiLabel?.target || '';
-    const aiConfidence = maskData?.aiLabel?.confidence ?? '';
+    const aiTarget = approvedLabels?.map(l => l.target).join('; ') || '';
+    const aiConfidence = approvedLabels?.length
+      ? approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ')
+      : '';
 
     const rows = processedImages.map(({ imageNumber, buffer, originalName }) => {
-      // Generate filename like temp folder naming: image_XXX_original_name.jpg
       const paddedNumber = String(imageNumber + 1).padStart(3, '0');
-      const baseOriginalName = originalName.replace(/\.[^.]+$/, ''); // Remove extension
+      const baseOriginalName = originalName.replace(/\.[^.]+$/, '');
       const filename = `image_${paddedNumber}_${baseOriginalName}.${outputSettings.format}`;
       const timestamp = new Date().toISOString();
       const isSuccessful = buffer.length > 0;
@@ -874,8 +900,8 @@ export class VideoProcessor {
         timestamp,
         buffer.length,
         status,
-        aiTarget,
-        aiConfidence
+        `"${aiTarget}"`,
+        `"${aiConfidence}"`
       ].join(',');
     });
 
@@ -1137,6 +1163,10 @@ export class VideoProcessor {
         console.warn(`⚠️ No successful frames to add to ZIP for job ${jobId}`);
       }
 
+      // Filter to approved AI labels only
+      const allLabels = ((job as any)?.aiLabels || []) as AiLabel[];
+      const approvedLabels = allLabels.filter(l => l.approved);
+
       // Add manifest.json as the FIRST entry
       const outputSize = this.resolveOutputSize(outputSettings, metadata);
       const manifest = this.buildManifest(
@@ -1145,10 +1175,11 @@ export class VideoProcessor {
         successfulFrames.map(f => f.frameNumber),
         outputSize,
         outputSettings,
-        maskData
+        maskData,
+        approvedLabels
       );
       archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-      console.log(`📦 Added manifest.json`);
+      console.log(`📦 Added manifest.json (${approvedLabels.length} approved labels)`);
 
       // Add README.txt as the second entry
       archive.append(this.buildReadme(manifest), { name: 'README.txt' });
@@ -1162,7 +1193,7 @@ export class VideoProcessor {
 
       // Add metadata CSV if requested
       if (outputSettings.includeMetadata) {
-        const csvContent = this.generateMetadataCSV(processedFrames, metadata, outputSettings, maskData);
+        const csvContent = this.generateMetadataCSV(processedFrames, metadata, outputSettings, maskData, approvedLabels);
         archive.append(csvContent, { name: 'metadata.csv' });
         console.log(`📦 Added metadata.csv`);
       }
@@ -1176,7 +1207,8 @@ export class VideoProcessor {
     processedFrames: Array<{ frameNumber: number; buffer: Buffer }>,
     metadata: any,
     outputSettings: OutputSettings,
-    maskData?: MaskData
+    maskData?: MaskData,
+    approvedLabels?: AiLabel[]
   ): string {
     const headers = [
       'filename',
@@ -1206,8 +1238,10 @@ export class VideoProcessor {
       outputHeight = 512;
     }
 
-    const aiTarget = maskData?.aiLabel?.target || '';
-    const aiConfidence = maskData?.aiLabel?.confidence ?? '';
+    const aiTarget = approvedLabels?.map(l => l.target).join('; ') || '';
+    const aiConfidence = approvedLabels?.length
+      ? approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ')
+      : '';
 
     const rows = processedFrames.map(({ frameNumber, buffer }) => {
       const filename = `frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
@@ -1225,8 +1259,8 @@ export class VideoProcessor {
         timestamp,
         buffer.length,
         status,
-        aiTarget,
-        aiConfidence
+        `"${aiTarget}"`,
+        `"${aiConfidence}"`
       ].join(',');
     });
 

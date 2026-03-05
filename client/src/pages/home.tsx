@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import FileUpload from "@/components/FileUpload";
 import MaskingCanvas from "@/components/MaskingCanvas";
@@ -8,8 +8,8 @@ import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
 import { Button } from "@/components/ui/button";
-import { Settings, Video, Download, Lock, Upload } from "lucide-react";
-import type { MaskData, OutputSettings } from "@shared/schema";
+import { Settings, Video, Download, Lock, Upload, Check, X } from "lucide-react";
+import type { MaskData, OutputSettings, AiLabel } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
 
 export default function Home() {
@@ -75,6 +75,51 @@ export default function Home() {
       aiLabel,
     };
     handleMaskUpdate(aiMask);
+  };
+
+  // AI Labels state and management
+  const [aiLabels, setAiLabels] = useState<AiLabel[]>([]);
+
+  const fetchLabels = useCallback(async () => {
+    if (!currentJob) return;
+    try {
+      const res = await fetch(`/api/ai/labels/${currentJob}`);
+      if (res.ok) {
+        const data = await res.json();
+        setAiLabels(data.labels || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch labels:', err);
+    }
+  }, [currentJob]);
+
+  // Fetch labels when job completes (Step 4 unlocks)
+  useEffect(() => {
+    if (jobCompleted) fetchLabels();
+  }, [jobCompleted, fetchLabels]);
+
+  const handleToggleLabel = async (labelId: string, approved: boolean) => {
+    if (!currentJob) return;
+    try {
+      await fetch(`/api/ai/labels/${currentJob}/${labelId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved }),
+      });
+      await fetchLabels();
+    } catch (err) {
+      console.error('Failed to toggle label:', err);
+    }
+  };
+
+  const handleRemoveLabel = async (labelId: string) => {
+    if (!currentJob) return;
+    try {
+      await fetch(`/api/ai/labels/${currentJob}/${labelId}`, { method: 'DELETE' });
+      await fetchLabels();
+    } catch (err) {
+      console.error('Failed to remove label:', err);
+    }
   };
 
   const handleDownload = () => {
@@ -204,8 +249,53 @@ export default function Home() {
                 currentFrame={currentFrame}
                 firstFrameBase64={firstFrame}
                 onMaskGenerated={handleAiMaskGenerated}
+                onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}
               />
+
+              {/* AI Label list */}
+              {aiLabels.length > 0 && (
+                <div className="px-4 py-3 space-y-2 border-t border-border">
+                  <p className="text-xs text-muted-foreground">
+                    Only approved labels will appear in your download.
+                  </p>
+                  {aiLabels.map(label => (
+                    <div
+                      key={label.id}
+                      className={`flex items-center justify-between rounded-md px-3 py-2 text-xs ${
+                        label.approved ? 'bg-muted/50' : 'bg-muted/20 opacity-60'
+                      }`}
+                    >
+                      <div className="flex-1 min-w-0 mr-2">
+                        <span className="font-medium">{label.target}</span>
+                        <span className="text-muted-foreground ml-1">({label.intent})</span>
+                        {label.confidence !== null && (
+                          <span className="text-muted-foreground ml-1">
+                            {Math.round(label.confidence * 100)}%
+                          </span>
+                        )}
+                        <span className="text-muted-foreground ml-1 text-[10px]">{label.model}</span>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => handleToggleLabel(label.id, !label.approved)}
+                          className={`p-1 rounded hover:bg-muted ${label.approved ? 'text-green-500' : 'text-muted-foreground'}`}
+                          title={label.approved ? 'Unapprove' : 'Approve'}
+                        >
+                          <Check size={14} />
+                        </button>
+                        <button
+                          onClick={() => handleRemoveLabel(label.id)}
+                          className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-muted"
+                          title="Remove"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           ) : (
             <div className="px-4 py-3 text-xs text-muted-foreground">
