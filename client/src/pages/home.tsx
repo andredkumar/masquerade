@@ -7,8 +7,10 @@ import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
-import { Settings, Video } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Settings, Video, Download, Lock, Upload } from "lucide-react";
 import type { MaskData, OutputSettings } from "@shared/schema";
+import { posthog } from "@/lib/posthog";
 
 export default function Home() {
   const [currentJob, setCurrentJob] = useState<string | null>(null);
@@ -30,10 +32,12 @@ export default function Home() {
     enabled: !!currentJob
   });
 
+  const job = (jobData as any)?.job;
+  const jobCompleted = job?.status === 'completed';
+
   // Reset processing state when job completes
   useEffect(() => {
     if (jobData) {
-      const job = (jobData as any)?.job;
       if (job && isProcessing && (job.status === 'completed' || job.status === 'failed')) {
         setIsProcessing(false);
         setShowCompletedStatus(true);
@@ -62,15 +66,37 @@ export default function Home() {
     setShowCompletedStatus(false);
   };
 
-  const handleAiMaskGenerated = (maskBase64: string) => {
+  const handleAiMaskGenerated = (maskBase64: string, aiLabel?: { intent: string; target: string; confidence: number | null; model: string }) => {
     const aiMask: MaskData = {
       type: 'freeform',
       coordinates: { x: 0, y: 0, width: 0, height: 0 },
       opacity: 75,
       canvasDataUrl: `data:image/png;base64,${maskBase64}`,
+      aiLabel,
     };
     handleMaskUpdate(aiMask);
   };
+
+  const handleDownload = () => {
+    window.open(`/api/videos/${currentJob}/download`, '_blank');
+    posthog.capture('frames_downloaded', { job_id: currentJob });
+  };
+
+  const handleUploadAnother = () => {
+    window.location.reload();
+  };
+
+  // Step unlock conditions
+  const step2Enabled = !!currentJob;
+  const step3Enabled = !!maskData;
+  const step4Enabled = jobCompleted;
+  const step5Enabled = jobCompleted;
+
+  const stepCircle = (num: string, enabled: boolean) => (
+    <div className={`w-6 h-6 rounded-full flex items-center justify-center text-sm font-medium ${enabled ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
+      {num}
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -86,7 +112,7 @@ export default function Home() {
               <p className="text-xs text-muted-foreground">High-Performance Video Processing</p>
             </div>
           </div>
-          
+
           <div className="flex items-center space-x-4">
             <div className="text-sm text-muted-foreground">
               CPU Cores: <span className="font-mono text-foreground">8</span>
@@ -103,54 +129,114 @@ export default function Home() {
 
       <div className="flex h-[calc(100vh-80px)]">
         {/* Sidebar */}
-        <aside className="w-80 border-r border-border bg-card flex flex-col">
+        <aside className="w-80 border-r border-border bg-card flex flex-col overflow-y-auto">
           {/* Step 1: Upload Video */}
           <div className="p-4 border-b border-border">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-6 h-6 bg-primary text-primary-foreground rounded-full flex items-center justify-center text-sm font-medium">
-                1
-              </div>
+            <div className="flex items-center gap-2">
+              {stepCircle('1', true)}
               <h2 className="text-lg font-semibold">Upload Video</h2>
             </div>
           </div>
           <FileUpload onUploadComplete={handleUploadComplete} />
-          
-          {/* Step 2: Masking Tools */}
-          <div className="p-4 border-b border-border">
-            <div className="flex items-center gap-2 mb-2">
-              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-sm font-medium ${currentJob ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
-                2
-              </div>
-              <h2 className="text-lg font-semibold">Masking Tools</h2>
-            </div>
-          </div>
-          <MaskingTools
-            selectedTool={selectedTool}
-            onToolChange={setSelectedTool}
-            maskData={maskData}
-            onMaskUpdate={handleMaskUpdate}
-          />
 
-          {/* AI Command */}
+          {/* Step 2: Template Mask */}
           <div className="p-4 border-b border-border">
-            <div className="flex items-center gap-2 mb-2">
-              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-sm font-medium ${currentJob ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
-                AI
-              </div>
-              <h2 className="text-lg font-semibold">AI Command</h2>
+            <div className="flex items-center gap-2">
+              {stepCircle('2', step2Enabled)}
+              <h2 className="text-lg font-semibold">Template Mask</h2>
+              {!step2Enabled && <Lock size={14} className="text-muted-foreground ml-auto" />}
             </div>
           </div>
-          <TaskSelector
-            selectedTask={selectedTask}
-            onTaskChange={setSelectedTask}
-          />
-          <CommandInput
-            jobId={currentJob}
-            currentFrame={currentFrame}
-            firstFrameBase64={firstFrame}
-            onMaskGenerated={handleAiMaskGenerated}
-            selectedTask={selectedTask}
-          />
+          {step2Enabled ? (
+            <MaskingTools
+              selectedTool={selectedTool}
+              onToolChange={setSelectedTool}
+              maskData={maskData}
+              onMaskUpdate={handleMaskUpdate}
+            />
+          ) : (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              Upload a video to enable masking tools.
+            </div>
+          )}
+
+          {/* Step 3: Apply to All Frames */}
+          <div className="p-4 border-b border-border">
+            <div className="flex items-center gap-2">
+              {stepCircle('3', step3Enabled)}
+              <h2 className="text-lg font-semibold">Apply to All Frames</h2>
+              {!step3Enabled && <Lock size={14} className="text-muted-foreground ml-auto" />}
+            </div>
+          </div>
+          {step3Enabled && currentJob ? (
+            <ProcessingControls
+              jobId={currentJob}
+              maskData={maskData}
+              videoMetadata={videoMetadata}
+              onStartProcessing={handleStartProcessing}
+              disabled={!currentJob || !maskData}
+              hasExistingMask={!!maskData}
+              isProcessing={isProcessing}
+              lastProcessedSettings={lastProcessedSettings}
+            />
+          ) : (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              Draw a mask on the first frame to enable processing.
+            </div>
+          )}
+
+          {/* Step 4: AI Analysis */}
+          <div className="p-4 border-b border-border">
+            <div className="flex items-center gap-2">
+              {stepCircle('4', step4Enabled)}
+              <h2 className="text-lg font-semibold">AI Analysis</h2>
+              {!step4Enabled && <Lock size={14} className="text-muted-foreground ml-auto" />}
+            </div>
+          </div>
+          {step4Enabled ? (
+            <>
+              <TaskSelector
+                selectedTask={selectedTask}
+                onTaskChange={setSelectedTask}
+              />
+              <CommandInput
+                jobId={currentJob}
+                currentFrame={currentFrame}
+                firstFrameBase64={firstFrame}
+                onMaskGenerated={handleAiMaskGenerated}
+                selectedTask={selectedTask}
+              />
+            </>
+          ) : (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              Complete Step 3 first to enable AI analysis.
+            </div>
+          )}
+
+          {/* Step 5: Download ZIP */}
+          <div className="p-4 border-b border-border">
+            <div className="flex items-center gap-2">
+              {stepCircle('5', step5Enabled)}
+              <h2 className="text-lg font-semibold">Download ZIP</h2>
+              {!step5Enabled && <Lock size={14} className="text-muted-foreground ml-auto" />}
+            </div>
+          </div>
+          {step5Enabled ? (
+            <div className="px-4 py-3 space-y-2">
+              <Button className="w-full" onClick={handleDownload} data-testid="sidebar-download-button">
+                <Download size={16} className="mr-2" />
+                Download ZIP
+              </Button>
+              <Button variant="outline" className="w-full" onClick={handleUploadAnother} data-testid="sidebar-upload-another-button">
+                <Upload size={16} className="mr-2" />
+                Upload Another
+              </Button>
+            </div>
+          ) : (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              Complete Step 3 first to enable download.
+            </div>
+          )}
         </aside>
 
         {/* Main Content Area */}
@@ -164,7 +250,7 @@ export default function Home() {
               onZoomChange={setCanvasZoom}
               maskData={maskData}
             />
-            
+
             {/* Processing Started Indicator - Top Right of Canvas */}
             {isProcessing && (
               <div className="absolute top-8 right-8 bg-card border border-border rounded-lg shadow-lg p-4 z-10" data-testid="processing-indicator">
@@ -178,31 +264,8 @@ export default function Home() {
               </div>
             )}
           </div>
-          
-          {/* Step 3: Processing */}
-          {currentJob && (
-            <div className="border-t border-border bg-card">
-              <div className="p-4 border-b border-border">
-                <div className="flex items-center gap-2 mb-2">
-                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-sm font-medium ${currentJob && maskData ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
-                    3
-                  </div>
-                  <h2 className="text-lg font-semibold">Processing</h2>
-                </div>
-              </div>
-              <ProcessingControls 
-                jobId={currentJob}
-                maskData={maskData}
-                videoMetadata={videoMetadata}
-                onStartProcessing={handleStartProcessing}
-                disabled={!currentJob || !maskData}
-                hasExistingMask={!!maskData}
-                isProcessing={isProcessing}
-                lastProcessedSettings={lastProcessedSettings}
-              />
-            </div>
-          )}
-          
+
+          {/* Processing Status - stays in main content area */}
           {currentJob && (
             <ProcessingStatus jobId={currentJob} />
           )}
