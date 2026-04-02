@@ -2,7 +2,7 @@ import sharp from 'sharp';
 import type { ParsedIntent } from '@shared/schema';
 import type { ModelConfig } from './modelRouter';
 
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8000';
+const SAM2_SERVICE_URL = process.env.SAM2_SERVICE_URL || 'http://172.31.6.85:8001';
 
 // ── Interfaces ────────────────────────────────────────────────
 
@@ -10,6 +10,7 @@ export interface InferenceRequest {
   modelConfig: ModelConfig;
   imageBase64: string;   // PNG frame as base64 string (no data: prefix)
   intent: ParsedIntent;  // from shared/schema.ts
+  jobId?: string;        // passed through to GPU service for tracking
 }
 
 export interface InferenceResult {
@@ -17,69 +18,99 @@ export interface InferenceResult {
   confidence: number;
   modelUsed: string;
   inferenceMs: number;
+  mock?: boolean;        // true when GPU service returned a mock or we fell back locally
+}
+
+// ── MedSAM2 GPU service response shape ───────────────────────
+
+interface MedSAM2Response {
+  job_id: string;
+  target: string;
+  success: boolean;
+  mask_b64: string;
+  overlay_b64: string;
+  confidence: number;
+  mock: boolean;
+  error?: string;
 }
 
 // ── AI Inference Client ───────────────────────────────────────
 
 export class AIInferenceClient {
   /**
-   * Send an image + intent to the Python AI service and get back
-   * a segmentation mask (or classification result).
+   * Send an image + intent to the MedSAM2 GPU service and get back
+   * a segmentation mask.
    *
-   * In development mode, if the AI service is unreachable a mock
-   * result is returned so the frontend can be built in parallel.
+   * Falls back to a local mock result if the GPU service is unreachable
+   * so the Node.js app never crashes due to inference failures.
    */
   async infer(request: InferenceRequest): Promise<InferenceResult> {
     const startMs = Date.now();
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30_000); // 30s timeout
+      const timeout = setTimeout(() => controller.abort(), 30_000); // 30s — MedSAM2 can be slow on first run
 
-      const response = await fetch(`${AI_SERVICE_URL}/infer`, {
+      const body = {
+        job_id: request.jobId || 'unknown',
+        image_b64: request.imageBase64,
+        target: request.intent.target || 'unknown',
+        bbox: null,             // will add UI bbox drawing later
+        points: null,           // will add point prompts later
+        use_auto_prompt: true,  // let MedSAM2 auto-generate center bbox
+      };
+
+      console.log(`🤖 Calling MedSAM2 at ${SAM2_SERVICE_URL}/segment — target: "${body.target}"`);
+
+      const response = await fetch(`${SAM2_SERVICE_URL}/segment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: request.modelConfig.id,
-          image_base64: request.imageBase64,
-          prompt: {
-            intent: request.intent.intent,
-            target: request.intent.target,
-          },
-        }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
 
       clearTimeout(timeout);
 
       if (!response.ok) {
-        throw new Error(`AI service returned ${response.status}: ${await response.text()}`);
+        const text = await response.text();
+        throw new Error(`MedSAM2 service returned ${response.status}: ${text}`);
       }
 
-      const data = await response.json() as { mask_base64: string; confidence: number };
+      const data = await response.json() as MedSAM2Response;
+
+      if (!data.success) {
+        throw new Error(`MedSAM2 inference failed: ${data.error || 'unknown error'}`);
+      }
+
+      if (data.mock) {
+        console.warn('⚠️  MedSAM2 returned a MOCK result — checkpoint not loaded on GPU instance');
+      } else {
+        console.log(`✅ MedSAM2 inference complete — confidence: ${(data.confidence * 100).toFixed(1)}%`);
+      }
 
       return {
-        maskBase64: data.mask_base64,
+        maskBase64: data.mask_b64,
         confidence: data.confidence,
-        modelUsed: request.modelConfig.id,
+        modelUsed: data.mock ? 'medsam2-mock' : 'medsam2',
         inferenceMs: Date.now() - startMs,
+        mock: data.mock,
       };
     } catch (err) {
-      // Always return mock when AI service is unavailable
-      console.warn('⚠️  AI service unavailable — returning mock mask');
-      return this.generateMockResult(request.modelConfig.id, startMs);
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(`⚠️  MedSAM2 GPU service unreachable — falling back to local mock. Reason: ${reason}`);
+      return this.generateMockResult(startMs);
     }
   }
 
   /**
-   * Check whether the Python AI service is reachable.
+   * Check whether the MedSAM2 GPU service is reachable.
    */
   async isAvailable(): Promise<boolean> {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5_000);
 
-      const response = await fetch(`${AI_SERVICE_URL}/health`, {
+      const response = await fetch(`${SAM2_SERVICE_URL}/health`, {
         signal: controller.signal,
       });
 
@@ -94,15 +125,14 @@ export class AIInferenceClient {
 
   /**
    * Generate a white-circle-on-black mock mask (512×512).
-   * Used only in development when the real AI service is down.
+   * Used only as a fallback when the MedSAM2 GPU service is unreachable.
    */
-  private async generateMockResult(model: string, startMs: number): Promise<InferenceResult> {
+  private async generateMockResult(startMs: number): Promise<InferenceResult> {
     const size = 512;
     const cx = size / 2;
     const cy = size / 2;
     const r = size / 4;
 
-    // Create a white circle on a black background using Sharp
     const svg = `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
       <rect width="${size}" height="${size}" fill="black"/>
       <circle cx="${cx}" cy="${cy}" r="${r}" fill="white"/>
@@ -114,9 +144,10 @@ export class AIInferenceClient {
 
     return {
       maskBase64: pngBuffer.toString('base64'),
-      confidence: 0.5,
+      confidence: 0.0,
       modelUsed: 'mock',
       inferenceMs: Date.now() - startMs,
+      mock: true,
     };
   }
 }

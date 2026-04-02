@@ -644,6 +644,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         modelConfig,
         imageBase64: resolvedFrameBase64,
         intent: parsedIntent,
+        jobId,
       });
 
       // 6. Store the AI label on the job record
