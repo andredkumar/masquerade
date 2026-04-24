@@ -53,6 +53,13 @@ export default function Home() {
     ? `/api/videos/${currentJob}/first-processed-frame`
     : null;
 
+  // [DEBUG] Trace processed-frame URL changes
+  useEffect(() => {
+    console.log('[DEBUG] processedFirstFrameUrl:', processedFirstFrameUrl,
+                'jobCompleted:', jobCompleted, 'currentJob:', currentJob,
+                'jobStatus:', job?.status);
+  }, [processedFirstFrameUrl, jobCompleted, currentJob, job?.status]);
+
   // Reset processing state when job completes
   useEffect(() => {
     if (jobData) {

@@ -32,6 +32,11 @@ interface BboxCanvasProps {
  * clinician can draw an accurate bbox prompt on a full-size image.
  */
 export default function BboxCanvas({ frameBase64, overlayBase64, imageDimensions, onBboxChange }: BboxCanvasProps) {
+  // [DEBUG] Trace the frame source reaching BboxCanvas
+  console.log('[DEBUG] BboxCanvas frameBase64 type:',
+              typeof frameBase64, 'value preview:',
+              frameBase64?.substring(0, 50));
+
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);

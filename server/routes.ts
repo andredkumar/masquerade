@@ -415,17 +415,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // folder used by the download builder.
   app.get("/api/videos/:jobId/first-processed-frame", async (req, res) => {
     try {
-      const dir = path.join(process.cwd(), 'temp_processed', req.params.jobId);
-      if (!fs.existsSync(dir)) {
+      const jobId = req.params.jobId;
+      console.log('[DEBUG] first-processed-frame called for job:', jobId);
+      const dirPath = path.join(process.cwd(), 'temp_processed', jobId);
+      console.log('[DEBUG] temp_processed path:', dirPath);
+
+      if (!fs.existsSync(dirPath)) {
+        console.log('[DEBUG] dir does not exist:', dirPath);
         return res.status(404).json({ error: "No processed frames for this job" });
       }
-      const files = fs.readdirSync(dir)
+      const files = fs.readdirSync(dirPath)
         .filter(f => /\.(png|jpe?g)$/i.test(f))
         .sort();
+      console.log('[DEBUG] files found:', files);
+
       if (files.length === 0) {
         return res.status(404).json({ error: "No processed frames for this job" });
       }
-      const firstPath = path.join(dir, files[0]);
+      const firstPath = path.join(dirPath, files[0]);
       const ext = path.extname(files[0]).toLowerCase();
       const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
       res.setHeader('Content-Type', mime);
