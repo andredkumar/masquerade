@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Loader2, Sparkles, AlertTriangle, CheckCircle2, X } from "lucide-react";
+import { useWebSocket } from "@/hooks/useWebSocket";
 
 interface VideoMetadata {
   width?: number;
@@ -50,6 +51,22 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
   const [box, setBox] = useState<DisplayBox | null>(null);
   const [displaySize, setDisplaySize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const [overlayDataUrl, setOverlayDataUrl] = useState<string | null>(null);
+
+  // Per-frame inference progress (pushed from the server via Socket.IO)
+  const { socket } = useWebSocket();
+  useEffect(() => {
+    if (!socket || !jobId) return;
+    socket.emit('join', jobId);
+    const onInferProgress = (data: { jobId: string; current: number; total: number; done?: boolean }) => {
+      if (data.jobId !== jobId) return;
+      if (data.done) return;
+      setStatusMessage(`Analyzing frame ${data.current} of ${data.total}...`);
+    };
+    socket.on('inference-progress', onInferProgress);
+    return () => {
+      socket.off('inference-progress', onInferProgress);
+    };
+  }, [socket, jobId]);
 
   // Resize canvas internal pixels to match the image's rendered size
   const syncCanvasSize = useCallback(() => {

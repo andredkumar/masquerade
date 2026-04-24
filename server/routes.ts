@@ -448,23 +448,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
       const approvedLabels = allLabels.filter(l => l.approved);
 
-      // Collect mask/overlay buffers from the first approved label that has them.
-      // Silently skip add-ons if no approved label supplies the corresponding artifact.
-      let maskBuffer: Buffer | null = null;
-      let overlayBuffer: Buffer | null = null;
-      if (includeMasks || includeOverlays) {
-        for (const label of approvedLabels) {
-          if (includeMasks && !maskBuffer && label.maskB64) {
-            maskBuffer = Buffer.from(label.maskB64, 'base64');
-          }
-          if (includeOverlays && !overlayBuffer && label.overlayB64) {
-            overlayBuffer = Buffer.from(label.overlayB64, 'base64');
-          }
-          if ((!includeMasks || maskBuffer) && (!includeOverlays || overlayBuffer)) break;
-        }
-      }
+      // Pick the primary approved label that owns the per-frame inference results.
+      // If multiple approved labels exist, use the first that has frameResults.
+      const primaryLabel = approvedLabels.find(l => l.frameResults && Object.keys(l.frameResults).length > 0)
+        || approvedLabels[0]
+        || null;
 
-      // Build per-frame and top-level AI label arrays
+      // Per-frame getter: returns the mask/overlay buffer for a given frame index, or null
+      // if no approved label has that artifact for that frame.
+      const getFrameMask = (frameIdx: number): Buffer | null => {
+        if (!primaryLabel) return null;
+        const r = primaryLabel.frameResults?.[frameIdx];
+        if (r?.maskB64) return Buffer.from(r.maskB64, 'base64');
+        if (primaryLabel.maskB64) return Buffer.from(primaryLabel.maskB64, 'base64'); // single-frame fallback
+        return null;
+      };
+      const getFrameOverlay = (frameIdx: number): Buffer | null => {
+        if (!primaryLabel) return null;
+        const r = primaryLabel.frameResults?.[frameIdx];
+        if (r?.overlayB64) return Buffer.from(r.overlayB64, 'base64');
+        if (primaryLabel.overlayB64) return Buffer.from(primaryLabel.overlayB64, 'base64');
+        return null;
+      };
+      const getFrameConfidence = (frameIdx: number): number | null => {
+        if (!primaryLabel) return null;
+        const r = primaryLabel.frameResults?.[frameIdx];
+        if (r && typeof r.confidence === 'number') return r.confidence;
+        return primaryLabel.confidence ?? null;
+      };
+
+      // Precompute whether the add-on folders will have any content at all
+      // (so we don't write a README section for an empty folder).
+      const hasAnyMasks = includeMasks && !!primaryLabel && (
+        (primaryLabel.frameResults && Object.values(primaryLabel.frameResults).some(r => !!r.maskB64)) ||
+        !!primaryLabel.maskB64
+      );
+      const hasAnyOverlays = includeOverlays && !!primaryLabel && (
+        (primaryLabel.frameResults && Object.values(primaryLabel.frameResults).some(r => !!r.overlayB64)) ||
+        !!primaryLabel.overlayB64
+      );
+
+      // Top-level AI labels in the manifest (unchanged top-level confidence is the first-frame one)
       const labelsForManifest = approvedLabels.map(l => ({
         id: l.id,
         intent: l.intent,
@@ -474,14 +498,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         approved: l.approved,
         bbox: l.bbox || null,
       }));
-      const labelsForFrame = approvedLabels.map(l => ({
-        intent: l.intent,
-        target: l.target,
-        confidence: l.confidence,
-        model: l.model,
-        approved: l.approved,
-        bbox: l.bbox || null,
-      }));
+
+      // Per-frame AI labels are built below with each frame's individual confidence score
 
       // Derive split assignment from frame index (80/10/10 train/val/test)
       const determineSplit = (n: number): 'train' | 'val' | 'test' => {
@@ -506,12 +524,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const outputFormat = (job as any).outputSettings?.format || 'png';
       const manifestFrames = frameFiles.map((filename, i) => {
         const { index } = extractFrameIndex(filename, i);
+        // Per-frame AI labels use THIS frame's individual confidence, not a copied value
+        const frameConf = getFrameConfidence(index);
+        const perFrameLabels = approvedLabels.map(l => ({
+          intent: l.intent,
+          target: l.target,
+          confidence: l.id === primaryLabel?.id ? frameConf : l.confidence,
+          model: l.model,
+          approved: l.approved,
+          bbox: l.bbox || null,
+        }));
         return {
           frame_number: index,
           filename: `frame_${String(index).padStart(4, '0')}.${outputFormat}`,
           split: determineSplit(index),
           has_mask: true,
-          ai_labels: labelsForFrame,
+          ai_labels: perFrameLabels,
         };
       });
 
@@ -546,7 +574,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `  These are your primary training images.`,
         ``,
       ];
-      if (includeMasks && maskBuffer) {
+      if (hasAnyMasks) {
         readmeSections.push(
           `masks/`,
           `  Binary segmentation masks. White pixels = AI-detected target structure.`,
@@ -554,7 +582,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           ``,
         );
       }
-      if (includeOverlays && overlayBuffer) {
+      if (hasAnyOverlays) {
         readmeSections.push(
           `overlays/`,
           `  Visual overlays showing AI detections highlighted in green on the original`,
@@ -612,20 +640,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // 3. metadata.csv
       archive.append(csv, { name: 'metadata.csv' });
 
-      // 4. Frames + optional mask/overlay companions
+      // 4. Frames + optional per-frame mask/overlay companions
       for (let i = 0; i < frameFiles.length; i++) {
         const filename = frameFiles[i];
         const { index, paddedNum, ext } = extractFrameIndex(filename, i);
         const framePath = path.join(tempDir, filename);
         archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
 
-        if (includeMasks && maskBuffer) {
-          archive.append(maskBuffer, { name: `masks/frame_${paddedNum}_mask.png` });
+        if (includeMasks) {
+          const frameMask = getFrameMask(index);
+          if (frameMask) {
+            archive.append(frameMask, { name: `masks/frame_${paddedNum}_mask.png` });
+          }
         }
-        if (includeOverlays && overlayBuffer) {
-          archive.append(overlayBuffer, { name: `overlays/frame_${paddedNum}_overlay.png` });
+        if (includeOverlays) {
+          const frameOverlay = getFrameOverlay(index);
+          if (frameOverlay) {
+            archive.append(frameOverlay, { name: `overlays/frame_${paddedNum}_overlay.png` });
+          }
         }
-        void index; // suppress unused warning
       }
 
       await archive.finalize();
@@ -688,21 +721,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Resolve the frame image: prefer temp folder, fall back to request body
-      let resolvedFrameBase64 = frameBase64;
+      // 3. Collect all frames from temp_processed/{jobId}/ — inference runs on ALL of them
       const tempDir = path.join(process.cwd(), 'temp_processed', jobId);
+      let frameFileNames: string[] = [];
       if (fs.existsSync(tempDir)) {
-        const pngFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.png')).sort();
-        if (pngFiles.length > 0) {
-          const firstFramePath = path.join(tempDir, pngFiles[0]);
-          resolvedFrameBase64 = fs.readFileSync(firstFramePath).toString('base64');
-          console.log(`📂 Using first frame from temp folder: ${pngFiles[0]}`);
-        }
+        frameFileNames = fs.readdirSync(tempDir)
+          .filter(f => /\.(png|jpe?g)$/i.test(f))
+          .sort();
       }
 
-      if (!resolvedFrameBase64) {
+      // Helper: extract frame index from a filename (same rules as the download route)
+      const extractIdx = (filename: string, fallback: number): number => {
+        const m1 = filename.match(/^frame_(\d+)\.(\w+)$/);
+        if (m1) return parseInt(m1[1], 10);
+        const m2 = filename.match(/^image_(\d+)_.*\.(\w+)$/);
+        if (m2) return parseInt(m2[1], 10) - 1;
+        return fallback;
+      };
+
+      // Fall back to request-body frame if temp folder is empty (single-frame path)
+      const singleFrameFallback = !frameFileNames.length && frameBase64;
+      if (!frameFileNames.length && !singleFrameFallback) {
         return res.status(400).json({
-          error: "No frame available — upload and process a video first, or send frameBase64",
+          error: "No frames available — upload and process a video first, or send frameBase64",
         });
       }
 
@@ -711,43 +752,91 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const modelConfig = router.route(parsedIntent);
       console.log(`🔀 Model router selected: ${modelConfig.id} (${modelConfig.name}) — type: ${modelConfig.type}, available: ${modelConfig.available}`);
 
-      // 5. Call the AI inference service
+      // 5. Run inference on every frame, emitting progress via Socket.IO (uses closure-scoped `io`)
       const aiClient = new AIInferenceClient();
-      const result = await aiClient.infer({
-        modelConfig,
-        imageBase64: resolvedFrameBase64,
-        intent: parsedIntent,
-        jobId,
-        bbox: bbox || null,
-        useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
-      });
 
-      // 6. Store the AI label on the job record (with mask/overlay artifacts)
+      const frameResults: Record<number, { maskB64: string; overlayB64?: string; confidence: number }> = {};
+      let firstResult: { maskBase64: string; overlayBase64?: string; confidence: number; modelUsed: string; inferenceMs: number } | null = null;
+      const totalFrames = frameFileNames.length || 1;
+
+      if (singleFrameFallback) {
+        // Single-frame path (no temp folder yet)
+        io?.to(jobId).emit('inference-progress', { jobId, current: 1, total: 1 });
+        const r = await aiClient.infer({
+          modelConfig,
+          imageBase64: frameBase64,
+          intent: parsedIntent,
+          jobId,
+          bbox: bbox || null,
+          useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
+        });
+        frameResults[0] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64, confidence: r.confidence };
+        firstResult = r;
+      } else {
+        for (let i = 0; i < frameFileNames.length; i++) {
+          const filename = frameFileNames[i];
+          const frameIdx = extractIdx(filename, i);
+
+          io?.to(jobId).emit('inference-progress', { jobId, current: i + 1, total: totalFrames });
+
+          const framePath = path.join(tempDir, filename);
+          const b64 = fs.readFileSync(framePath).toString('base64');
+
+          const r = await aiClient.infer({
+            modelConfig,
+            imageBase64: b64,
+            intent: parsedIntent,
+            jobId,
+            bbox: bbox || null,
+            useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
+          });
+
+          frameResults[frameIdx] = {
+            maskB64: r.maskBase64,
+            overlayB64: r.overlayBase64,
+            confidence: r.confidence,
+          };
+          if (i === 0) firstResult = r;
+        }
+      }
+
+      io?.to(jobId).emit('inference-progress', { jobId, current: totalFrames, total: totalFrames, done: true });
+
+      if (!firstResult) {
+        return res.status(500).json({ error: "Inference produced no results" });
+      }
+
+      // 6. Store the AI label on the job record
+      // - maskB64/overlayB64/confidence = first frame (for preview)
+      // - frameResults = full per-frame map (used by the download route)
+      // - bbox = the prompt the user actually drew (so it appears in manifest.json)
       const existingLabels = ((job as any).aiLabels || []) as AiLabel[];
       const newLabel: AiLabel = {
         id: randomUUID(),
         intent: parsedIntent.intent,
         target: parsedIntent.target || 'unknown',
-        confidence: result.confidence ?? null,
-        model: result.modelUsed || 'unknown',
+        confidence: firstResult.confidence ?? null,
+        model: firstResult.modelUsed || 'unknown',
         timestamp: new Date().toISOString(),
         approved: true,
-        bbox: null,
-        maskB64: result.maskBase64 || undefined,
-        overlayB64: result.overlayBase64 || undefined,
+        bbox: bbox && typeof bbox.x1 === 'number' ? { x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2 } : null,
+        maskB64: firstResult.maskBase64 || undefined,
+        overlayB64: firstResult.overlayBase64 || undefined,
+        frameResults,
       };
       await storage.updateVideoJob(jobId, {
         aiLabels: [...existingLabels, newLabel] as any,
       });
 
-      // 7. Return the result
+      // 7. Return the first-frame result (the UI only displays one preview overlay)
       res.json({
         parsedIntent,
-        maskBase64: result.maskBase64,
-        overlayBase64: result.overlayBase64,
-        confidence: result.confidence,
-        modelUsed: result.modelUsed,
-        inferenceMs: result.inferenceMs,
+        maskBase64: firstResult.maskBase64,
+        overlayBase64: firstResult.overlayBase64,
+        confidence: firstResult.confidence,
+        modelUsed: firstResult.modelUsed,
+        inferenceMs: firstResult.inferenceMs,
+        framesProcessed: totalFrames,
         label: newLabel,
       });
     } catch (error) {

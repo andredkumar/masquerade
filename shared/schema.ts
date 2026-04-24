@@ -126,13 +126,19 @@ export interface AiLabel {
   id: string;        // randomUUID
   intent: string;
   target: string;
-  confidence: number | null;
+  confidence: number | null;   // first-frame confidence (for display)
   model: string;
   timestamp: string;
   approved: boolean;
-  bbox?: [number, number, number, number] | null; // [x1, y1, x2, y2] bounding box if available
-  maskB64?: string;     // Binary mask PNG as base64 (from MedSAM2 mask_b64)
-  overlayB64?: string;  // Visual overlay PNG as base64 (from MedSAM2 overlay_b64)
+  bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn prompt (image pixel coords)
+  maskB64?: string;     // First-frame binary mask PNG as base64 (for preview only)
+  overlayB64?: string;  // First-frame visual overlay PNG as base64 (for preview only)
+  // Per-frame inference results — populated when Step 4 runs across all frames
+  frameResults?: Record<number, {
+    maskB64: string;
+    overlayB64?: string;
+    confidence: number;
+  }>;
 }
 
 // AI intent parsing result
