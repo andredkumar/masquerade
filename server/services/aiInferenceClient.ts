@@ -14,11 +14,12 @@ export interface InferenceRequest {
 }
 
 export interface InferenceResult {
-  maskBase64: string;    // PNG mask as base64 string
+  maskBase64: string;       // PNG mask as base64 string
+  overlayBase64?: string;   // PNG overlay as base64 string (green tint on image)
   confidence: number;
   modelUsed: string;
   inferenceMs: number;
-  mock?: boolean;        // true when GPU service returned a mock or we fell back locally
+  mock?: boolean;           // true when GPU service returned a mock or we fell back locally
 }
 
 // ── MedSAM2 GPU service response shape ───────────────────────
@@ -90,6 +91,7 @@ export class AIInferenceClient {
 
       return {
         maskBase64: data.mask_b64,
+        overlayBase64: data.overlay_b64 || undefined,
         confidence: data.confidence,
         modelUsed: data.mock ? 'medsam2-mock' : 'medsam2',
         inferenceMs: Date.now() - startMs,

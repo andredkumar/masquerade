@@ -8,7 +8,7 @@ import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
 import { Button } from "@/components/ui/button";
-import { Settings, Video, Download, Lock, Upload, Check, X } from "lucide-react";
+import { Settings, Video, Download, Lock, Upload, Check, X, Info } from "lucide-react";
 import type { MaskData, OutputSettings, AiLabel } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
 
@@ -24,6 +24,8 @@ export default function Home() {
   const [showCompletedStatus, setShowCompletedStatus] = useState(false);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [selectedTask, setSelectedTask] = useState('segment');
+  const [includeMasks, setIncludeMasks] = useState(false);
+  const [includeOverlays, setIncludeOverlays] = useState(false);
 
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
@@ -123,8 +125,12 @@ export default function Home() {
   };
 
   const handleDownload = () => {
-    window.open(`/api/videos/${currentJob}/download`, '_blank');
-    posthog.capture('frames_downloaded', { job_id: currentJob });
+    const params = new URLSearchParams();
+    if (includeMasks) params.set('masks', 'true');
+    if (includeOverlays) params.set('overlays', 'true');
+    const qs = params.toString();
+    window.open(`/api/videos/${currentJob}/download${qs ? '?' + qs : ''}`, '_blank');
+    posthog.capture('frames_downloaded', { job_id: currentJob, includeMasks, includeOverlays });
   };
 
   const handleUploadAnother = () => {
@@ -278,9 +284,9 @@ export default function Home() {
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button
-                          onClick={() => handleToggleLabel(label.id, !label.approved)}
+                          onClick={() => handleToggleLabel(label.id, true)}
                           className={`p-1 rounded hover:bg-muted ${label.approved ? 'text-green-500' : 'text-muted-foreground'}`}
-                          title={label.approved ? 'Unapprove' : 'Approve'}
+                          title="Approve"
                         >
                           <Check size={14} />
                         </button>
@@ -312,7 +318,60 @@ export default function Home() {
             </div>
           </div>
           {step5Enabled ? (
-            <div className="px-4 py-3 space-y-2">
+            <div className="px-4 py-3 space-y-3">
+              <div>
+                <p className="text-xs font-medium">Customize your download</p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  Your download always includes your images and a data file with AI label locations. The options below add extra files for technical use.
+                </p>
+              </div>
+
+              {/* Binary masks checkbox */}
+              <div className="flex items-start gap-2">
+                <label className="flex items-start gap-2 cursor-pointer flex-1">
+                  <input
+                    type="checkbox"
+                    checked={includeMasks}
+                    onChange={e => setIncludeMasks(e.target.checked)}
+                    className="mt-0.5 rounded border-border"
+                  />
+                  <span className="text-xs leading-tight">Include binary masks</span>
+                </label>
+                <span
+                  className="relative inline-flex items-center mt-0.5 group cursor-help"
+                  tabIndex={0}
+                  aria-label="About binary masks"
+                >
+                  <Info size={12} className="text-muted-foreground" />
+                  <span className="absolute bottom-full right-0 mb-1 hidden group-hover:block group-focus:block w-[280px] max-w-[calc(100vw-2rem)] p-2 text-[11px] leading-snug bg-popover text-popover-foreground border border-border rounded-md shadow-md z-50 pointer-events-none">
+                    A black-and-white image where white pixels show exactly where the AI detected your target structure. Used by machine learning engineers to train models. You don't need this unless you're building or fine-tuning an AI model yourself.
+                  </span>
+                </span>
+              </div>
+
+              {/* Visual overlays checkbox */}
+              <div className="flex items-start gap-2">
+                <label className="flex items-start gap-2 cursor-pointer flex-1">
+                  <input
+                    type="checkbox"
+                    checked={includeOverlays}
+                    onChange={e => setIncludeOverlays(e.target.checked)}
+                    className="mt-0.5 rounded border-border"
+                  />
+                  <span className="text-xs leading-tight">Include visual overlays</span>
+                </label>
+                <span
+                  className="relative inline-flex items-center mt-0.5 group cursor-help"
+                  tabIndex={0}
+                  aria-label="About visual overlays"
+                >
+                  <Info size={12} className="text-muted-foreground" />
+                  <span className="absolute bottom-full right-0 mb-1 hidden group-hover:block group-focus:block w-[280px] max-w-[calc(100vw-2rem)] p-2 text-[11px] leading-snug bg-popover text-popover-foreground border border-border rounded-md shadow-md z-50 pointer-events-none">
+                    Your ultrasound image with the AI's detection highlighted in green. Useful for visually verifying segmentation quality or presenting results. Larger file size — skip this if you just need the data.
+                  </span>
+                </span>
+              </div>
+
               <Button className="w-full" onClick={handleDownload} data-testid="sidebar-download-button">
                 <Download size={16} className="mr-2" />
                 Download ZIP

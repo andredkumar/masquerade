@@ -763,14 +763,16 @@ export class VideoProcessor {
           target: l.target,
           confidence: l.confidence,
           model: l.model,
+          approved: l.approved,
+          bbox: l.bbox || null,
         }))
-      : null;
+      : [];
 
     const frames = frameNumbers.map(frameNumber => {
       const paddedNum = String(frameNumber).padStart(4, '0');
       return {
-        filename: `frame_${paddedNum}.${outputSettings.format}`,
         frame_number: frameNumber,
+        filename: `frame_${paddedNum}.${outputSettings.format}`,
         split: determineSplit(frameNumber),
         has_mask: true,
         ai_labels: labelsForFrame,
@@ -793,6 +795,8 @@ export class VideoProcessor {
         target: l.target,
         confidence: l.confidence,
         model: l.model,
+        approved: l.approved,
+        bbox: l.bbox || null,
       })) || [],
       frames,
     };

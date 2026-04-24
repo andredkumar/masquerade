@@ -130,6 +130,9 @@ export interface AiLabel {
   model: string;
   timestamp: string;
   approved: boolean;
+  bbox?: [number, number, number, number] | null; // [x1, y1, x2, y2] bounding box if available
+  maskB64?: string;     // Binary mask PNG as base64 (from MedSAM2 mask_b64)
+  overlayB64?: string;  // Visual overlay PNG as base64 (from MedSAM2 overlay_b64)
 }
 
 // AI intent parsing result

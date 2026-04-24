@@ -411,6 +411,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Download processed video ZIP (rebuilds manifest.json + README.txt with current approved labels)
+  // Optional query params: ?masks=true&overlays=true
   app.get("/api/videos/:jobId/download", async (req, res) => {
     try {
       const job = await storage.getVideoJob(req.params.jobId);
@@ -438,9 +439,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Output file not found" });
       }
 
+      // Read optional add-on flags from query params
+      const includeMasks = req.query.masks === 'true';
+      const includeOverlays = req.query.overlays === 'true';
+
       // Get current approved labels from the job record
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
       const approvedLabels = allLabels.filter(l => l.approved);
+
+      // Collect mask/overlay buffers from the first approved label that has them
+      let maskBuffer: Buffer | null = null;
+      let overlayBuffer: Buffer | null = null;
+      if (includeMasks || includeOverlays) {
+        for (const label of approvedLabels) {
+          if (includeMasks && !maskBuffer && label.maskB64) {
+            maskBuffer = Buffer.from(label.maskB64, 'base64');
+          }
+          if (includeOverlays && !overlayBuffer && label.overlayB64) {
+            overlayBuffer = Buffer.from(label.overlayB64, 'base64');
+          }
+          if ((!includeMasks || maskBuffer) && (!includeOverlays || overlayBuffer)) break;
+        }
+      }
 
       // Read the existing ZIP and rebuild with updated manifest + README
       const directory = await unzipper.Open.file(zipPath);
@@ -453,27 +473,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         existingManifest = JSON.parse(buf.toString('utf-8'));
       }
 
-      // Build updated manifest
+      // Build per-frame and top-level label arrays
       const labelsForManifest = approvedLabels.map(l => ({
         id: l.id,
         intent: l.intent,
         target: l.target,
         confidence: l.confidence,
         model: l.model,
+        approved: l.approved,
+        bbox: l.bbox || null,
       }));
 
-      const labelsForFrame = approvedLabels.length > 0
-        ? approvedLabels.map(l => ({
-            intent: l.intent,
-            target: l.target,
-            confidence: l.confidence,
-            model: l.model,
-          }))
-        : null;
+      const labelsForFrame = approvedLabels.map(l => ({
+        intent: l.intent,
+        target: l.target,
+        confidence: l.confidence,
+        model: l.model,
+        approved: l.approved,
+        bbox: l.bbox || null,
+      }));
 
       let updatedManifest: Record<string, any>;
       if (existingManifest) {
-        // Update ai_labels at top level and on each frame
         updatedManifest = {
           ...existingManifest,
           ai_labels: labelsForManifest,
@@ -483,7 +504,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
           })),
         };
       } else {
-        // Fallback: minimal manifest
         updatedManifest = {
           masquerade_version: '1.0',
           export_timestamp: new Date().toISOString(),
@@ -512,6 +532,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ).join('\n');
         }
 
+        const fileList = [
+          `  manifest.json  — full metadata (machine-readable)`,
+          `  metadata.csv   — per-frame data (spreadsheet)`,
+          `  README.txt     — this file`,
+          `  frames/frame_*.${manifest.output_format || 'png'}  — masked frames`,
+        ];
+        if (includeMasks && maskBuffer) {
+          fileList.push(`  frames/frame_*_mask.png  — binary segmentation masks`);
+        }
+        if (includeOverlays && overlayBuffer) {
+          fileList.push(`  frames/frame_*_overlay.png  — visual overlay images`);
+        }
+
         return [
           `Masquerade Export — masqueradeimage.com`,
           ``,
@@ -522,10 +555,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
           ``,
           `Files:`,
-          `  manifest.json  — full metadata (machine-readable)`,
-          `  metadata.csv   — per-frame data (spreadsheet)`,
-          `  README.txt     — this file`,
-          `  frame_*.${manifest.output_format || 'png'}  — masked frames`,
+          ...fileList,
         ].join('\n');
       };
 
@@ -548,12 +578,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // 2. Add updated README.txt
       archive.append(buildReadme(updatedManifest), { name: 'README.txt' });
 
-      // 3. Copy all other files from the original ZIP unchanged
+      // 3. Copy all other files from the original ZIP and add mask/overlay PNGs per frame
       for (const entry of directory.files) {
         if (entry.path === 'manifest.json' || entry.path === 'README.txt') continue;
         if (entry.type === 'Directory') continue;
         const buf = await entry.buffer();
         archive.append(buf, { name: entry.path });
+
+        // For each frame file, optionally add companion mask/overlay PNGs
+        const frameMatch = entry.path.match(/^frames\/frame_(\d+)\.\w+$/);
+        if (frameMatch) {
+          const paddedNum = frameMatch[1];
+          if (includeMasks && maskBuffer) {
+            archive.append(maskBuffer, { name: `frames/frame_${paddedNum}_mask.png` });
+          }
+          if (includeOverlays && overlayBuffer) {
+            archive.append(overlayBuffer, { name: `frames/frame_${paddedNum}_overlay.png` });
+          }
+        }
       }
 
       await archive.finalize();
@@ -647,7 +689,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         jobId,
       });
 
-      // 6. Store the AI label on the job record
+      // 6. Store the AI label on the job record (with mask/overlay artifacts)
       const existingLabels = ((job as any).aiLabels || []) as AiLabel[];
       const newLabel: AiLabel = {
         id: randomUUID(),
@@ -657,6 +699,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         model: result.modelUsed || 'unknown',
         timestamp: new Date().toISOString(),
         approved: true,
+        bbox: null,
+        maskB64: result.maskBase64 || undefined,
+        overlayB64: result.overlayBase64 || undefined,
       };
       await storage.updateVideoJob(jobId, {
         aiLabels: [...existingLabels, newLabel] as any,
