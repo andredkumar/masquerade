@@ -319,9 +319,9 @@ export default function Home() {
           </div>
           {step5Enabled ? (
             <div className="px-4 py-3 space-y-3">
-              <div>
-                <p className="text-xs font-medium">Customize your download</p>
-                <p className="text-[11px] text-muted-foreground mt-0.5">
+              <div className="mb-3">
+                <p className="text-sm font-medium text-foreground">Customize your download</p>
+                <p className="text-xs text-muted-foreground mt-0.5">
                   Your download always includes your images and a data file with AI label locations. The options below add extra files for technical use.
                 </p>
               </div>
