@@ -1,7 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Loader2, Sparkles, AlertTriangle, CheckCircle2, X } from "lucide-react";
+import {
+  Loader2, Sparkles, AlertTriangle, CheckCircle2, X,
+  Square as IconSquare, Circle as IconCircle, Hexagon as IconHexagon, Paintbrush as IconBrush,
+} from "lucide-react";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
 interface VideoMetadata {
@@ -29,12 +32,56 @@ const TASK_PLACEHOLDERS: Record<string, string> = {
 
 type Stage = 'idle' | 'parsing' | 'inferring' | 'done' | 'error' | 'clarify';
 
-interface DisplayBox {
-  x1: number; // display-pixel coords
-  y1: number;
-  x2: number;
-  y2: number;
+type DrawMode = 'rect' | 'circle' | 'polygon' | 'brush';
+
+interface Pt { x: number; y: number; }
+interface DisplayBox { x1: number; y1: number; x2: number; y2: number; }
+
+// Discriminated union describing the user's freehand annotation. Regardless of
+// shape, the bbox we send to MedSAM2 is the axis-aligned bounding box of the shape.
+type Shape =
+  | { type: 'rect'; start: Pt; end: Pt; completed: boolean }
+  | { type: 'circle'; center: Pt; edge: Pt; completed: boolean }
+  | { type: 'polygon'; points: Pt[]; completed: boolean }
+  | { type: 'brush'; points: Pt[]; completed: boolean };
+
+function shapeBbox(shape: Shape): DisplayBox | null {
+  switch (shape.type) {
+    case 'rect':
+      return {
+        x1: Math.min(shape.start.x, shape.end.x),
+        y1: Math.min(shape.start.y, shape.end.y),
+        x2: Math.max(shape.start.x, shape.end.x),
+        y2: Math.max(shape.start.y, shape.end.y),
+      };
+    case 'circle': {
+      const rx = Math.abs(shape.edge.x - shape.center.x);
+      const ry = Math.abs(shape.edge.y - shape.center.y);
+      return {
+        x1: shape.center.x - rx,
+        y1: shape.center.y - ry,
+        x2: shape.center.x + rx,
+        y2: shape.center.y + ry,
+      };
+    }
+    case 'polygon':
+    case 'brush': {
+      if (shape.points.length === 0) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of shape.points) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      return { x1: minX, y1: minY, x2: maxX, y2: maxY };
+    }
+  }
 }
+
+const CYAN_FILL = 'rgba(34, 211, 238, 0.20)';
+const CYAN_STROKE = 'rgba(34, 211, 238, 0.95)';
+const CYAN_DASH = 'rgba(34, 211, 238, 0.85)';
 
 export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
   const [command, setCommand] = useState('');
@@ -43,12 +90,13 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
   const [confidence, setConfidence] = useState<number | null>(null);
   const [modelUsed, setModelUsed] = useState<string | null>(null);
 
-  // bbox drawing state (local to this sidebar panel)
+  // Drawing state
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
-  const [box, setBox] = useState<DisplayBox | null>(null);
+  const [mode, setMode] = useState<DrawMode>('rect');
+  const [shape, setShape] = useState<Shape | null>(null);
+  const [isDragging, setIsDragging] = useState(false);        // drag-based modes (rect/circle/brush)
+  const [polygonHover, setPolygonHover] = useState<Pt | null>(null); // ghost segment for polygon
   const [displaySize, setDisplaySize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const [overlayDataUrl, setOverlayDataUrl] = useState<string | null>(null);
 
@@ -63,12 +111,109 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
       setStatusMessage(`Analyzing frame ${data.current} of ${data.total}...`);
     };
     socket.on('inference-progress', onInferProgress);
-    return () => {
-      socket.off('inference-progress', onInferProgress);
-    };
+    return () => { socket.off('inference-progress', onInferProgress); };
   }, [socket, jobId]);
 
-  // Resize canvas internal pixels to match the image's rendered size
+  // -------------- drawing helpers --------------
+
+  const redraw = useCallback((s: Shape | null, hover: Pt | null, w: number, h: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, w, h);
+    if (!s) return;
+
+    ctx.fillStyle = CYAN_FILL;
+    ctx.strokeStyle = CYAN_STROKE;
+    ctx.lineWidth = 2;
+
+    switch (s.type) {
+      case 'rect': {
+        const rx = Math.min(s.start.x, s.end.x);
+        const ry = Math.min(s.start.y, s.end.y);
+        const rw = Math.abs(s.end.x - s.start.x);
+        const rh = Math.abs(s.end.y - s.start.y);
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeRect(rx + 1, ry + 1, Math.max(0, rw - 2), Math.max(0, rh - 2));
+        break;
+      }
+      case 'circle': {
+        const rx = Math.abs(s.edge.x - s.center.x);
+        const ry = Math.abs(s.edge.y - s.center.y);
+        if (rx < 1 && ry < 1) break;
+        ctx.beginPath();
+        ctx.ellipse(s.center.x, s.center.y, rx, ry, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        break;
+      }
+      case 'polygon': {
+        if (s.points.length === 0) break;
+        ctx.beginPath();
+        ctx.moveTo(s.points[0].x, s.points[0].y);
+        for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i].x, s.points[i].y);
+        if (s.completed) {
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        } else {
+          ctx.stroke();
+          // ghost segment from last vertex to hover point
+          if (hover) {
+            const last = s.points[s.points.length - 1];
+            ctx.save();
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(last.x, last.y);
+            ctx.lineTo(hover.x, hover.y);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+        // vertex dots
+        ctx.fillStyle = CYAN_STROKE;
+        for (const p of s.points) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        break;
+      }
+      case 'brush': {
+        if (s.points.length < 2) break;
+        ctx.save();
+        ctx.lineWidth = 12;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(34, 211, 238, 0.55)';
+        ctx.beginPath();
+        ctx.moveTo(s.points[0].x, s.points[0].y);
+        for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i].x, s.points[i].y);
+        ctx.stroke();
+        ctx.restore();
+        break;
+      }
+    }
+
+    // After completion, draw the computed bbox as a dashed cyan rectangle
+    if (s.completed) {
+      const bb = shapeBbox(s);
+      if (bb) {
+        const bw = bb.x2 - bb.x1;
+        const bh = bb.y2 - bb.y1;
+        if (bw > 0 && bh > 0) {
+          ctx.save();
+          ctx.setLineDash([5, 4]);
+          ctx.strokeStyle = CYAN_DASH;
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(bb.x1 + 0.5, bb.y1 + 0.5, bw, bh);
+          ctx.restore();
+        }
+      }
+    }
+  }, []);
+
   const syncCanvasSize = useCallback(() => {
     const img = imgRef.current;
     const canvas = canvasRef.current;
@@ -80,9 +225,8 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
     canvas.width = w;
     canvas.height = h;
     setDisplaySize({ w, h });
-    redraw(box, w, h);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [box]);
+    redraw(shape, polygonHover, w, h);
+  }, [shape, polygonHover, redraw]);
 
   useEffect(() => {
     syncCanvasSize();
@@ -90,31 +234,32 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
     return () => window.removeEventListener('resize', syncCanvasSize);
   }, [syncCanvasSize]);
 
-  // Reset overlay + box when job / frame changes
+  useEffect(() => {
+    redraw(shape, polygonHover, displaySize.w, displaySize.h);
+  }, [shape, polygonHover, displaySize.w, displaySize.h, redraw]);
+
+  // Reset when job / base frame changes, and when switching mode
   useEffect(() => {
     setOverlayDataUrl(null);
-    setBox(null);
+    setShape(null);
+    setPolygonHover(null);
+    setIsDragging(false);
   }, [jobId, firstFrameBase64]);
 
-  const redraw = (b: DisplayBox | null, w: number, h: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, w, h);
-    if (!b) return;
-    const rx = Math.min(b.x1, b.x2);
-    const ry = Math.min(b.y1, b.y2);
-    const rw = Math.abs(b.x2 - b.x1);
-    const rh = Math.abs(b.y2 - b.y1);
-    ctx.fillStyle = 'rgba(34, 211, 238, 0.15)';   // cyan tint
-    ctx.fillRect(rx, ry, rw, rh);
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.95)'; // cyan border
-    ctx.lineWidth = 2;
-    ctx.strokeRect(rx + 1, ry + 1, Math.max(0, rw - 2), Math.max(0, rh - 2));
+  const handleModeChange = (m: DrawMode) => {
+    setMode(m);
+    setShape(null);
+    setPolygonHover(null);
+    setIsDragging(false);
   };
 
-  const pointFromEvent = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const clearShape = () => {
+    setShape(null);
+    setPolygonHover(null);
+    setIsDragging(false);
+  };
+
+  const pointFromEvent = (e: React.MouseEvent<HTMLCanvasElement>): Pt | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
@@ -124,60 +269,89 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
     };
   };
 
-  const onCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // -------------- mouse handlers (mode-dispatched) --------------
+
+  const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (mode === 'polygon') return; // polygon uses onClick / onDoubleClick
     const p = pointFromEvent(e);
     if (!p) return;
-    setIsDrawing(true);
-    setDrawStart(p);
-    setBox({ x1: p.x, y1: p.y, x2: p.x, y2: p.y });
-    redraw({ x1: p.x, y1: p.y, x2: p.x, y2: p.y }, displaySize.w, displaySize.h);
+    setIsDragging(true);
+    if (mode === 'rect') setShape({ type: 'rect', start: p, end: p, completed: false });
+    else if (mode === 'circle') setShape({ type: 'circle', center: p, edge: p, completed: false });
+    else if (mode === 'brush') setShape({ type: 'brush', points: [p], completed: false });
   };
 
-  const onCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing || !drawStart) return;
+  const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const p = pointFromEvent(e);
     if (!p) return;
-    const next = { x1: drawStart.x, y1: drawStart.y, x2: p.x, y2: p.y };
-    setBox(next);
-    redraw(next, displaySize.w, displaySize.h);
-  };
-
-  const onCanvasMouseUp = () => {
-    if (!isDrawing) return;
-    setIsDrawing(false);
-    setDrawStart(null);
-    // Reject tiny boxes (accidental clicks)
-    if (box) {
-      const w = Math.abs(box.x2 - box.x1);
-      const h = Math.abs(box.y2 - box.y1);
-      if (w < 4 || h < 4) {
-        setBox(null);
-        redraw(null, displaySize.w, displaySize.h);
+    if (mode === 'polygon') {
+      if (shape && shape.type === 'polygon' && !shape.completed) {
+        setPolygonHover(p);
       }
+      return;
+    }
+    if (!isDragging || !shape) return;
+    if (shape.type === 'rect') setShape({ ...shape, end: p });
+    else if (shape.type === 'circle') setShape({ ...shape, edge: p });
+    else if (shape.type === 'brush') setShape({ ...shape, points: [...shape.points, p] });
+  };
+
+  const onMouseUp = () => {
+    if (mode === 'polygon') return;
+    if (!isDragging || !shape) return;
+    setIsDragging(false);
+
+    // Reject tiny shapes (accidental clicks)
+    const bb = shapeBbox(shape);
+    if (!bb || (bb.x2 - bb.x1) < 4 || (bb.y2 - bb.y1) < 4) {
+      setShape(null);
+      return;
+    }
+    setShape({ ...shape, completed: true } as Shape);
+  };
+
+  const onClickCanvas = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (mode !== 'polygon') return;
+    const p = pointFromEvent(e);
+    if (!p) return;
+    if (!shape || shape.type !== 'polygon') {
+      setShape({ type: 'polygon', points: [p], completed: false });
+    } else if (!shape.completed) {
+      setShape({ ...shape, points: [...shape.points, p] });
     }
   };
 
-  const clearBox = () => {
-    setBox(null);
-    redraw(null, displaySize.w, displaySize.h);
+  const onDoubleClickCanvas = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (mode !== 'polygon') return;
+    if (!shape || shape.type !== 'polygon' || shape.completed) return;
+    if (shape.points.length < 3) {
+      setShape(null);
+      setPolygonHover(null);
+      return;
+    }
+    const bb = shapeBbox(shape);
+    if (!bb || (bb.x2 - bb.x1) < 4 || (bb.y2 - bb.y1) < 4) {
+      setShape(null);
+      setPolygonHover(null);
+      return;
+    }
+    setShape({ ...shape, completed: true });
+    setPolygonHover(null);
   };
 
-  // Convert display-pixel box to actual-image-pixel box
-  const toImagePixelBox = (b: DisplayBox): { x1: number; y1: number; x2: number; y2: number } | null => {
+  // -------------- coord scaling + submit --------------
+
+  const toImagePixelBox = (bb: DisplayBox): { x1: number; y1: number; x2: number; y2: number } | null => {
     const imgW = videoMetadata?.width;
     const imgH = videoMetadata?.height;
     if (!imgW || !imgH || displaySize.w === 0 || displaySize.h === 0) return null;
     const sx = imgW / displaySize.w;
     const sy = imgH / displaySize.h;
-    const x1 = Math.min(b.x1, b.x2) * sx;
-    const y1 = Math.min(b.y1, b.y2) * sy;
-    const x2 = Math.max(b.x1, b.x2) * sx;
-    const y2 = Math.max(b.y1, b.y2) * sy;
     return {
-      x1: Math.max(0, Math.min(imgW, Math.round(x1))),
-      y1: Math.max(0, Math.min(imgH, Math.round(y1))),
-      x2: Math.max(0, Math.min(imgW, Math.round(x2))),
-      y2: Math.max(0, Math.min(imgH, Math.round(y2))),
+      x1: Math.max(0, Math.min(imgW, Math.round(bb.x1 * sx))),
+      y1: Math.max(0, Math.min(imgH, Math.round(bb.y1 * sy))),
+      x2: Math.max(0, Math.min(imgW, Math.round(bb.x2 * sx))),
+      y2: Math.max(0, Math.min(imgH, Math.round(bb.y2 * sy))),
     };
   };
 
@@ -212,7 +386,9 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
       setStage('inferring');
       setStatusMessage(`Running ${parsed.intent} on "${parsed.target}"...`);
 
-      const pixelBox = box ? toImagePixelBox(box) : null;
+      // Only use completed shapes as a prompt (half-drawn shapes fall back to auto-prompt)
+      const displayBB = shape && shape.completed ? shapeBbox(shape) : null;
+      const pixelBox = displayBB ? toImagePixelBox(displayBB) : null;
 
       const inferRes = await fetch('/api/ai/infer', {
         method: 'POST',
@@ -242,7 +418,6 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
         });
       }
 
-      // Show the GPU's visual overlay on top of the preview (box stays visible)
       if (result.overlayBase64) {
         setOverlayDataUrl(`data:image/png;base64,${result.overlayBase64}`);
       } else {
@@ -253,7 +428,6 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
       setModelUsed(result.modelUsed);
       setStage('done');
       setStatusMessage('Mask generated');
-
       onLabelAdded?.();
     } catch (err) {
       setStage('error');
@@ -271,14 +445,50 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
   const isLoading = stage === 'parsing' || stage === 'inferring';
   const previewSrc = overlayDataUrl || firstFrameBase64;
 
+  // Cursor hint per mode
+  const cursor = (() => {
+    if (mode === 'polygon') return 'crosshair';
+    if (mode === 'brush') return 'crosshair';
+    if (isDragging) return 'crosshair';
+    if (shape?.completed) return 'default';
+    return 'crosshair';
+  })();
+
+  const modeBtn = (m: DrawMode, Icon: typeof IconSquare, label: string) => (
+    <button
+      type="button"
+      onClick={() => handleModeChange(m)}
+      title={label}
+      aria-label={label}
+      className={`p-1.5 rounded ${
+        mode === m
+          ? 'bg-primary text-primary-foreground'
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+      }`}
+      data-testid={`bbox-mode-${m}`}
+    >
+      <Icon size={14} />
+    </button>
+  );
+
   return (
     <div className="px-4 py-3 space-y-3">
       {/* Frame preview with bbox drawing canvas (in-sidebar) */}
       {firstFrameBase64 && (
         <div className="space-y-1.5">
           <p className="text-[11px] text-muted-foreground leading-tight">
-            Draw a box around the structure you want to segment, then type what it is and click Run.
+            Draw around the structure you want to segment, then type what it is and click Run.
+            {mode === 'polygon' && ' Click to add points, double-click to close.'}
           </p>
+
+          {/* Compact toolbar — icons only */}
+          <div className="flex items-center gap-1">
+            {modeBtn('rect', IconSquare, 'Rectangle')}
+            {modeBtn('circle', IconCircle, 'Circle')}
+            {modeBtn('polygon', IconHexagon, 'Polygon')}
+            {modeBtn('brush', IconBrush, 'Brush')}
+          </div>
+
           <div className="relative inline-block w-full rounded-md overflow-hidden border border-border bg-black">
             <img
               ref={imgRef}
@@ -292,17 +502,19 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
             <canvas
               ref={canvasRef}
               className="absolute inset-0 w-full h-full"
-              style={{ cursor: isDrawing ? 'crosshair' : (box ? 'default' : 'crosshair') }}
-              onMouseDown={onCanvasMouseDown}
-              onMouseMove={onCanvasMouseMove}
-              onMouseUp={onCanvasMouseUp}
-              onMouseLeave={onCanvasMouseUp}
+              style={{ cursor }}
+              onMouseDown={onMouseDown}
+              onMouseMove={onMouseMove}
+              onMouseUp={onMouseUp}
+              onMouseLeave={onMouseUp}
+              onClick={onClickCanvas}
+              onDoubleClick={onDoubleClickCanvas}
               data-testid="command-bbox-canvas"
             />
-            {box && (
+            {shape && (
               <button
                 type="button"
-                onClick={clearBox}
+                onClick={clearShape}
                 className="absolute top-1 right-1 flex items-center gap-1 rounded bg-background/90 text-foreground border border-border px-1.5 py-0.5 text-[10px] shadow-sm hover:bg-muted"
                 data-testid="command-clear-box"
               >
