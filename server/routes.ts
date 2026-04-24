@@ -13,7 +13,6 @@ import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
 import archiver from "archiver";
-import unzipper from "unzipper";
 
 const upload = multer({
   dest: 'uploads/',
@@ -410,7 +409,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Download processed video ZIP (rebuilds manifest.json + README.txt with current approved labels)
+  // Download processed ZIP — built lazily from temp_processed/{jobId}/ on demand.
   // Optional query params: ?masks=true&overlays=true
   app.get("/api/videos/:jobId/download", async (req, res) => {
     try {
@@ -420,34 +419,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       if (job.status !== 'completed') {
-        if (job.status === 'ready') {
-          const zipPath = (job as any).outputZipPath || path.join('output', `processed_frames_${job.id}.zip`);
-          if (!fs.existsSync(zipPath)) {
-            return res.status(400).json({
-              error: `Job is in ${job.status} state, download not available`
-            });
-          }
-        } else {
-          return res.status(400).json({
-            error: `Job is in ${job.status} state, download not available`
-          });
-        }
-      }
-
-      const zipPath = (job as any).outputZipPath || path.join('output', `processed_frames_${job.id}.zip`);
-      if (!fs.existsSync(zipPath)) {
-        return res.status(404).json({ error: "Output file not found" });
+        return res.status(400).json({
+          error: `Job is in ${job.status} state, download not available`,
+        });
       }
 
       // Read optional add-on flags from query params
       const includeMasks = req.query.masks === 'true';
       const includeOverlays = req.query.overlays === 'true';
 
-      // Get current approved labels from the job record
+      console.log(`📦 Building ZIP for job ${job.id} (masks: ${includeMasks}, overlays: ${includeOverlays})`);
+
+      // Source of truth for processed frames is the temp folder
+      const tempDir = path.join(process.cwd(), 'temp_processed', job.id);
+      if (!fs.existsSync(tempDir)) {
+        return res.status(404).json({ error: "Processed frames not found on disk" });
+      }
+
+      const frameFiles = fs.readdirSync(tempDir)
+        .filter(f => /\.(png|jpe?g)$/i.test(f))
+        .sort();
+
+      if (frameFiles.length === 0) {
+        return res.status(404).json({ error: "No processed frames available to download" });
+      }
+
+      // Get approved AI labels from the job record
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
       const approvedLabels = allLabels.filter(l => l.approved);
 
-      // Collect mask/overlay buffers from the first approved label that has them
+      // Collect mask/overlay buffers from the first approved label that has them.
+      // Silently skip add-ons if no approved label supplies the corresponding artifact.
       let maskBuffer: Buffer | null = null;
       let overlayBuffer: Buffer | null = null;
       if (includeMasks || includeOverlays) {
@@ -462,18 +464,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
 
-      // Read the existing ZIP and rebuild with updated manifest + README
-      const directory = await unzipper.Open.file(zipPath);
-
-      // Parse existing manifest to preserve all fields and update only ai_labels
-      let existingManifest: Record<string, any> | null = null;
-      const manifestEntry = directory.files.find(f => f.path === 'manifest.json');
-      if (manifestEntry) {
-        const buf = await manifestEntry.buffer();
-        existingManifest = JSON.parse(buf.toString('utf-8'));
-      }
-
-      // Build per-frame and top-level label arrays
+      // Build per-frame and top-level AI label arrays
       const labelsForManifest = approvedLabels.map(l => ({
         id: l.id,
         intent: l.intent,
@@ -483,7 +474,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         approved: l.approved,
         bbox: l.bbox || null,
       }));
-
       const labelsForFrame = approvedLabels.map(l => ({
         intent: l.intent,
         target: l.target,
@@ -493,143 +483,159 @@ export async function registerRoutes(app: Express): Promise<Server> {
         bbox: l.bbox || null,
       }));
 
-      let updatedManifest: Record<string, any>;
-      if (existingManifest) {
-        updatedManifest = {
-          ...existingManifest,
-          ai_labels: labelsForManifest,
-          frames: (existingManifest.frames || []).map((frame: any) => ({
-            ...frame,
-            ai_labels: labelsForFrame,
-          })),
-        };
-      } else {
-        updatedManifest = {
-          masquerade_version: '1.0',
-          export_timestamp: new Date().toISOString(),
-          job_id: job.id,
-          source_filename: job.filename,
-          ai_labels: labelsForManifest,
-        };
-      }
-
-      // Build updated README
-      const buildReadme = (manifest: Record<string, any>): string => {
-        const frames = (manifest.frames || []) as Array<{ split: string }>;
-        const splitCounts = { train: 0, val: 0, test: 0 };
-        for (const f of frames) {
-          if (f.split in splitCounts) splitCounts[f.split as keyof typeof splitCounts]++;
-        }
-
-        const labels = (manifest.ai_labels || []) as Array<{ target: string; intent: string; model: string; confidence: number | null }>;
-        let aiLines: string;
-        if (labels.length === 0) {
-          aiLines = 'AI Labels: none (manual mask)';
-        } else {
-          aiLines = `AI Labels (${labels.length} approved):\n` +
-            labels.map(l =>
-              `  - ${l.target} (${l.intent}, ${l.model}, confidence ${l.confidence !== null ? (l.confidence * 100).toFixed(0) + '%' : 'N/A'})`
-            ).join('\n');
-        }
-
-        const sections: string[] = [
-          `images/`,
-          `  Template-masked ultrasound frames with PHI and irrelevant markings removed.`,
-          `  These are your primary training images.`,
-          ``,
-        ];
-        if (includeMasks && maskBuffer) {
-          sections.push(
-            `masks/`,
-            `  Binary segmentation masks. White pixels = AI-detected target structure.`,
-            `  Black pixels = background. Use these to train segmentation models.`,
-            ``,
-          );
-        }
-        if (includeOverlays && overlayBuffer) {
-          sections.push(
-            `overlays/`,
-            `  Visual overlays showing AI detections highlighted in green on the original`,
-            `  frame. Use these to verify segmentation quality before training.`,
-            ``,
-          );
-        }
-        sections.push(
-          `manifest.json`,
-          `  Per-frame AI label data including target structure, confidence score,`,
-          `  and approval status. This is the primary AI output for programmatic use.`,
-          ``,
-          `metadata.csv`,
-          `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
-        );
-
-        return [
-          `=== Masquerade Export ===`,
-          ``,
-          `Export date: ${manifest.export_timestamp}`,
-          `Source file: ${manifest.source_filename}`,
-          `Total frames: ${manifest.total_frames}`,
-          aiLines,
-          `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
-          ``,
-          ...sections,
-        ].join('\n');
+      // Derive split assignment from frame index (80/10/10 train/val/test)
+      const determineSplit = (n: number): 'train' | 'val' | 'test' => {
+        const mod = n % 10;
+        if (mod <= 7) return 'train';
+        if (mod === 8) return 'val';
+        return 'test';
       };
 
-      // Create new ZIP in-memory and stream to client
+      // Extract frame index from filename (supports frame_000000.png and image_001_name.png)
+      const extractFrameIndex = (filename: string, fallback: number): { index: number; paddedNum: string; ext: string } => {
+        const m1 = filename.match(/^frame_(\d+)\.(\w+)$/);
+        if (m1) return { index: parseInt(m1[1], 10), paddedNum: m1[1], ext: m1[2] };
+        const m2 = filename.match(/^image_(\d+)_.*\.(\w+)$/);
+        if (m2) {
+          const idx = parseInt(m2[1], 10) - 1;
+          return { index: idx, paddedNum: String(idx).padStart(6, '0'), ext: m2[2] };
+        }
+        return { index: fallback, paddedNum: String(fallback).padStart(6, '0'), ext: path.extname(filename).slice(1) || 'png' };
+      };
+
+      const outputFormat = (job as any).outputSettings?.format || 'png';
+      const manifestFrames = frameFiles.map((filename, i) => {
+        const { index } = extractFrameIndex(filename, i);
+        return {
+          frame_number: index,
+          filename: `frame_${String(index).padStart(4, '0')}.${outputFormat}`,
+          split: determineSplit(index),
+          has_mask: true,
+          ai_labels: labelsForFrame,
+        };
+      });
+
+      const manifest: Record<string, any> = {
+        masquerade_version: '1.0',
+        export_timestamp: new Date().toISOString(),
+        job_id: job.id,
+        source_filename: job.filename,
+        total_frames: frameFiles.length,
+        output_format: outputFormat,
+        splits: { train: 0.8, val: 0.1, test: 0.1 },
+        ai_labels: labelsForManifest,
+        frames: manifestFrames,
+      };
+
+      // Build README.txt
+      const splitCounts = { train: 0, val: 0, test: 0 };
+      for (const f of manifestFrames) {
+        if (f.split in splitCounts) splitCounts[f.split as keyof typeof splitCounts]++;
+      }
+
+      const aiLines = approvedLabels.length === 0
+        ? 'AI Labels: none (manual mask)'
+        : `AI Labels (${approvedLabels.length} approved):\n` +
+          approvedLabels.map(l =>
+            `  - ${l.target} (${l.intent}, ${l.model}, confidence ${l.confidence !== null ? (l.confidence * 100).toFixed(0) + '%' : 'N/A'})`
+          ).join('\n');
+
+      const readmeSections: string[] = [
+        `images/`,
+        `  Template-masked ultrasound frames with PHI and irrelevant markings removed.`,
+        `  These are your primary training images.`,
+        ``,
+      ];
+      if (includeMasks && maskBuffer) {
+        readmeSections.push(
+          `masks/`,
+          `  Binary segmentation masks. White pixels = AI-detected target structure.`,
+          `  Black pixels = background. Use these to train segmentation models.`,
+          ``,
+        );
+      }
+      if (includeOverlays && overlayBuffer) {
+        readmeSections.push(
+          `overlays/`,
+          `  Visual overlays showing AI detections highlighted in green on the original`,
+          `  frame. Use these to verify segmentation quality before training.`,
+          ``,
+        );
+      }
+      readmeSections.push(
+        `manifest.json`,
+        `  Per-frame AI label data including target structure, confidence score,`,
+        `  and approval status. This is the primary AI output for programmatic use.`,
+        ``,
+        `metadata.csv`,
+        `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
+      );
+
+      const readme = [
+        `=== Masquerade Export ===`,
+        ``,
+        `Export date: ${manifest.export_timestamp}`,
+        `Source file: ${manifest.source_filename}`,
+        `Total frames: ${manifest.total_frames}`,
+        aiLines,
+        `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
+        ``,
+        ...readmeSections,
+      ].join('\n');
+
+      // Build metadata.csv
+      const aiTarget = approvedLabels.map(l => l.target).join('; ');
+      const aiConfidence = approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ');
+      const csvHeaders = ['filename', 'frame_number', 'split', 'ai_target', 'ai_confidence'];
+      const csvRows = manifestFrames.map(f =>
+        [f.filename, f.frame_number, f.split, `"${aiTarget}"`, `"${aiConfidence}"`].join(',')
+      );
+      const csv = [csvHeaders.join(','), ...csvRows].join('\n');
+
+      // Stream the ZIP to the client
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', `attachment; filename="processed_${job.filename}.zip"`);
 
       const archive = archiver('zip', { zlib: { level: 9 } });
       archive.on('error', (err: Error) => {
-        console.error('Archive rebuild error:', err);
+        console.error('Archive build error:', err);
         if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to rebuild ZIP' });
+          res.status(500).json({ error: 'Failed to build ZIP' });
         }
       });
       archive.pipe(res);
 
-      // 1. Add updated manifest.json
-      archive.append(JSON.stringify(updatedManifest, null, 2), { name: 'manifest.json' });
+      // 1. manifest.json
+      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+      // 2. README.txt
+      archive.append(readme, { name: 'README.txt' });
+      // 3. metadata.csv
+      archive.append(csv, { name: 'metadata.csv' });
 
-      // 2. Add updated README.txt
-      archive.append(buildReadme(updatedManifest), { name: 'README.txt' });
+      // 4. Frames + optional mask/overlay companions
+      for (let i = 0; i < frameFiles.length; i++) {
+        const filename = frameFiles[i];
+        const { index, paddedNum, ext } = extractFrameIndex(filename, i);
+        const framePath = path.join(tempDir, filename);
+        archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
 
-      // 3. Copy all other files from the original ZIP into the new subfolder layout,
-      //    and add mask/overlay PNGs per frame into their own subfolders.
-      for (const entry of directory.files) {
-        if (entry.path === 'manifest.json' || entry.path === 'README.txt') continue;
-        if (entry.type === 'Directory') continue;
-
-        // Match a frame file under either the legacy `frames/` or new `images/` folder
-        const frameMatch = entry.path.match(/^(?:frames|images)\/frame_(\d+)\.(\w+)$/);
-        const buf = await entry.buffer();
-
-        if (frameMatch) {
-          const paddedNum = frameMatch[1];
-          const ext = frameMatch[2];
-          // Normalize raw frame into images/ subfolder
-          archive.append(buf, { name: `images/frame_${paddedNum}.${ext}` });
-          // Optional add-ons go into their own subfolders
-          if (includeMasks && maskBuffer) {
-            archive.append(maskBuffer, { name: `masks/frame_${paddedNum}_mask.png` });
-          }
-          if (includeOverlays && overlayBuffer) {
-            archive.append(overlayBuffer, { name: `overlays/frame_${paddedNum}_overlay.png` });
-          }
-        } else {
-          // Non-frame files (e.g. metadata.csv) pass through unchanged
-          archive.append(buf, { name: entry.path });
+        if (includeMasks && maskBuffer) {
+          archive.append(maskBuffer, { name: `masks/frame_${paddedNum}_mask.png` });
         }
+        if (includeOverlays && overlayBuffer) {
+          archive.append(overlayBuffer, { name: `overlays/frame_${paddedNum}_overlay.png` });
+        }
+        void index; // suppress unused warning
       }
 
       await archive.finalize();
+      console.log(`✅ ZIP streamed to client for job ${job.id}`);
 
     } catch (error) {
       console.error("Download error:", error);
       if (!res.headersSent) {
         res.status(500).json({
-          error: error instanceof Error ? error.message : "Download failed"
+          error: error instanceof Error ? error.message : "Download failed",
         });
       }
     }

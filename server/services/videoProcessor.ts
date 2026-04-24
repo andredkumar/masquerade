@@ -1,10 +1,7 @@
 import { storage } from '../storage';
 import { FrameExtractor } from './frameExtractor';
-import type { VideoJob, MaskData, OutputSettings, ProcessingProgress, AiLabel } from '@shared/schema';
+import type { MaskData, OutputSettings, ProcessingProgress } from '@shared/schema';
 import { Server } from 'socket.io';
-import archiver from 'archiver';
-import { createWriteStream } from 'fs';
-import { createReadStream } from 'fs';
 import path from 'path';
 import fs from 'fs/promises';
 import Sharp from 'sharp';
@@ -323,31 +320,42 @@ export class VideoProcessor {
 
       // Process batches in parallel
       const processedFrames = await this.processBatchesInParallel(
-        jobId, 
-        videoPath, 
-        batches, 
-        maskData, 
+        jobId,
+        videoPath,
+        batches,
+        maskData,
         outputSettings
       );
 
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
-      // Create output ZIP
-      const zipPath = await this.createOutputZip(jobId, processedFrames, metadata, outputSettings, maskData);
+      // Persist processed frames to temp_processed/{jobId}/ so the download route
+      // can build the ZIP lazily when the user clicks download. Do NOT pre-build a ZIP.
+      await TempFolderManager.cleanupJobTempFolder(jobId);
+      await TempFolderManager.createJobTempFolder(jobId);
+      const tempDir = TempFolderManager.getJobTempFolder(jobId);
+      const ext = outputSettings.format || 'png';
+      let savedCount = 0;
+      for (const { frameNumber, buffer } of processedFrames) {
+        if (!buffer || buffer.length === 0) continue;
+        const filename = `frame_${String(frameNumber).padStart(6, '0')}.${ext}`;
+        await fs.writeFile(path.join(tempDir, filename), buffer);
+        savedCount++;
+      }
+      console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
         progress: 100,
         completedAt: new Date().toISOString(),
-        outputZipPath: zipPath
       });
 
-      await this.updateProgress(jobId, { 
-        stage: 'completed', 
-        progress: 100 
+      await this.updateProgress(jobId, {
+        stage: 'completed',
+        progress: 100
       });
 
-      return zipPath;
+      return tempDir;
 
     } catch (error) {
       console.error(`Error processing video ${jobId}:`, error);
@@ -569,28 +577,24 @@ export class VideoProcessor {
 
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
-      // Create output ZIP from temp folder
-      const zipPath = await this.createImageZipFromTempFolder(jobId, {
-        duration: 0,
-        width: firstImageDimensions.width,
-        height: firstImageDimensions.height,
-        frameRate: 1,
-        totalFrames: imageFiles.length
-      }, outputSettings, processedImages, maskData);
+      // Frames are already saved to temp_processed/{jobId}/ by TempFolderManager.saveProcessedImage
+      // above. Do NOT pre-build a ZIP here — the download route builds it lazily with the
+      // correct subfolder structure and any optional add-ons requested via query params.
+      const tempDir = TempFolderManager.getJobTempFolder(jobId);
+      console.log(`💾 Image batch frames available at ${tempDir}`);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
         progress: 100,
         completedAt: new Date().toISOString(),
-        outputZipPath: zipPath
       });
 
-      await this.updateProgress(jobId, { 
-        stage: 'completed', 
-        progress: 100 
+      await this.updateProgress(jobId, {
+        stage: 'completed',
+        progress: 100
       });
 
-      return zipPath;
+      return tempDir;
 
     } catch (error) {
       console.error(`Error processing images ${jobId}:`, error);
@@ -608,321 +612,6 @@ export class VideoProcessor {
 
       throw error;
     }
-  }
-
-  /**
-   * Create ZIP from processed images in temp folder (for multi-image upload workflow)
-   */
-  private async createImageZipFromTempFolder(
-    jobId: string,
-    metadata: any,
-    outputSettings: OutputSettings,
-    processedImages: Array<{ imageNumber: number; buffer: Buffer; originalName: string }>,
-    maskData?: MaskData
-  ): Promise<string> {
-    const zipFilename = `processed_images_${jobId}.zip`;
-    const zipPath = path.join(this.outputDir, zipFilename);
-
-    console.log(`📦 Creating ZIP at: ${zipPath}`);
-    console.log(`📦 Output directory: ${this.outputDir}`);
-
-    return new Promise(async (resolve, reject) => {
-      try {
-        const output = createWriteStream(zipPath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
-
-        output.on('close', () => {
-          console.log(`✅ ZIP created successfully: ${zipPath} (${archive.pointer()} bytes)`);
-          resolve(zipPath);
-        });
-
-        output.on('error', (err: Error) => {
-          console.error(`❌ Output stream error:`, err);
-          reject(err);
-        });
-
-        archive.on('error', (err: Error) => {
-          console.error(`❌ Archive error:`, err);
-          reject(err);
-        });
-
-        archive.on('warning', (err: Error) => {
-          console.warn(`⚠️ Archive warning:`, err);
-        });
-
-        archive.pipe(output);
-
-        // Get all processed images from temp folder
-        const processedImagePaths = await TempFolderManager.getProcessedImages(jobId);
-
-        console.log(`📦 Found ${processedImagePaths.length} processed images in temp folder`);
-
-        // Filter to approved AI labels only
-        const imgJob = await storage.getVideoJob(jobId);
-        const imgAllLabels = ((imgJob as any)?.aiLabels || []) as AiLabel[];
-        const imgApprovedLabels = imgAllLabels.filter(l => l.approved);
-
-        // Add manifest.json as the FIRST entry
-        const outputSize = this.resolveOutputSize(outputSettings, metadata);
-        const frameNumbers = processedImages.map(img => img.imageNumber);
-        const manifest = this.buildManifest(
-          jobId,
-          processedImages[0]?.originalName || 'unknown',
-          frameNumbers,
-          outputSize,
-          outputSettings,
-          maskData,
-          imgApprovedLabels
-        );
-        archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-        console.log(`📦 Added manifest.json (${imgApprovedLabels.length} approved labels)`);
-
-        // Add README.txt as the second entry
-        archive.append(this.buildReadme(manifest), { name: 'README.txt' });
-        console.log(`📦 Added README.txt`);
-
-        if (processedImagePaths.length === 0) {
-          console.warn(`⚠️ No processed images found in temp folder for job ${jobId}`);
-        }
-        
-        // Add each processed image to the ZIP
-        for (let i = 0; i < processedImagePaths.length; i++) {
-          const imagePath = processedImagePaths[i];
-          const filename = path.basename(imagePath);
-          
-          // Read the file and add to archive
-          const imageBuffer = await fs.readFile(imagePath);
-          archive.append(imageBuffer, { name: `images/${filename}` });
-          console.log(`📦 Added image ${i + 1}: ${filename} (${imageBuffer.length} bytes)`);
-        }
-
-        // Add metadata CSV if requested
-        if (outputSettings.includeMetadata) {
-          const csvContent = this.generateImageMetadataCSV(processedImages, metadata, outputSettings, maskData, imgApprovedLabels);
-          archive.append(csvContent, { name: 'metadata.csv' });
-          console.log(`📦 Added metadata.csv`);
-        }
-
-        console.log(`📦 Finalizing archive...`);
-        archive.finalize();
-      } catch (error) {
-        console.error(`❌ Error in createImageZipFromTempFolder:`, error);
-        reject(error);
-      }
-    });
-  }
-
-  /**
-   * Resolve the output dimensions from outputSettings + metadata.
-   */
-  private resolveOutputSize(
-    outputSettings: OutputSettings,
-    metadata: any
-  ): { width: number; height: number } {
-    if ((outputSettings as any).width && (outputSettings as any).height) {
-      return { width: (outputSettings as any).width, height: (outputSettings as any).height };
-    }
-    if (outputSettings.size === 'custom') {
-      return { width: outputSettings.customWidth || 512, height: outputSettings.customHeight || 512 };
-    }
-    if (outputSettings.size === 'original') {
-      return { width: metadata.width || 512, height: metadata.height || 512 };
-    }
-    if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
-      const [w, h] = outputSettings.size.split('x').map(Number);
-      return { width: w, height: h };
-    }
-    return { width: 512, height: 512 };
-  }
-
-  /**
-   * Build the manifest.json object for a ZIP export.
-   */
-  private buildManifest(
-    jobId: string,
-    sourceFilename: string,
-    frameNumbers: number[],
-    outputSize: { width: number; height: number },
-    outputSettings: OutputSettings,
-    maskData?: MaskData,
-    approvedLabels?: AiLabel[]
-  ): Record<string, unknown> {
-    const maskType = maskData?.canvasDataUrl ? 'ai_generated' : (maskData?.type || 'rectangle');
-
-    const determineSplit = (frameNumber: number): string => {
-      const mod = frameNumber % 10;
-      if (mod <= 7) return 'train';
-      if (mod === 8) return 'val';
-      return 'test';
-    };
-
-    // Build per-frame ai_labels from approved labels
-    const labelsForFrame = (approvedLabels && approvedLabels.length > 0)
-      ? approvedLabels.map(l => ({
-          intent: l.intent,
-          target: l.target,
-          confidence: l.confidence,
-          model: l.model,
-          approved: l.approved,
-          bbox: l.bbox || null,
-        }))
-      : [];
-
-    const frames = frameNumbers.map(frameNumber => {
-      const paddedNum = String(frameNumber).padStart(4, '0');
-      return {
-        frame_number: frameNumber,
-        filename: `frame_${paddedNum}.${outputSettings.format}`,
-        split: determineSplit(frameNumber),
-        has_mask: true,
-        ai_labels: labelsForFrame,
-      };
-    });
-
-    return {
-      masquerade_version: '1.0',
-      export_timestamp: new Date().toISOString(),
-      job_id: jobId,
-      source_filename: sourceFilename,
-      total_frames: frameNumbers.length,
-      mask_type: maskType,
-      output_size: outputSize,
-      output_format: outputSettings.format,
-      splits: { train: 0.8, val: 0.1, test: 0.1 },
-      ai_labels: approvedLabels?.map(l => ({
-        id: l.id,
-        intent: l.intent,
-        target: l.target,
-        confidence: l.confidence,
-        model: l.model,
-        approved: l.approved,
-        bbox: l.bbox || null,
-      })) || [],
-      frames,
-    };
-  }
-
-  /**
-   * Build a human-readable README.txt from manifest data.
-   */
-  private buildReadme(manifest: Record<string, unknown>): string {
-    const frames = manifest.frames as Array<{ split: string }>;
-    const splitCounts = { train: 0, val: 0, test: 0 };
-    for (const f of frames) {
-      if (f.split in splitCounts) splitCounts[f.split as keyof typeof splitCounts]++;
-    }
-
-    const approvedLabels = (manifest.ai_labels || []) as Array<{ target: string; intent: string; model: string; confidence: number | null }>;
-    let aiLines: string;
-    if (approvedLabels.length === 0) {
-      aiLines = 'AI Labels: none (manual mask)';
-    } else {
-      aiLines = `AI Labels (${approvedLabels.length} approved):\n` +
-        approvedLabels.map(l =>
-          `  - ${l.target} (${l.intent}, ${l.model}, confidence ${l.confidence !== null ? (l.confidence * 100).toFixed(0) + '%' : 'N/A'})`
-        ).join('\n');
-    }
-
-    return [
-      `=== Masquerade Export ===`,
-      ``,
-      `Export date: ${manifest.export_timestamp}`,
-      `Source file: ${manifest.source_filename}`,
-      `Total frames: ${manifest.total_frames}`,
-      aiLines,
-      `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
-      ``,
-      `images/`,
-      `  Template-masked ultrasound frames with PHI and irrelevant markings removed.`,
-      `  These are your primary training images.`,
-      ``,
-      `masks/  (included if selected)`,
-      `  Binary segmentation masks. White pixels = AI-detected target structure.`,
-      `  Black pixels = background. Use these to train segmentation models.`,
-      ``,
-      `overlays/  (included if selected)`,
-      `  Visual overlays showing AI detections highlighted in green on the original`,
-      `  frame. Use these to verify segmentation quality before training.`,
-      ``,
-      `manifest.json`,
-      `  Per-frame AI label data including target structure, confidence score,`,
-      `  and approval status. This is the primary AI output for programmatic use.`,
-      ``,
-      `metadata.csv`,
-      `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
-    ].join('\n');
-  }
-
-  /**
-   * Generate metadata CSV for processed images (matching video format exactly)
-   */
-  private generateImageMetadataCSV(
-    processedImages: Array<{ imageNumber: number; buffer: Buffer; originalName: string }>,
-    metadata: any,
-    outputSettings: OutputSettings,
-    maskData?: MaskData,
-    approvedLabels?: AiLabel[]
-  ): string {
-    const headers = [
-      'filename',
-      'image_number',
-      'original_width',
-      'original_height',
-      'output_width',
-      'output_height',
-      'timestamp',
-      'file_size',
-      'status',
-      'ai_target',
-      'ai_confidence'
-    ];
-
-    // Handle different output settings formats (same as video)
-    let outputWidth, outputHeight;
-    if (outputSettings.width && outputSettings.height) {
-      outputWidth = outputSettings.width;
-      outputHeight = outputSettings.height;
-    } else if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
-      const [width, height] = outputSettings.size.split('x').map(Number);
-      outputWidth = width;
-      outputHeight = height;
-    } else if (outputSettings.size === 'original') {
-      outputWidth = metadata.width;
-      outputHeight = metadata.height;
-    } else {
-      outputWidth = 512;
-      outputHeight = 512;
-    }
-
-    const aiTarget = approvedLabels?.map(l => l.target).join('; ') || '';
-    const aiConfidence = approvedLabels?.length
-      ? approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ')
-      : '';
-
-    const rows = processedImages.map(({ imageNumber, buffer, originalName }) => {
-      const paddedNumber = String(imageNumber + 1).padStart(3, '0');
-      const baseOriginalName = originalName.replace(/\.[^.]+$/, '');
-      const filename = `image_${paddedNumber}_${baseOriginalName}.${outputSettings.format}`;
-      const timestamp = new Date().toISOString();
-      const isSuccessful = buffer.length > 0;
-      const status = isSuccessful ? 'success' : 'failed';
-
-      return [
-        filename,
-        imageNumber,
-        metadata.width,
-        metadata.height,
-        outputWidth,
-        outputHeight,
-        timestamp,
-        buffer.length,
-        status,
-        `"${aiTarget}"`,
-        `"${aiConfidence}"`
-      ].join(',');
-    });
-
-    return [headers.join(','), ...rows].join('\n');
   }
 
   private createFrameBatches(totalFrames: number, batchSize: number) {
@@ -1129,159 +818,6 @@ export class VideoProcessor {
     console.log(`Total processed frames: ${processedFrames.length}`);
 
     return processedFrames.sort((a, b) => a.frameNumber - b.frameNumber);
-  }
-
-  private async createOutputZip(
-    jobId: string,
-    processedFrames: Array<{ frameNumber: number; buffer: Buffer }>,
-    metadata: any,
-    outputSettings: OutputSettings,
-    maskData?: MaskData
-  ): Promise<string> {
-    const zipFilename = `processed_frames_${jobId}.zip`;
-    const zipPath = path.join(this.outputDir, zipFilename);
-
-    console.log(`📦 Creating ZIP at: ${zipPath}`);
-    console.log(`📦 Output directory: ${this.outputDir}`);
-
-    // Fetch job info before entering the Promise constructor
-    const job = await storage.getVideoJob(jobId);
-
-    return new Promise((resolve, reject) => {
-      const output = createWriteStream(zipPath);
-      const archive = archiver('zip', { zlib: { level: 9 } });
-
-      output.on('close', () => {
-        console.log(`✅ ZIP created successfully: ${zipPath} (${archive.pointer()} bytes)`);
-        resolve(zipPath);
-      });
-
-      output.on('error', (err: Error) => {
-        console.error(`❌ Output stream error:`, err);
-        reject(err);
-      });
-
-      archive.on('error', (err: Error) => {
-        console.error(`❌ Archive error:`, err);
-        reject(err);
-      });
-
-      archive.on('warning', (err: Error) => {
-        console.warn(`⚠️ Archive warning:`, err);
-      });
-
-      archive.pipe(output);
-
-      // Add processed frames in a frames folder - only include successful frames in ZIP
-      const successfulFrames = processedFrames.filter(frame => frame.buffer.length > 0);
-      console.log(`📦 Found ${successfulFrames.length} successful frames (${processedFrames.length} total attempted)`);
-
-      if (successfulFrames.length === 0) {
-        console.warn(`⚠️ No successful frames to add to ZIP for job ${jobId}`);
-      }
-
-      // Filter to approved AI labels only
-      const allLabels = ((job as any)?.aiLabels || []) as AiLabel[];
-      const approvedLabels = allLabels.filter(l => l.approved);
-
-      // Add manifest.json as the FIRST entry
-      const outputSize = this.resolveOutputSize(outputSettings, metadata);
-      const manifest = this.buildManifest(
-        jobId,
-        job?.filename || 'unknown',
-        successfulFrames.map(f => f.frameNumber),
-        outputSize,
-        outputSettings,
-        maskData,
-        approvedLabels
-      );
-      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-      console.log(`📦 Added manifest.json (${approvedLabels.length} approved labels)`);
-
-      // Add README.txt as the second entry
-      archive.append(this.buildReadme(manifest), { name: 'README.txt' });
-      console.log(`📦 Added README.txt`);
-
-      successfulFrames.forEach(({ frameNumber, buffer }) => {
-        const filename = `images/frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
-        console.log(`📦 Adding frame ${frameNumber} (${buffer.length} bytes) as ${filename}`);
-        archive.append(buffer, { name: filename });
-      });
-
-      // Add metadata CSV if requested
-      if (outputSettings.includeMetadata) {
-        const csvContent = this.generateMetadataCSV(processedFrames, metadata, outputSettings, maskData, approvedLabels);
-        archive.append(csvContent, { name: 'metadata.csv' });
-        console.log(`📦 Added metadata.csv`);
-      }
-
-      console.log(`📦 Finalizing archive...`);
-      archive.finalize();
-    });
-  }
-
-  private generateMetadataCSV(
-    processedFrames: Array<{ frameNumber: number; buffer: Buffer }>,
-    metadata: any,
-    outputSettings: OutputSettings,
-    maskData?: MaskData,
-    approvedLabels?: AiLabel[]
-  ): string {
-    const headers = [
-      'filename',
-      'frame_number',
-      'original_width',
-      'original_height',
-      'output_width',
-      'output_height',
-      'timestamp',
-      'file_size',
-      'status',
-      'ai_target',
-      'ai_confidence'
-    ];
-
-    // Handle different output settings formats
-    let outputWidth, outputHeight;
-    if (outputSettings.width && outputSettings.height) {
-      outputWidth = outputSettings.width;
-      outputHeight = outputSettings.height;
-    } else if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
-      const [width, height] = outputSettings.size.split('x').map(Number);
-      outputWidth = width;
-      outputHeight = height;
-    } else {
-      outputWidth = 512;
-      outputHeight = 512;
-    }
-
-    const aiTarget = approvedLabels?.map(l => l.target).join('; ') || '';
-    const aiConfidence = approvedLabels?.length
-      ? approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ')
-      : '';
-
-    const rows = processedFrames.map(({ frameNumber, buffer }) => {
-      const filename = `frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
-      const timestamp = new Date().toISOString();
-      const isSuccessful = buffer.length > 0;
-      const status = isSuccessful ? 'success' : 'failed';
-
-      return [
-        filename,
-        frameNumber,
-        metadata.width,
-        metadata.height,
-        outputWidth,
-        outputHeight,
-        timestamp,
-        buffer.length,
-        status,
-        `"${aiTarget}"`,
-        `"${aiConfidence}"`
-      ].join(',');
-    });
-
-    return [headers.join(','), ...rows].join('\n');
   }
 
   private async updateProgress(jobId: string, progress: Partial<ProcessingProgress>) {
