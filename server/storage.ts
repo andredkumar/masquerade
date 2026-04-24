@@ -109,5 +109,8 @@ export class MemStorage implements IStorage {
   }
 }
 
-import { PgStorage } from './pgStorage';
-export const storage = process.env.DATABASE_URL ? new PgStorage() : new MemStorage();
+// Always use in-memory storage. PgStorage import is intentionally omitted so
+// that `./db` (which throws if DATABASE_URL is unset) is never loaded and no
+// Neon client is ever initialized. AI label mask/overlay artifacts still live
+// in the separate maskArtifactStore (also in-memory).
+export const storage = new MemStorage();

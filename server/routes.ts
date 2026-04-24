@@ -410,42 +410,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Serve the first processed frame as an image for the Step 3/4/5 canvas preview.
-  // Additive route — no existing route is altered. Reads from the same temp_processed/
-  // folder used by the download builder.
-  app.get("/api/videos/:jobId/first-processed-frame", async (req, res) => {
-    try {
-      const jobId = req.params.jobId;
-      console.log('[DEBUG] first-processed-frame called for job:', jobId);
-      const dirPath = path.join(process.cwd(), 'temp_processed', jobId);
-      console.log('[DEBUG] temp_processed path:', dirPath);
-
-      if (!fs.existsSync(dirPath)) {
-        console.log('[DEBUG] dir does not exist:', dirPath);
-        return res.status(404).json({ error: "No processed frames for this job" });
-      }
-      const files = fs.readdirSync(dirPath)
-        .filter(f => /\.(png|jpe?g)$/i.test(f))
-        .sort();
-      console.log('[DEBUG] files found:', files);
-
-      if (files.length === 0) {
-        return res.status(404).json({ error: "No processed frames for this job" });
-      }
-      const firstPath = path.join(dirPath, files[0]);
-      const ext = path.extname(files[0]).toLowerCase();
-      const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
-      res.setHeader('Content-Type', mime);
-      res.setHeader('Cache-Control', 'no-cache');
-      fs.createReadStream(firstPath).pipe(res);
-    } catch (error) {
-      console.error("First processed frame error:", error);
-      if (!res.headersSent) {
-        res.status(500).json({ error: error instanceof Error ? error.message : "Failed to read frame" });
-      }
-    }
-  });
-
   // Download processed ZIP — built lazily from temp_processed/{jobId}/ on demand.
   // Optional query params: ?masks=true&overlays=true
   app.get("/api/videos/:jobId/download", async (req, res) => {

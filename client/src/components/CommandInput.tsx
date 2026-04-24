@@ -1,18 +1,20 @@
-import { useState, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Loader2, Sparkles, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { Loader2, Sparkles, AlertTriangle, CheckCircle2, X } from "lucide-react";
 import { useWebSocket } from "@/hooks/useWebSocket";
+
+interface VideoMetadata {
+  width?: number;
+  height?: number;
+}
 
 interface CommandInputProps {
   jobId: string | null;
   currentFrame: number;
   firstFrameBase64: string | null;
-  /** bbox drawn on the main-panel canvas, already in image-pixel coordinates */
-  bbox?: { x1: number; y1: number; x2: number; y2: number } | null;
+  videoMetadata?: VideoMetadata | null;
   onMaskGenerated: (maskBase64: string, aiLabel?: { intent: string; target: string; confidence: number | null; model: string }) => void;
-  /** fired after a successful inference so the parent can swap the main-panel preview to the overlay */
-  onOverlayReceived?: (overlayBase64: string | null) => void;
   onLabelAdded?: () => void;
   selectedTask?: string;
 }
@@ -27,12 +29,28 @@ const TASK_PLACEHOLDERS: Record<string, string> = {
 
 type Stage = 'idle' | 'parsing' | 'inferring' | 'done' | 'error' | 'clarify';
 
-export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bbox, onMaskGenerated, onOverlayReceived, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
+interface DisplayBox {
+  x1: number; // display-pixel coords
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
   const [confidence, setConfidence] = useState<number | null>(null);
   const [modelUsed, setModelUsed] = useState<string | null>(null);
+
+  // bbox drawing state (local to this sidebar panel)
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
+  const [box, setBox] = useState<DisplayBox | null>(null);
+  const [displaySize, setDisplaySize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const [overlayDataUrl, setOverlayDataUrl] = useState<string | null>(null);
 
   // Per-frame inference progress (pushed from the server via Socket.IO)
   const { socket } = useWebSocket();
@@ -49,6 +67,119 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
       socket.off('inference-progress', onInferProgress);
     };
   }, [socket, jobId]);
+
+  // Resize canvas internal pixels to match the image's rendered size
+  const syncCanvasSize = useCallback(() => {
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
+    const rect = img.getBoundingClientRect();
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
+    if (w === 0 || h === 0) return;
+    canvas.width = w;
+    canvas.height = h;
+    setDisplaySize({ w, h });
+    redraw(box, w, h);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [box]);
+
+  useEffect(() => {
+    syncCanvasSize();
+    window.addEventListener('resize', syncCanvasSize);
+    return () => window.removeEventListener('resize', syncCanvasSize);
+  }, [syncCanvasSize]);
+
+  // Reset overlay + box when job / frame changes
+  useEffect(() => {
+    setOverlayDataUrl(null);
+    setBox(null);
+  }, [jobId, firstFrameBase64]);
+
+  const redraw = (b: DisplayBox | null, w: number, h: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, w, h);
+    if (!b) return;
+    const rx = Math.min(b.x1, b.x2);
+    const ry = Math.min(b.y1, b.y2);
+    const rw = Math.abs(b.x2 - b.x1);
+    const rh = Math.abs(b.y2 - b.y1);
+    ctx.fillStyle = 'rgba(34, 211, 238, 0.15)';   // cyan tint
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeStyle = 'rgba(34, 211, 238, 0.95)'; // cyan border
+    ctx.lineWidth = 2;
+    ctx.strokeRect(rx + 1, ry + 1, Math.max(0, rw - 2), Math.max(0, rh - 2));
+  };
+
+  const pointFromEvent = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(rect.width, e.clientX - rect.left)),
+      y: Math.max(0, Math.min(rect.height, e.clientY - rect.top)),
+    };
+  };
+
+  const onCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const p = pointFromEvent(e);
+    if (!p) return;
+    setIsDrawing(true);
+    setDrawStart(p);
+    setBox({ x1: p.x, y1: p.y, x2: p.x, y2: p.y });
+    redraw({ x1: p.x, y1: p.y, x2: p.x, y2: p.y }, displaySize.w, displaySize.h);
+  };
+
+  const onCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || !drawStart) return;
+    const p = pointFromEvent(e);
+    if (!p) return;
+    const next = { x1: drawStart.x, y1: drawStart.y, x2: p.x, y2: p.y };
+    setBox(next);
+    redraw(next, displaySize.w, displaySize.h);
+  };
+
+  const onCanvasMouseUp = () => {
+    if (!isDrawing) return;
+    setIsDrawing(false);
+    setDrawStart(null);
+    // Reject tiny boxes (accidental clicks)
+    if (box) {
+      const w = Math.abs(box.x2 - box.x1);
+      const h = Math.abs(box.y2 - box.y1);
+      if (w < 4 || h < 4) {
+        setBox(null);
+        redraw(null, displaySize.w, displaySize.h);
+      }
+    }
+  };
+
+  const clearBox = () => {
+    setBox(null);
+    redraw(null, displaySize.w, displaySize.h);
+  };
+
+  // Convert display-pixel box to actual-image-pixel box
+  const toImagePixelBox = (b: DisplayBox): { x1: number; y1: number; x2: number; y2: number } | null => {
+    const imgW = videoMetadata?.width;
+    const imgH = videoMetadata?.height;
+    if (!imgW || !imgH || displaySize.w === 0 || displaySize.h === 0) return null;
+    const sx = imgW / displaySize.w;
+    const sy = imgH / displaySize.h;
+    const x1 = Math.min(b.x1, b.x2) * sx;
+    const y1 = Math.min(b.y1, b.y2) * sy;
+    const x2 = Math.max(b.x1, b.x2) * sx;
+    const y2 = Math.max(b.y1, b.y2) * sy;
+    return {
+      x1: Math.max(0, Math.min(imgW, Math.round(x1))),
+      y1: Math.max(0, Math.min(imgH, Math.round(y1))),
+      x2: Math.max(0, Math.min(imgW, Math.round(x2))),
+      y2: Math.max(0, Math.min(imgH, Math.round(y2))),
+    };
+  };
 
   const handleSubmit = async () => {
     if (!command.trim() || !jobId) return;
@@ -81,6 +212,8 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
       setStage('inferring');
       setStatusMessage(`Running ${parsed.intent} on "${parsed.target}"...`);
 
+      const pixelBox = box ? toImagePixelBox(box) : null;
+
       const inferRes = await fetch('/api/ai/infer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -88,8 +221,8 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
           jobId,
           command: command.trim(),
           frameBase64: firstFrameBase64?.replace('data:image/png;base64,', ''),
-          bbox: bbox || null,
-          useAutoPrompt: bbox == null,
+          bbox: pixelBox,
+          useAutoPrompt: pixelBox == null,
         }),
       });
 
@@ -109,8 +242,12 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
         });
       }
 
-      // Report the overlay up so the main-panel preview can swap to it
-      onOverlayReceived?.(result.overlayBase64 || null);
+      // Show the GPU's visual overlay on top of the preview (box stays visible)
+      if (result.overlayBase64) {
+        setOverlayDataUrl(`data:image/png;base64,${result.overlayBase64}`);
+      } else {
+        setOverlayDataUrl(null);
+      }
 
       setConfidence(result.confidence);
       setModelUsed(result.modelUsed);
@@ -132,9 +269,51 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
   };
 
   const isLoading = stage === 'parsing' || stage === 'inferring';
+  const previewSrc = overlayDataUrl || firstFrameBase64;
 
   return (
     <div className="px-4 py-3 space-y-3">
+      {/* Frame preview with bbox drawing canvas (in-sidebar) */}
+      {firstFrameBase64 && (
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-muted-foreground leading-tight">
+            Draw a box around the structure you want to segment, then type what it is and click Run.
+          </p>
+          <div className="relative inline-block w-full rounded-md overflow-hidden border border-border bg-black">
+            <img
+              ref={imgRef}
+              src={previewSrc || undefined}
+              alt="Frame preview"
+              className="block w-full h-auto select-none"
+              draggable={false}
+              onLoad={syncCanvasSize}
+              data-testid="command-frame-preview"
+            />
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 w-full h-full"
+              style={{ cursor: isDrawing ? 'crosshair' : (box ? 'default' : 'crosshair') }}
+              onMouseDown={onCanvasMouseDown}
+              onMouseMove={onCanvasMouseMove}
+              onMouseUp={onCanvasMouseUp}
+              onMouseLeave={onCanvasMouseUp}
+              data-testid="command-bbox-canvas"
+            />
+            {box && (
+              <button
+                type="button"
+                onClick={clearBox}
+                className="absolute top-1 right-1 flex items-center gap-1 rounded bg-background/90 text-foreground border border-border px-1.5 py-0.5 text-[10px] shadow-sm hover:bg-muted"
+                data-testid="command-clear-box"
+              >
+                <X size={10} />
+                Clear box
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="flex gap-2">
         <Input
           value={command}
@@ -159,18 +338,6 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, bb
           )}
         </Button>
       </div>
-
-      {/* Bbox hint */}
-      {bbox && stage !== 'inferring' && stage !== 'parsing' && (
-        <div className="text-[11px] text-muted-foreground">
-          Box prompt set — Run AI will use your drawn region.
-        </div>
-      )}
-      {!bbox && stage === 'idle' && (
-        <div className="text-[11px] text-muted-foreground">
-          Draw a box on the preview for best results, or skip to use auto-detection.
-        </div>
-      )}
 
       {/* Status area */}
       {stage !== 'idle' && (

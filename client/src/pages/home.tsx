@@ -6,7 +6,6 @@ import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
-import BboxCanvas, { type PixelBox } from "@/components/BboxCanvas";
 import TaskSelector from "@/components/TaskSelector";
 import { Button } from "@/components/ui/button";
 import { Settings, Video, Download, Lock, Upload, Check, X, Info } from "lucide-react";
@@ -28,15 +27,6 @@ export default function Home() {
   const [includeMasks, setIncludeMasks] = useState(false);
   const [includeOverlays, setIncludeOverlays] = useState(false);
 
-  // Step 4 (AI Analysis) — shared between the main-panel BboxCanvas and the sidebar CommandInput
-  const [aiBbox, setAiBbox] = useState<PixelBox | null>(null);
-  const [aiOverlayBase64, setAiOverlayBase64] = useState<string | null>(null);
-
-  // Once the job has been template-masked (status='completed'), show the PROCESSED
-  // first frame (from temp_processed/{jobId}/) rather than the raw upload. Falls
-  // back to the raw frame before processing completes.
-  // Cache-busted by currentJob so re-uploads always fetch fresh.
-
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
     queryKey: ['/api/videos', currentJob],
@@ -46,19 +36,6 @@ export default function Home() {
 
   const job = (jobData as any)?.job;
   const jobCompleted = job?.status === 'completed';
-
-  // URL for the first template-masked frame. Served additively by the backend from
-  // temp_processed/{jobId}/. Only available once the job reports 'completed'.
-  const processedFirstFrameUrl = jobCompleted && currentJob
-    ? `/api/videos/${currentJob}/first-processed-frame`
-    : null;
-
-  // [DEBUG] Trace processed-frame URL changes
-  useEffect(() => {
-    console.log('[DEBUG] processedFirstFrameUrl:', processedFirstFrameUrl,
-                'jobCompleted:', jobCompleted, 'currentJob:', currentJob,
-                'jobStatus:', job?.status);
-  }, [processedFirstFrameUrl, jobCompleted, currentJob, job?.status]);
 
   // Reset processing state when job completes
   useEffect(() => {
@@ -78,9 +55,6 @@ export default function Home() {
     setMaskData(null);
     setIsProcessing(false);
     setLastProcessedSettings(null);
-    // Reset Step 4 UI state so a fresh upload doesn't reuse the old overlay/box
-    setAiBbox(null);
-    setAiOverlayBase64(null);
     setAiLabels([]);
   };
 
@@ -281,9 +255,8 @@ export default function Home() {
                 jobId={currentJob}
                 currentFrame={currentFrame}
                 firstFrameBase64={firstFrame}
-                bbox={aiBbox}
+                videoMetadata={videoMetadata}
                 onMaskGenerated={handleAiMaskGenerated}
-                onOverlayReceived={setAiOverlayBase64}
                 onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}
               />
@@ -440,27 +413,14 @@ export default function Home() {
         {/* Main Content Area */}
         <main className="flex-1 flex flex-col">
           <div className="flex-1 p-6 relative">
-            {step4Enabled ? (
-              // Step 4 is active — show the large bbox drawing preview on top of the
-              // TEMPLATE-MASKED processed frame (from temp_processed/{jobId}/). Falls
-              // back to the raw first frame while the processed frame isn't yet available.
-              // Controls (intent input, Run, label list) remain in the sidebar.
-              <BboxCanvas
-                frameBase64={processedFirstFrameUrl || firstFrame}
-                overlayBase64={aiOverlayBase64}
-                imageDimensions={videoMetadata ? { width: videoMetadata.width, height: videoMetadata.height } : null}
-                onBboxChange={setAiBbox}
-              />
-            ) : (
-              <MaskingCanvas
-                firstFrame={firstFrame}
-                selectedTool={selectedTool}
-                onMaskUpdate={handleMaskUpdate}
-                zoom={canvasZoom}
-                onZoomChange={setCanvasZoom}
-                maskData={maskData}
-              />
-            )}
+            <MaskingCanvas
+              firstFrame={firstFrame}
+              selectedTool={selectedTool}
+              onMaskUpdate={handleMaskUpdate}
+              zoom={canvasZoom}
+              onZoomChange={setCanvasZoom}
+              maskData={maskData}
+            />
 
             {/* Processing Started Indicator - Top Right of Canvas */}
             {isProcessing && (
