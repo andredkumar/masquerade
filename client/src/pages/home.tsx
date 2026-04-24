@@ -6,6 +6,7 @@ import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput from "@/components/CommandInput";
+import BboxCanvas, { type PixelBox } from "@/components/BboxCanvas";
 import TaskSelector from "@/components/TaskSelector";
 import { Button } from "@/components/ui/button";
 import { Settings, Video, Download, Lock, Upload, Check, X, Info } from "lucide-react";
@@ -26,6 +27,10 @@ export default function Home() {
   const [selectedTask, setSelectedTask] = useState('segment');
   const [includeMasks, setIncludeMasks] = useState(false);
   const [includeOverlays, setIncludeOverlays] = useState(false);
+
+  // Step 4 (AI Analysis) — shared between the main-panel BboxCanvas and the sidebar CommandInput
+  const [aiBbox, setAiBbox] = useState<PixelBox | null>(null);
+  const [aiOverlayBase64, setAiOverlayBase64] = useState<string | null>(null);
 
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
@@ -254,8 +259,9 @@ export default function Home() {
                 jobId={currentJob}
                 currentFrame={currentFrame}
                 firstFrameBase64={firstFrame}
-                videoMetadata={videoMetadata}
+                bbox={aiBbox}
                 onMaskGenerated={handleAiMaskGenerated}
+                onOverlayReceived={setAiOverlayBase64}
                 onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}
               />
@@ -412,14 +418,26 @@ export default function Home() {
         {/* Main Content Area */}
         <main className="flex-1 flex flex-col">
           <div className="flex-1 p-6 relative">
-            <MaskingCanvas
-              firstFrame={firstFrame}
-              selectedTool={selectedTool}
-              onMaskUpdate={handleMaskUpdate}
-              zoom={canvasZoom}
-              onZoomChange={setCanvasZoom}
-              maskData={maskData}
-            />
+            {step4Enabled ? (
+              // Step 4 is active — show the large bbox drawing preview instead of the
+              // template-mask canvas. Controls (intent input, Run, label list) remain in
+              // the sidebar. Drawn boxes are reported up as image-pixel coordinates.
+              <BboxCanvas
+                frameBase64={firstFrame}
+                overlayBase64={aiOverlayBase64}
+                imageDimensions={videoMetadata ? { width: videoMetadata.width, height: videoMetadata.height } : null}
+                onBboxChange={setAiBbox}
+              />
+            ) : (
+              <MaskingCanvas
+                firstFrame={firstFrame}
+                selectedTool={selectedTool}
+                onMaskUpdate={handleMaskUpdate}
+                zoom={canvasZoom}
+                onZoomChange={setCanvasZoom}
+                maskData={maskData}
+              />
+            )}
 
             {/* Processing Started Indicator - Top Right of Canvas */}
             {isProcessing && (
