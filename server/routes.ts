@@ -569,32 +569,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `  These are your primary training images.`,
         ``,
       ];
-      const multiLabel = approvedLabels.length > 1;
       if (hasAnyMasks) {
         readmeSections.push(
           `masks/`,
-          `  Binary segmentation masks. White pixels = AI-detected target structure.`,
-          `  Black pixels = background. Use these to train segmentation models.`,
+          `  One subfolder per analysis run, named analysis_N_<target>.`,
+          `  Each subfolder contains one binary mask PNG per frame.`,
+          `  White pixels = AI-detected region. Black = background.`,
+          ``,
         );
-        if (multiLabel) {
-          readmeSections.push(
-            `  One file per label per frame: frame_NNNNNN_<target>_mask.png`,
-          );
-        }
-        readmeSections.push(``);
       }
       if (hasAnyOverlays) {
         readmeSections.push(
           `overlays/`,
-          `  Visual overlays showing AI detections highlighted in green on the original`,
-          `  frame. Use these to verify segmentation quality before training.`,
+          `  One subfolder per analysis run, named analysis_N_<target>.`,
+          `  Each subfolder contains one overlay PNG per frame (green highlight on image).`,
+          ``,
         );
-        if (multiLabel) {
-          readmeSections.push(
-            `  One file per label per frame: frame_NNNNNN_<target>_overlay.png`,
-          );
-        }
-        readmeSections.push(``);
       }
       readmeSections.push(
         `manifest.json`,
@@ -646,12 +636,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // 3. metadata.csv
       archive.append(csv, { name: 'metadata.csv' });
 
-      // 4. Frames + optional per-label, per-frame mask/overlay companions
-      //    When multiple approved labels exist, each gets its own file per frame:
-      //      masks/frame_000000_pleural_line_mask.png
-      //      masks/frame_000000_effusion_mask.png
-      //    When only one approved label exists, the target suffix is dropped for simplicity.
-      const singleLabel = approvedLabels.length === 1;
+      // 4. Frames + optional per-label, per-frame mask/overlay companions.
+      //    Organized into one subfolder per approved label (aka "analysis run"):
+      //      masks/analysis_1_pleural_line/frame_000000_mask.png
+      //      masks/analysis_2_effusion/frame_000000_mask.png
+      //      overlays/analysis_1_pleural_line/frame_000000_overlay.png
+      //      overlays/analysis_2_effusion/frame_000000_overlay.png
+      //    Subfolder naming is stable across single-label and multi-label jobs.
+      //    archiver auto-creates the directory entries when files are appended.
+      const analysisFolders = approvedLabels.map((label, i) =>
+        `analysis_${i + 1}_${slugifyTarget(label.target)}`
+      );
       for (let i = 0; i < frameFiles.length; i++) {
         const filename = frameFiles[i];
         const { index, paddedNum, ext } = extractFrameIndex(filename, i);
@@ -659,23 +654,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
 
         if (includeMasks) {
-          for (const label of approvedLabels) {
-            const maskBuf = getLabelFrameMask(label, index);
+          for (let li = 0; li < approvedLabels.length; li++) {
+            const maskBuf = getLabelFrameMask(approvedLabels[li], index);
             if (!maskBuf) continue;
-            const name = singleLabel
-              ? `masks/frame_${paddedNum}_mask.png`
-              : `masks/frame_${paddedNum}_${slugifyTarget(label.target)}_mask.png`;
-            archive.append(maskBuf, { name });
+            archive.append(maskBuf, {
+              name: `masks/${analysisFolders[li]}/frame_${paddedNum}_mask.png`,
+            });
           }
         }
         if (includeOverlays) {
-          for (const label of approvedLabels) {
-            const overlayBuf = getLabelFrameOverlay(label, index);
+          for (let li = 0; li < approvedLabels.length; li++) {
+            const overlayBuf = getLabelFrameOverlay(approvedLabels[li], index);
             if (!overlayBuf) continue;
-            const name = singleLabel
-              ? `overlays/frame_${paddedNum}_overlay.png`
-              : `overlays/frame_${paddedNum}_${slugifyTarget(label.target)}_overlay.png`;
-            archive.append(overlayBuf, { name });
+            archive.append(overlayBuf, {
+              name: `overlays/${analysisFolders[li]}/frame_${paddedNum}_overlay.png`,
+            });
           }
         }
       }
