@@ -532,21 +532,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ).join('\n');
         }
 
-        const fileList = [
-          `  manifest.json  — full metadata (machine-readable)`,
-          `  metadata.csv   — per-frame data (spreadsheet)`,
-          `  README.txt     — this file`,
-          `  frames/frame_*.${manifest.output_format || 'png'}  — masked frames`,
+        const sections: string[] = [
+          `images/`,
+          `  Template-masked ultrasound frames with PHI and irrelevant markings removed.`,
+          `  These are your primary training images.`,
+          ``,
         ];
         if (includeMasks && maskBuffer) {
-          fileList.push(`  frames/frame_*_mask.png  — binary segmentation masks`);
+          sections.push(
+            `masks/`,
+            `  Binary segmentation masks. White pixels = AI-detected target structure.`,
+            `  Black pixels = background. Use these to train segmentation models.`,
+            ``,
+          );
         }
         if (includeOverlays && overlayBuffer) {
-          fileList.push(`  frames/frame_*_overlay.png  — visual overlay images`);
+          sections.push(
+            `overlays/`,
+            `  Visual overlays showing AI detections highlighted in green on the original`,
+            `  frame. Use these to verify segmentation quality before training.`,
+            ``,
+          );
         }
+        sections.push(
+          `manifest.json`,
+          `  Per-frame AI label data including target structure, confidence score,`,
+          `  and approval status. This is the primary AI output for programmatic use.`,
+          ``,
+          `metadata.csv`,
+          `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
+        );
 
         return [
-          `Masquerade Export — masqueradeimage.com`,
+          `=== Masquerade Export ===`,
           ``,
           `Export date: ${manifest.export_timestamp}`,
           `Source file: ${manifest.source_filename}`,
@@ -554,8 +572,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           aiLines,
           `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
           ``,
-          `Files:`,
-          ...fileList,
+          ...sections,
         ].join('\n');
       };
 
@@ -578,23 +595,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // 2. Add updated README.txt
       archive.append(buildReadme(updatedManifest), { name: 'README.txt' });
 
-      // 3. Copy all other files from the original ZIP and add mask/overlay PNGs per frame
+      // 3. Copy all other files from the original ZIP into the new subfolder layout,
+      //    and add mask/overlay PNGs per frame into their own subfolders.
       for (const entry of directory.files) {
         if (entry.path === 'manifest.json' || entry.path === 'README.txt') continue;
         if (entry.type === 'Directory') continue;
-        const buf = await entry.buffer();
-        archive.append(buf, { name: entry.path });
 
-        // For each frame file, optionally add companion mask/overlay PNGs
-        const frameMatch = entry.path.match(/^frames\/frame_(\d+)\.\w+$/);
+        // Match a frame file under either the legacy `frames/` or new `images/` folder
+        const frameMatch = entry.path.match(/^(?:frames|images)\/frame_(\d+)\.(\w+)$/);
+        const buf = await entry.buffer();
+
         if (frameMatch) {
           const paddedNum = frameMatch[1];
+          const ext = frameMatch[2];
+          // Normalize raw frame into images/ subfolder
+          archive.append(buf, { name: `images/frame_${paddedNum}.${ext}` });
+          // Optional add-ons go into their own subfolders
           if (includeMasks && maskBuffer) {
-            archive.append(maskBuffer, { name: `frames/frame_${paddedNum}_mask.png` });
+            archive.append(maskBuffer, { name: `masks/frame_${paddedNum}_mask.png` });
           }
           if (includeOverlays && overlayBuffer) {
-            archive.append(overlayBuffer, { name: `frames/frame_${paddedNum}_overlay.png` });
+            archive.append(overlayBuffer, { name: `overlays/frame_${paddedNum}_overlay.png` });
           }
+        } else {
+          // Non-frame files (e.g. metadata.csv) pass through unchanged
+          archive.append(buf, { name: entry.path });
         }
       }
 

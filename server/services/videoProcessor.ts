@@ -824,7 +824,7 @@ export class VideoProcessor {
     }
 
     return [
-      `Masquerade Export — masqueradeimage.com`,
+      `=== Masquerade Export ===`,
       ``,
       `Export date: ${manifest.export_timestamp}`,
       `Source file: ${manifest.source_filename}`,
@@ -832,11 +832,24 @@ export class VideoProcessor {
       aiLines,
       `Splits: train=${splitCounts.train}, val=${splitCounts.val}, test=${splitCounts.test}`,
       ``,
-      `Files:`,
-      `  manifest.json  — full metadata (machine-readable)`,
-      `  metadata.csv   — per-frame data (spreadsheet)`,
-      `  README.txt     — this file`,
-      `  frame_*.${manifest.output_format}  — masked frames`,
+      `images/`,
+      `  Template-masked ultrasound frames with PHI and irrelevant markings removed.`,
+      `  These are your primary training images.`,
+      ``,
+      `masks/  (included if selected)`,
+      `  Binary segmentation masks. White pixels = AI-detected target structure.`,
+      `  Black pixels = background. Use these to train segmentation models.`,
+      ``,
+      `overlays/  (included if selected)`,
+      `  Visual overlays showing AI detections highlighted in green on the original`,
+      `  frame. Use these to verify segmentation quality before training.`,
+      ``,
+      `manifest.json`,
+      `  Per-frame AI label data including target structure, confidence score,`,
+      `  and approval status. This is the primary AI output for programmatic use.`,
+      ``,
+      `metadata.csv`,
+      `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
     ].join('\n');
   }
 
@@ -1190,7 +1203,7 @@ export class VideoProcessor {
       console.log(`📦 Added README.txt`);
 
       successfulFrames.forEach(({ frameNumber, buffer }) => {
-        const filename = `frames/frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
+        const filename = `images/frame_${String(frameNumber).padStart(6, '0')}.${outputSettings.format}`;
         console.log(`📦 Adding frame ${frameNumber} (${buffer.length} bytes) as ${filename}`);
         archive.append(buffer, { name: filename });
       });
