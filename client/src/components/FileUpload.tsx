@@ -315,104 +315,53 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
         </div>
       )}
 
-      {/* Upload Complete */}
+      {/* Upload Complete — compact single-line summary with reset X */}
       {uploadMutation.isSuccess && currentFiles.length > 0 && (
-        <div className="mt-4 p-3 bg-muted rounded-lg" data-testid="upload-complete">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium flex items-center gap-2">
-              {fileType === 'video' ? <FileVideo size={16} /> : <FileImage size={16} />}
-              {fileType === 'video' 
-                ? currentFiles[0].name 
-                : `${currentFiles.length} image${currentFiles.length > 1 ? 's' : ''}`
+        <div className="mt-4 px-3 py-2 bg-muted rounded-lg flex items-center justify-between" data-testid="upload-complete">
+          <span className="text-sm font-medium flex items-center gap-2 min-w-0">
+            <span className="text-green-500 shrink-0">✓</span>
+            {fileType === 'video' ? <FileVideo size={14} className="shrink-0" /> : <FileImage size={14} className="shrink-0" />}
+            <span className="truncate">
+              {fileType === 'video'
+                ? `${currentFiles[0].name} ready`
+                : `${currentFiles.length} frame${currentFiles.length > 1 ? 's' : ''} ready`
               }
             </span>
-            <span className="text-xs text-muted-foreground">
-              {fileType === 'video' 
-                ? `${(currentFiles[0].size / (1024 * 1024)).toFixed(1)} MB`
-                : `${(currentFiles.reduce((acc, file) => acc + file.size, 0) / (1024 * 1024)).toFixed(1)} MB total`
-              }
-            </span>
-          </div>
-          <Progress value={100} className="mb-2" />
-          
-          {/* Show file list for images */}
-          {fileType === 'images' && currentFiles.length > 1 && (
-            <div className="mb-3">
-              <div className="text-xs text-muted-foreground mb-2">Files:</div>
-              <div className="max-h-32 overflow-y-auto space-y-1">
-                {currentFiles.map((file, index) => (
-                  <div key={index} className="flex items-center justify-between text-xs bg-background rounded px-2 py-1">
-                    <span className="truncate">{file.name}</span>
-                    <span className="text-muted-foreground ml-2">
-                      {(file.size / (1024 * 1024)).toFixed(1)} MB
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          
-          <div className="flex justify-between items-center">
-            <div className="text-xs text-muted-foreground">
-              <div>Upload Complete</div>
-              <div>Ready for masking</div>
-            </div>
-            <Button 
-              size="sm" 
-              variant="outline" 
-              onClick={handleReset}
-              data-testid="upload-new-file-button"
-            >
-              Upload New Files
-            </Button>
-          </div>
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={handleReset}
+            className="h-6 w-6 p-0 shrink-0 ml-2"
+            title="Clear uploaded files"
+            data-testid="upload-new-file-button"
+          >
+            <X size={14} />
+          </Button>
         </div>
       )}
       
-      {/* Selected Files Preview (before upload) */}
+      {/* Selected Files Preview (before upload) — also compact */}
       {!uploadMutation.isPending && !uploadMutation.isSuccess && currentFiles.length > 0 && (
-        <div className="mt-4 p-3 bg-muted rounded-lg">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium flex items-center gap-2">
-              {fileType === 'video' ? <FileVideo size={16} /> : <FileImage size={16} />}
-              {fileType === 'video' 
-                ? 'Video Ready' 
-                : `${currentFiles.length} Image${currentFiles.length > 1 ? 's' : ''} Ready`
+        <div className="mt-4 px-3 py-2 bg-muted rounded-lg flex items-center justify-between">
+          <span className="text-sm font-medium flex items-center gap-2 min-w-0">
+            {fileType === 'video' ? <FileVideo size={14} className="shrink-0" /> : <FileImage size={14} className="shrink-0" />}
+            <span className="truncate">
+              {fileType === 'video'
+                ? `${currentFiles[0].name}`
+                : `${currentFiles.length} frame${currentFiles.length > 1 ? 's' : ''} selected`
               }
             </span>
-            <Button size="sm" variant="ghost" onClick={handleReset}>
-              <X size={14} />
-            </Button>
-          </div>
-          
-          {fileType === 'images' && (
-            <div className="space-y-2">
-              {currentFiles.map((file, index) => (
-                <div key={index} className="flex items-center justify-between text-xs bg-background rounded px-2 py-1">
-                  <span className="truncate">{file.name}</span>
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">
-                      {(file.size / (1024 * 1024)).toFixed(1)} MB
-                    </span>
-                    <Button 
-                      size="sm" 
-                      variant="ghost" 
-                      className="h-4 w-4 p-0"
-                      onClick={() => removeFile(index)}
-                    >
-                      <X size={12} />
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          
-          {fileType === 'video' && (
-            <div className="text-xs text-muted-foreground">
-              {currentFiles[0].name} ({(currentFiles[0].size / (1024 * 1024)).toFixed(1)} MB)
-            </div>
-          )}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={handleReset}
+            className="h-6 w-6 p-0 shrink-0 ml-2"
+            title="Clear selection"
+          >
+            <X size={14} />
+          </Button>
         </div>
       )}
     </div>

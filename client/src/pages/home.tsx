@@ -32,6 +32,11 @@ export default function Home() {
   const [aiBbox, setAiBbox] = useState<PixelBox | null>(null);
   const [aiOverlayBase64, setAiOverlayBase64] = useState<string | null>(null);
 
+  // Once the job has been template-masked (status='completed'), show the PROCESSED
+  // first frame (from temp_processed/{jobId}/) rather than the raw upload. Falls
+  // back to the raw frame before processing completes.
+  // Cache-busted by currentJob so re-uploads always fetch fresh.
+
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
     queryKey: ['/api/videos', currentJob],
@@ -41,6 +46,12 @@ export default function Home() {
 
   const job = (jobData as any)?.job;
   const jobCompleted = job?.status === 'completed';
+
+  // URL for the first template-masked frame. Served additively by the backend from
+  // temp_processed/{jobId}/. Only available once the job reports 'completed'.
+  const processedFirstFrameUrl = jobCompleted && currentJob
+    ? `/api/videos/${currentJob}/first-processed-frame`
+    : null;
 
   // Reset processing state when job completes
   useEffect(() => {
@@ -60,6 +71,10 @@ export default function Home() {
     setMaskData(null);
     setIsProcessing(false);
     setLastProcessedSettings(null);
+    // Reset Step 4 UI state so a fresh upload doesn't reuse the old overlay/box
+    setAiBbox(null);
+    setAiOverlayBase64(null);
+    setAiLabels([]);
   };
 
   const handleMaskUpdate = (newMaskData: MaskData) => {
@@ -419,11 +434,12 @@ export default function Home() {
         <main className="flex-1 flex flex-col">
           <div className="flex-1 p-6 relative">
             {step4Enabled ? (
-              // Step 4 is active — show the large bbox drawing preview instead of the
-              // template-mask canvas. Controls (intent input, Run, label list) remain in
-              // the sidebar. Drawn boxes are reported up as image-pixel coordinates.
+              // Step 4 is active — show the large bbox drawing preview on top of the
+              // TEMPLATE-MASKED processed frame (from temp_processed/{jobId}/). Falls
+              // back to the raw first frame while the processed frame isn't yet available.
+              // Controls (intent input, Run, label list) remain in the sidebar.
               <BboxCanvas
-                frameBase64={firstFrame}
+                frameBase64={processedFirstFrameUrl || firstFrame}
                 overlayBase64={aiOverlayBase64}
                 imageDimensions={videoMetadata ? { width: videoMetadata.width, height: videoMetadata.height } : null}
                 onBboxChange={setAiBbox}
