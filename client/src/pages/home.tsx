@@ -254,6 +254,7 @@ export default function Home() {
                 jobId={currentJob}
                 currentFrame={currentFrame}
                 firstFrameBase64={firstFrame}
+                videoMetadata={videoMetadata}
                 onMaskGenerated={handleAiMaskGenerated}
                 onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}

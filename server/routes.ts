@@ -665,7 +665,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ── AI: Run inference on a single frame ──────────────────────
   app.post("/api/ai/infer", async (req, res) => {
     try {
-      const { jobId, command, frameBase64 } = req.body;
+      const { jobId, command, frameBase64, bbox, useAutoPrompt } = req.body;
 
       if (!jobId || !command) {
         return res.status(400).json({
@@ -718,6 +718,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         imageBase64: resolvedFrameBase64,
         intent: parsedIntent,
         jobId,
+        bbox: bbox || null,
+        useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
       });
 
       // 6. Store the AI label on the job record (with mask/overlay artifacts)
@@ -742,6 +744,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({
         parsedIntent,
         maskBase64: result.maskBase64,
+        overlayBase64: result.overlayBase64,
         confidence: result.confidence,
         modelUsed: result.modelUsed,
         inferenceMs: result.inferenceMs,

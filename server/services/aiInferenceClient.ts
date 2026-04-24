@@ -11,6 +11,8 @@ export interface InferenceRequest {
   imageBase64: string;   // PNG frame as base64 string (no data: prefix)
   intent: ParsedIntent;  // from shared/schema.ts
   jobId?: string;        // passed through to GPU service for tracking
+  bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn bbox prompt
+  useAutoPrompt?: boolean; // false when bbox is provided, true to let GPU auto-pick
 }
 
 export interface InferenceResult {
@@ -56,9 +58,9 @@ export class AIInferenceClient {
         job_id: request.jobId || 'unknown',
         image_b64: request.imageBase64,
         target: request.intent.target || 'unknown',
-        bbox: null,             // will add UI bbox drawing later
+        bbox: request.bbox ?? null,
         points: null,           // will add point prompts later
-        use_auto_prompt: true,  // let MedSAM2 auto-generate center bbox
+        use_auto_prompt: request.useAutoPrompt ?? (request.bbox == null),
       };
 
       console.log(`🤖 Calling MedSAM2 at ${SAM2_SERVICE_URL}/segment — target: "${body.target}"`);
