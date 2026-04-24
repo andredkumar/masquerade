@@ -448,44 +448,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
       const approvedLabels = allLabels.filter(l => l.approved);
 
-      // Pick the primary approved label that owns the per-frame inference results.
-      // If multiple approved labels exist, use the first that has frameResults.
-      const primaryLabel = approvedLabels.find(l => l.frameResults && Object.keys(l.frameResults).length > 0)
-        || approvedLabels[0]
-        || null;
+      // Slugify a target string so it's safe as a filename fragment
+      //   "Pleural Line" → "pleural_line"
+      const slugifyTarget = (s: string): string => {
+        const slug = (s || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+        return slug || 'unknown';
+      };
 
-      // Per-frame getter: returns the mask/overlay buffer for a given frame index, or null
-      // if no approved label has that artifact for that frame.
-      const getFrameMask = (frameIdx: number): Buffer | null => {
-        if (!primaryLabel) return null;
-        const r = primaryLabel.frameResults?.[frameIdx];
+      // Per-label, per-frame getters — each approved label has its OWN frameResults
+      const getLabelFrameMask = (label: AiLabel, frameIdx: number): Buffer | null => {
+        const r = label.frameResults?.[frameIdx];
         if (r?.maskB64) return Buffer.from(r.maskB64, 'base64');
-        if (primaryLabel.maskB64) return Buffer.from(primaryLabel.maskB64, 'base64'); // single-frame fallback
+        if (label.maskB64) return Buffer.from(label.maskB64, 'base64'); // single-frame fallback
         return null;
       };
-      const getFrameOverlay = (frameIdx: number): Buffer | null => {
-        if (!primaryLabel) return null;
-        const r = primaryLabel.frameResults?.[frameIdx];
+      const getLabelFrameOverlay = (label: AiLabel, frameIdx: number): Buffer | null => {
+        const r = label.frameResults?.[frameIdx];
         if (r?.overlayB64) return Buffer.from(r.overlayB64, 'base64');
-        if (primaryLabel.overlayB64) return Buffer.from(primaryLabel.overlayB64, 'base64');
+        if (label.overlayB64) return Buffer.from(label.overlayB64, 'base64');
         return null;
       };
-      const getFrameConfidence = (frameIdx: number): number | null => {
-        if (!primaryLabel) return null;
-        const r = primaryLabel.frameResults?.[frameIdx];
+      const getLabelFrameConfidence = (label: AiLabel, frameIdx: number): number | null => {
+        const r = label.frameResults?.[frameIdx];
         if (r && typeof r.confidence === 'number') return r.confidence;
-        return primaryLabel.confidence ?? null;
+        return label.confidence ?? null;
       };
 
-      // Precompute whether the add-on folders will have any content at all
-      // (so we don't write a README section for an empty folder).
-      const hasAnyMasks = includeMasks && !!primaryLabel && (
-        (primaryLabel.frameResults && Object.values(primaryLabel.frameResults).some(r => !!r.maskB64)) ||
-        !!primaryLabel.maskB64
+      // True if at least one approved label has at least one per-frame mask/overlay artifact
+      const hasAnyMasks = includeMasks && approvedLabels.some(l =>
+        (l.frameResults && Object.values(l.frameResults).some(r => !!r.maskB64)) || !!l.maskB64
       );
-      const hasAnyOverlays = includeOverlays && !!primaryLabel && (
-        (primaryLabel.frameResults && Object.values(primaryLabel.frameResults).some(r => !!r.overlayB64)) ||
-        !!primaryLabel.overlayB64
+      const hasAnyOverlays = includeOverlays && approvedLabels.some(l =>
+        (l.frameResults && Object.values(l.frameResults).some(r => !!r.overlayB64)) || !!l.overlayB64
       );
 
       // Top-level AI labels in the manifest (unchanged top-level confidence is the first-frame one)
@@ -524,12 +518,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const outputFormat = (job as any).outputSettings?.format || 'png';
       const manifestFrames = frameFiles.map((filename, i) => {
         const { index } = extractFrameIndex(filename, i);
-        // Per-frame AI labels use THIS frame's individual confidence, not a copied value
-        const frameConf = getFrameConfidence(index);
+        // Each approved label carries THIS frame's individual confidence (from that
+        // label's own frameResults), so multi-label exports show distinct scores
+        // per label per frame rather than a shared value.
         const perFrameLabels = approvedLabels.map(l => ({
           intent: l.intent,
           target: l.target,
-          confidence: l.id === primaryLabel?.id ? frameConf : l.confidence,
+          confidence: getLabelFrameConfidence(l, index),
           model: l.model,
           approved: l.approved,
           bbox: l.bbox || null,
@@ -574,21 +569,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `  These are your primary training images.`,
         ``,
       ];
+      const multiLabel = approvedLabels.length > 1;
       if (hasAnyMasks) {
         readmeSections.push(
           `masks/`,
           `  Binary segmentation masks. White pixels = AI-detected target structure.`,
           `  Black pixels = background. Use these to train segmentation models.`,
-          ``,
         );
+        if (multiLabel) {
+          readmeSections.push(
+            `  One file per label per frame: frame_NNNNNN_<target>_mask.png`,
+          );
+        }
+        readmeSections.push(``);
       }
       if (hasAnyOverlays) {
         readmeSections.push(
           `overlays/`,
           `  Visual overlays showing AI detections highlighted in green on the original`,
           `  frame. Use these to verify segmentation quality before training.`,
-          ``,
         );
+        if (multiLabel) {
+          readmeSections.push(
+            `  One file per label per frame: frame_NNNNNN_<target>_overlay.png`,
+          );
+        }
+        readmeSections.push(``);
       }
       readmeSections.push(
         `manifest.json`,
@@ -640,7 +646,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // 3. metadata.csv
       archive.append(csv, { name: 'metadata.csv' });
 
-      // 4. Frames + optional per-frame mask/overlay companions
+      // 4. Frames + optional per-label, per-frame mask/overlay companions
+      //    When multiple approved labels exist, each gets its own file per frame:
+      //      masks/frame_000000_pleural_line_mask.png
+      //      masks/frame_000000_effusion_mask.png
+      //    When only one approved label exists, the target suffix is dropped for simplicity.
+      const singleLabel = approvedLabels.length === 1;
       for (let i = 0; i < frameFiles.length; i++) {
         const filename = frameFiles[i];
         const { index, paddedNum, ext } = extractFrameIndex(filename, i);
@@ -648,15 +659,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
         archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
 
         if (includeMasks) {
-          const frameMask = getFrameMask(index);
-          if (frameMask) {
-            archive.append(frameMask, { name: `masks/frame_${paddedNum}_mask.png` });
+          for (const label of approvedLabels) {
+            const maskBuf = getLabelFrameMask(label, index);
+            if (!maskBuf) continue;
+            const name = singleLabel
+              ? `masks/frame_${paddedNum}_mask.png`
+              : `masks/frame_${paddedNum}_${slugifyTarget(label.target)}_mask.png`;
+            archive.append(maskBuf, { name });
           }
         }
         if (includeOverlays) {
-          const frameOverlay = getFrameOverlay(index);
-          if (frameOverlay) {
-            archive.append(frameOverlay, { name: `overlays/frame_${paddedNum}_overlay.png` });
+          for (const label of approvedLabels) {
+            const overlayBuf = getLabelFrameOverlay(label, index);
+            if (!overlayBuf) continue;
+            const name = singleLabel
+              ? `overlays/frame_${paddedNum}_overlay.png`
+              : `overlays/frame_${paddedNum}_${slugifyTarget(label.target)}_overlay.png`;
+            archive.append(overlayBuf, { name });
           }
         }
       }
@@ -806,11 +825,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ error: "Inference produced no results" });
       }
 
-      // 6. Store the AI label on the job record
-      // - maskB64/overlayB64/confidence = first frame (for preview)
-      // - frameResults = full per-frame map (used by the download route)
-      // - bbox = the prompt the user actually drew (so it appears in manifest.json)
-      const existingLabels = ((job as any).aiLabels || []) as AiLabel[];
+      // 6. Store the AI label on the job record.
+      //    IMPORTANT: re-fetch the job RIGHT BEFORE writing so we see any labels
+      //    added by concurrent Run clicks (the per-frame loop above can take
+      //    minutes, during which the user could initiate another inference).
+      //    Without this re-fetch, two in-flight runs would both start from the
+      //    same snapshot and the second write would clobber the first.
+      const latestJob = await storage.getVideoJob(jobId);
+      const existingLabels = ((latestJob as any)?.aiLabels || []) as AiLabel[];
       const newLabel: AiLabel = {
         id: randomUUID(),
         intent: parsedIntent.intent,
@@ -827,6 +849,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       await storage.updateVideoJob(jobId, {
         aiLabels: [...existingLabels, newLabel] as any,
       });
+      console.log(`🏷️  Appended AI label "${newLabel.target}" — job now has ${existingLabels.length + 1} label(s)`);
 
       // 7. Return the first-frame result (the UI only displays one preview overlay)
       res.json({

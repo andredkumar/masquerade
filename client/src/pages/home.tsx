@@ -260,28 +260,47 @@ export default function Home() {
                 selectedTask={selectedTask}
               />
 
-              {/* AI Label list */}
+              {/* AI Label list — all approved labels persist, each Run adds a new one */}
               {aiLabels.length > 0 && (
                 <div className="px-4 py-3 space-y-2 border-t border-border">
-                  <p className="text-xs text-muted-foreground">
-                    Only approved labels will appear in your download.
-                  </p>
-                  {aiLabels.map(label => (
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-medium">Approved labels ({aiLabels.filter(l => l.approved).length})</p>
+                    <p className="text-[10px] text-muted-foreground">Draw a new box above to add another</p>
+                  </div>
+                  {aiLabels.map(label => {
+                    // Compute average confidence across all frames (falls back to single value)
+                    const frameResults = (label as any).frameResults as
+                      | Record<number, { confidence: number }>
+                      | undefined;
+                    let avgConfidence: number | null = label.confidence;
+                    let frameCount = 0;
+                    if (frameResults && Object.keys(frameResults).length > 0) {
+                      const values = Object.values(frameResults).map(r => r.confidence).filter(c => typeof c === 'number');
+                      if (values.length > 0) {
+                        avgConfidence = values.reduce((a, b) => a + b, 0) / values.length;
+                        frameCount = values.length;
+                      }
+                    }
+                    return (
                     <div
                       key={label.id}
                       className={`flex items-center justify-between rounded-md px-3 py-2 text-xs ${
                         label.approved ? 'bg-muted/50' : 'bg-muted/20 opacity-60'
                       }`}
+                      data-testid={`ai-label-${label.id}`}
                     >
                       <div className="flex-1 min-w-0 mr-2">
+                        {label.approved && <span className="text-green-500 mr-1">✓</span>}
                         <span className="font-medium">{label.target}</span>
-                        <span className="text-muted-foreground ml-1">({label.intent})</span>
-                        {label.confidence !== null && (
+                        {avgConfidence !== null && (
                           <span className="text-muted-foreground ml-1">
-                            {Math.round(label.confidence * 100)}%
+                            ({Math.round(avgConfidence * 100)}%{frameCount > 1 ? ' avg confidence' : ''})
                           </span>
                         )}
-                        <span className="text-muted-foreground ml-1 text-[10px]">{label.model}</span>
+                        <span className="text-muted-foreground ml-1 text-[10px]">
+                          {label.intent} · {label.model}
+                          {frameCount > 1 ? ` · ${frameCount} frames` : ''}
+                        </span>
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button
@@ -300,7 +319,8 @@ export default function Home() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </>
