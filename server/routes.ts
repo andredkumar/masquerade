@@ -9,6 +9,7 @@ import { FrameExtractor } from "./services/frameExtractor";
 import { IntentParser } from "./services/intentParser";
 import { AIInferenceClient } from "./services/aiInferenceClient";
 import { ModelRouter } from "./services/modelRouter";
+import { maskArtifactStore } from "./services/maskArtifactStore";
 import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
@@ -455,17 +456,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return slug || 'unknown';
       };
 
-      // Per-label, per-frame getters — each approved label has its OWN frameResults
+      // Per-label, per-frame getters — base64 artifacts come from the IN-MEMORY store,
+      // not the database. Confidence still lives on the label (lightweight).
       const getLabelFrameMask = (label: AiLabel, frameIdx: number): Buffer | null => {
-        const r = label.frameResults?.[frameIdx];
+        const artifacts = maskArtifactStore.get(label.id);
+        if (!artifacts) return null;
+        const r = artifacts.frameResults?.[frameIdx];
         if (r?.maskB64) return Buffer.from(r.maskB64, 'base64');
-        if (label.maskB64) return Buffer.from(label.maskB64, 'base64'); // single-frame fallback
+        if (artifacts.maskB64) return Buffer.from(artifacts.maskB64, 'base64'); // single-frame fallback
         return null;
       };
       const getLabelFrameOverlay = (label: AiLabel, frameIdx: number): Buffer | null => {
-        const r = label.frameResults?.[frameIdx];
+        const artifacts = maskArtifactStore.get(label.id);
+        if (!artifacts) return null;
+        const r = artifacts.frameResults?.[frameIdx];
         if (r?.overlayB64) return Buffer.from(r.overlayB64, 'base64');
-        if (label.overlayB64) return Buffer.from(label.overlayB64, 'base64');
+        if (artifacts.overlayB64) return Buffer.from(artifacts.overlayB64, 'base64');
         return null;
       };
       const getLabelFrameConfidence = (label: AiLabel, frameIdx: number): number | null => {
@@ -474,13 +480,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return label.confidence ?? null;
       };
 
-      // True if at least one approved label has at least one per-frame mask/overlay artifact
-      const hasAnyMasks = includeMasks && approvedLabels.some(l =>
-        (l.frameResults && Object.values(l.frameResults).some(r => !!r.maskB64)) || !!l.maskB64
-      );
-      const hasAnyOverlays = includeOverlays && approvedLabels.some(l =>
-        (l.frameResults && Object.values(l.frameResults).some(r => !!r.overlayB64)) || !!l.overlayB64
-      );
+      // True if at least one approved label has at least one per-frame artifact in memory
+      const hasAnyMasks = includeMasks && approvedLabels.some(l => {
+        const a = maskArtifactStore.get(l.id);
+        if (!a) return false;
+        return !!a.maskB64 || (a.frameResults && Object.values(a.frameResults).some(r => !!r.maskB64));
+      });
+      const hasAnyOverlays = includeOverlays && approvedLabels.some(l => {
+        const a = maskArtifactStore.get(l.id);
+        if (!a) return false;
+        return !!a.overlayB64 || (a.frameResults && Object.values(a.frameResults).some(r => !!r.overlayB64));
+      });
 
       // Top-level AI labels in the manifest (unchanged top-level confidence is the first-frame one)
       const labelsForManifest = approvedLabels.map(l => ({
@@ -764,10 +774,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const modelConfig = router.route(parsedIntent);
       console.log(`🔀 Model router selected: ${modelConfig.id} (${modelConfig.name}) — type: ${modelConfig.type}, available: ${modelConfig.available}`);
 
-      // 5. Run inference on every frame, emitting progress via Socket.IO (uses closure-scoped `io`)
+      // 5. Run inference on every frame, emitting progress via Socket.IO.
+      //    Heavy base64 blobs are collected into `artifactFrameResults` (in-memory only),
+      //    while lightweight per-frame confidence goes into `metaFrameResults` (persisted).
       const aiClient = new AIInferenceClient();
 
-      const frameResults: Record<number, { maskB64: string; overlayB64?: string; confidence: number }> = {};
+      const artifactFrameResults: Record<number, { maskB64: string; overlayB64?: string }> = {};
+      const metaFrameResults: Record<number, { confidence: number }> = {};
       let firstResult: { maskBase64: string; overlayBase64?: string; confidence: number; modelUsed: string; inferenceMs: number } | null = null;
       const totalFrames = frameFileNames.length || 1;
 
@@ -782,7 +795,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           bbox: bbox || null,
           useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
         });
-        frameResults[0] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64, confidence: r.confidence };
+        artifactFrameResults[0] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
+        metaFrameResults[0] = { confidence: r.confidence };
         firstResult = r;
       } else {
         for (let i = 0; i < frameFileNames.length; i++) {
@@ -803,11 +817,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
             useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
           });
 
-          frameResults[frameIdx] = {
-            maskB64: r.maskBase64,
-            overlayB64: r.overlayBase64,
-            confidence: r.confidence,
-          };
+          artifactFrameResults[frameIdx] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
+          metaFrameResults[frameIdx] = { confidence: r.confidence };
           if (i === 0) firstResult = r;
         }
       }
@@ -818,16 +829,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ error: "Inference produced no results" });
       }
 
-      // 6. Store the AI label on the job record.
-      //    IMPORTANT: re-fetch the job RIGHT BEFORE writing so we see any labels
-      //    added by concurrent Run clicks (the per-frame loop above can take
-      //    minutes, during which the user could initiate another inference).
-      //    Without this re-fetch, two in-flight runs would both start from the
-      //    same snapshot and the second write would clobber the first.
+      // 6a. Write heavy base64 artifacts to the IN-MEMORY store (never touches the DB).
+      const newLabelId = randomUUID();
+      maskArtifactStore.set(newLabelId, {
+        maskB64: firstResult.maskBase64 || undefined,
+        overlayB64: firstResult.overlayBase64 || undefined,
+        frameResults: artifactFrameResults,
+      });
+
+      // 6b. Write the LEAN label (metadata only) to the database.
+      //    Re-fetch the job first to see any labels added by concurrent Run clicks;
+      //    without this re-fetch, two in-flight runs would both start from the same
+      //    snapshot and the second write would clobber the first.
       const latestJob = await storage.getVideoJob(jobId);
       const existingLabels = ((latestJob as any)?.aiLabels || []) as AiLabel[];
       const newLabel: AiLabel = {
-        id: randomUUID(),
+        id: newLabelId,
         intent: parsedIntent.intent,
         target: parsedIntent.target || 'unknown',
         confidence: firstResult.confidence ?? null,
@@ -835,14 +852,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         timestamp: new Date().toISOString(),
         approved: true,
         bbox: bbox && typeof bbox.x1 === 'number' ? { x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2 } : null,
-        maskB64: firstResult.maskBase64 || undefined,
-        overlayB64: firstResult.overlayBase64 || undefined,
-        frameResults,
+        frameResults: metaFrameResults,
+        // NOTE: maskB64 / overlayB64 are deliberately omitted — they live in
+        //       maskArtifactStore (in-memory) to avoid Neon data transfer costs.
       };
       await storage.updateVideoJob(jobId, {
         aiLabels: [...existingLabels, newLabel] as any,
       });
-      console.log(`🏷️  Appended AI label "${newLabel.target}" — job now has ${existingLabels.length + 1} label(s)`);
+      console.log(`🏷️  Appended AI label "${newLabel.target}" — job now has ${existingLabels.length + 1} label(s) (artifact store: ~${Math.round(maskArtifactStore.approximateSize() / 1024)} KB)`);
 
       // 7. Return the first-frame result (the UI only displays one preview overlay)
       res.json({
@@ -951,6 +968,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       await storage.updateVideoJob(req.params.jobId, { aiLabels: filtered as any });
+      // Evict the heavy base64 artifacts from the in-memory store too
+      maskArtifactStore.delete(req.params.labelId);
       res.json({ success: true });
     } catch (error) {
       console.error("Delete label error:", error);

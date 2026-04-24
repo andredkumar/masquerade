@@ -121,7 +121,12 @@ export interface OutputSettings {
   aspectRatioMode: 'stretch' | 'letterbox' | 'crop';
 }
 
-// AI label stored per-session on the job record
+// AI label stored per-session on the job record.
+//
+// IMPORTANT: Heavy base64 mask/overlay artifacts are DELIBERATELY not persisted on
+// this interface. They live in server/services/maskArtifactStore.ts (in-memory only,
+// keyed by label id) to avoid blowing through Neon's data transfer quota.
+// Only lightweight per-frame metadata (confidence scores) is stored here.
 export interface AiLabel {
   id: string;        // randomUUID
   intent: string;
@@ -131,12 +136,9 @@ export interface AiLabel {
   timestamp: string;
   approved: boolean;
   bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn prompt (image pixel coords)
-  maskB64?: string;     // First-frame binary mask PNG as base64 (for preview only)
-  overlayB64?: string;  // First-frame visual overlay PNG as base64 (for preview only)
-  // Per-frame inference results — populated when Step 4 runs across all frames
+  // Per-frame confidence scores — populated when Step 4 runs across all frames.
+  // Mask/overlay base64 blobs for each frame live in maskArtifactStore, not here.
   frameResults?: Record<number, {
-    maskB64: string;
-    overlayB64?: string;
     confidence: number;
   }>;
 }
