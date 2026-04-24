@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 import torch
-from models.model_loader import is_model_loaded
+from models.model_loader import is_model_loaded, loaded_checkpoints
 
 router = APIRouter()
 
@@ -12,6 +12,7 @@ def health():
     return {
         "status": "ok",
         "model_loaded": is_model_loaded(),
+        "loaded_checkpoints": loaded_checkpoints(),
         "gpu_available": gpu,
         "device": device,
     }

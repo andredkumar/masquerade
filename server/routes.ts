@@ -497,6 +497,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         id: l.id,
         intent: l.intent,
         target: l.target,
+        modality: l.modality || null,
         confidence: l.confidence,
         model: l.model,
         approved: l.approved,
@@ -534,6 +535,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const perFrameLabels = approvedLabels.map(l => ({
           intent: l.intent,
           target: l.target,
+          modality: l.modality || null,
           confidence: getLabelFrameConfidence(l, index),
           model: l.model,
           approved: l.approved,
@@ -720,13 +722,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ── AI: Run inference on a single frame ──────────────────────
   app.post("/api/ai/infer", async (req, res) => {
     try {
-      const { jobId, command, frameBase64, bbox, useAutoPrompt } = req.body;
+      const { jobId, command, frameBase64, bbox, useAutoPrompt, modality } = req.body;
 
       if (!jobId || !command) {
         return res.status(400).json({
           error: "jobId and command are required",
         });
       }
+
+      // Normalize modality — only accept the four known values, else treat as null
+      const validModalities = new Set(['cardiac', 'lung', 'abdominal', 'other']);
+      const resolvedModality: 'cardiac' | 'lung' | 'abdominal' | 'other' | null =
+        (typeof modality === 'string' && validModalities.has(modality))
+          ? (modality as 'cardiac' | 'lung' | 'abdominal' | 'other')
+          : null;
 
       // 1. Fetch the job
       const job = await storage.getVideoJob(jobId);
@@ -794,6 +803,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           jobId,
           bbox: bbox || null,
           useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
+          modality: resolvedModality,
         });
         artifactFrameResults[0] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
         metaFrameResults[0] = { confidence: r.confidence };
@@ -847,6 +857,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         id: newLabelId,
         intent: parsedIntent.intent,
         target: parsedIntent.target || 'unknown',
+        modality: resolvedModality,
         confidence: firstResult.confidence ?? null,
         model: firstResult.modelUsed || 'unknown',
         timestamp: new Date().toISOString(),

@@ -127,10 +127,13 @@ export interface OutputSettings {
 // this interface. They live in server/services/maskArtifactStore.ts (in-memory only,
 // keyed by label id) to avoid blowing through Neon's data transfer quota.
 // Only lightweight per-frame metadata (confidence scores) is stored here.
+export type Modality = 'cardiac' | 'lung' | 'abdominal' | 'other';
+
 export interface AiLabel {
   id: string;        // randomUUID
   intent: string;
   target: string;
+  modality?: Modality | null;  // imaging modality — drives GPU checkpoint routing
   confidence: number | null;   // first-frame confidence (for display)
   model: string;
   timestamp: string;

@@ -13,6 +13,7 @@ export interface InferenceRequest {
   jobId?: string;        // passed through to GPU service for tracking
   bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn bbox prompt
   useAutoPrompt?: boolean; // false when bbox is provided, true to let GPU auto-pick
+  modality?: string | null; // 'cardiac' | 'lung' | 'abdominal' | 'other' — drives checkpoint routing on GPU
 }
 
 export interface InferenceResult {
@@ -58,12 +59,13 @@ export class AIInferenceClient {
         job_id: request.jobId || 'unknown',
         image_b64: request.imageBase64,
         target: request.intent.target || 'unknown',
+        modality: request.modality ?? null,
         bbox: request.bbox ?? null,
         points: null,           // will add point prompts later
         use_auto_prompt: request.useAutoPrompt ?? (request.bbox == null),
       };
 
-      console.log(`🤖 Calling MedSAM2 at ${SAM2_SERVICE_URL}/segment — target: "${body.target}"`);
+      console.log(`🤖 Calling MedSAM2 at ${SAM2_SERVICE_URL}/segment — target: "${body.target}", modality: "${body.modality ?? 'none'}"`);
 
       const response = await fetch(`${SAM2_SERVICE_URL}/segment`, {
         method: 'POST',

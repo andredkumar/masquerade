@@ -12,15 +12,26 @@ interface VideoMetadata {
   height?: number;
 }
 
+export type Modality = 'cardiac' | 'lung' | 'abdominal' | 'other';
+
 interface CommandInputProps {
   jobId: string | null;
   currentFrame: number;
   firstFrameBase64: string | null;
   videoMetadata?: VideoMetadata | null;
+  modality: Modality | null;
+  onModalityChange: (m: Modality | null) => void;
   onMaskGenerated: (maskBase64: string, aiLabel?: { intent: string; target: string; confidence: number | null; model: string }) => void;
   onLabelAdded?: () => void;
   selectedTask?: string;
 }
+
+const MODALITY_OPTIONS: Array<{ id: Modality; emoji: string; label: string }> = [
+  { id: 'cardiac',   emoji: '🫀', label: 'Cardiac' },
+  { id: 'lung',      emoji: '🫁', label: 'Lung' },
+  { id: 'abdominal', emoji: '🫃', label: 'Abdominal' },
+  { id: 'other',     emoji: '🔬', label: 'Something Else' },
+];
 
 const TASK_PLACEHOLDERS: Record<string, string> = {
   segment: 'e.g. segment the pleural effusion',
@@ -83,7 +94,7 @@ const CYAN_FILL = 'rgba(34, 211, 238, 0.20)';
 const CYAN_STROKE = 'rgba(34, 211, 238, 0.95)';
 const CYAN_DASH = 'rgba(34, 211, 238, 0.85)';
 
-export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, modality, onModalityChange, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
@@ -399,6 +410,7 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
           frameBase64: firstFrameBase64?.replace('data:image/png;base64,', ''),
           bbox: pixelBox,
           useAutoPrompt: pixelBox == null,
+          modality,
         }),
       });
 
@@ -473,6 +485,33 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
 
   return (
     <div className="px-4 py-3 space-y-3">
+      {/* Modality selector — must be chosen before Run AI is enabled */}
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium">What do you want to AI Label?</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          {MODALITY_OPTIONS.map(opt => {
+            const active = modality === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => onModalityChange(opt.id)}
+                className={`flex items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs transition-colors ${
+                  active
+                    ? 'bg-primary text-primary-foreground border-primary'
+                    : 'bg-background text-foreground border-border hover:bg-muted'
+                }`}
+                data-testid={`modality-${opt.id}`}
+                aria-pressed={active}
+              >
+                <span aria-hidden>{opt.emoji}</span>
+                <span className="truncate">{opt.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Frame preview with bbox drawing canvas (in-sidebar) */}
       {firstFrameBase64 && (
         <div className="space-y-1.5">
@@ -538,7 +577,8 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
         <Button
           size="sm"
           onClick={handleSubmit}
-          disabled={!jobId || !command.trim() || isLoading}
+          disabled={!jobId || !command.trim() || !modality || isLoading}
+          title={!modality ? 'Select a modality above first' : undefined}
         >
           {isLoading ? (
             <Loader2 className="h-4 w-4 animate-spin" />

@@ -1,26 +1,36 @@
 import numpy as np
 import logging
-from models.model_loader import get_predictor, is_model_loaded
+from typing import Optional
+
+from models.model_loader import get_predictor_for_modality, is_model_loaded
 from utils.image_utils import mask_to_rgba_overlay, numpy_to_b64, auto_bbox_from_image
 
 logger = logging.getLogger(__name__)
 
 
-def run_segmentation(image_rgb: np.ndarray, bbox=None, points=None,
+def run_segmentation(image_rgb: np.ndarray,
+                     modality: Optional[str] = None,
+                     bbox=None,
+                     points=None,
                      use_auto_prompt: bool = True) -> dict:
     """
     Run MedSAM2 segmentation on a single RGB frame.
+
+    Checkpoint selection is driven by `modality` (cardiac / lung / abdominal / other).
+    See model_loader.get_predictor_for_modality for the routing table.
 
     Prompt priority:
       1. bbox  — best results, MedSAM2 was trained heavily on bounding boxes
       2. points — acceptable but lower quality for medical images
       3. auto center-region bbox — reasonable fallback for POCUS (use_auto_prompt=True)
 
-    Returns mock result if model is not loaded (checkpoint missing).
+    Returns mock result if no predictor is loaded.
     """
-    predictor = get_predictor()
+    predictor, checkpoint = get_predictor_for_modality(modality)
     if predictor is None or not is_model_loaded():
         return _mock_result(image_rgb)
+
+    logger.info(f"🎯 Modality '{modality or 'none'}' → {checkpoint}")
 
     try:
         predictor.set_image(image_rgb)
@@ -64,6 +74,7 @@ def run_segmentation(image_rgb: np.ndarray, bbox=None, points=None,
             "mask_b64": numpy_to_b64(best_mask * 255),
             "overlay_b64": numpy_to_b64(overlay),
             "confidence": confidence,
+            "checkpoint": checkpoint,
             "mock": False,
         }
     except Exception as e:
@@ -73,7 +84,7 @@ def run_segmentation(image_rgb: np.ndarray, bbox=None, points=None,
 
 def _mock_result(image_rgb: np.ndarray) -> dict:
     """
-    Return an obviously fake ellipse mask when the model is not loaded.
+    Return an obviously fake ellipse mask when no predictor is loaded.
     The orange color and confidence=0.0 make it visually clear this is a mock.
     """
     h, w = image_rgb.shape[:2]
@@ -89,5 +100,6 @@ def _mock_result(image_rgb: np.ndarray) -> dict:
         "mask_b64": numpy_to_b64(mock_mask),
         "overlay_b64": numpy_to_b64(overlay),
         "confidence": 0.0,
+        "checkpoint": None,
         "mock": True,
     }

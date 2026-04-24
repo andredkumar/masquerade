@@ -5,7 +5,7 @@ import MaskingCanvas from "@/components/MaskingCanvas";
 import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
-import CommandInput from "@/components/CommandInput";
+import CommandInput, { type Modality } from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
 import { Button } from "@/components/ui/button";
 import { Settings, Video, Download, Lock, Upload, Check, X, Info } from "lucide-react";
@@ -26,6 +26,10 @@ export default function Home() {
   const [selectedTask, setSelectedTask] = useState('segment');
   const [includeMasks, setIncludeMasks] = useState(false);
   const [includeOverlays, setIncludeOverlays] = useState(false);
+
+  // Step 4: modality selection — persists across AI runs on the same job,
+  // but resets on every new upload.
+  const [modality, setModality] = useState<Modality | null>(null);
 
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
@@ -56,6 +60,7 @@ export default function Home() {
     setIsProcessing(false);
     setLastProcessedSettings(null);
     setAiLabels([]);
+    setModality(null); // new job — user must pick a modality again
   };
 
   const handleMaskUpdate = (newMaskData: MaskData) => {
@@ -256,6 +261,8 @@ export default function Home() {
                 currentFrame={currentFrame}
                 firstFrameBase64={firstFrame}
                 videoMetadata={videoMetadata}
+                modality={modality}
+                onModalityChange={setModality}
                 onMaskGenerated={handleAiMaskGenerated}
                 onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}

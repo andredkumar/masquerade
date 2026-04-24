@@ -18,6 +18,7 @@ def segment(req: SegmentRequest):
 
     result = run_segmentation(
         image_rgb=image_rgb,
+        modality=req.modality,
         bbox=req.bbox,
         points=req.points,
         use_auto_prompt=req.use_auto_prompt,
@@ -26,5 +27,6 @@ def segment(req: SegmentRequest):
     return {
         "job_id": req.job_id,
         "target": req.target,
+        "modality": req.modality,
         **result,
     }
