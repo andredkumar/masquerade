@@ -437,9 +437,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Processed frames not found on disk" });
       }
 
-      const frameFiles = fs.readdirSync(tempDir)
-        .filter(f => /\.(png|jpe?g)$/i.test(f))
-        .sort();
+      // Deduplicate (by filename) and sort. Each file's POSITION in this list is its
+      // canonical frame number — the manifest ignores any number embedded in the
+      // filename, so upstream ffmpeg/batch quirks can't surface as repeated entries.
+      const rawFrameFiles = fs.readdirSync(tempDir)
+        .filter(f => /\.(png|jpe?g)$/i.test(f));
+      const frameFiles = Array.from(new Set(rawFrameFiles)).sort();
 
       if (frameFiles.length === 0) {
         return res.status(404).json({ error: "No processed frames available to download" });
@@ -514,37 +517,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return 'test';
       };
 
-      // Extract frame index from filename (supports frame_000000.png and image_001_name.png)
-      const extractFrameIndex = (filename: string, fallback: number): { index: number; paddedNum: string; ext: string } => {
-        const m1 = filename.match(/^frame_(\d+)\.(\w+)$/);
-        if (m1) return { index: parseInt(m1[1], 10), paddedNum: m1[1], ext: m1[2] };
-        const m2 = filename.match(/^image_(\d+)_.*\.(\w+)$/);
-        if (m2) {
-          const idx = parseInt(m2[1], 10) - 1;
-          return { index: idx, paddedNum: String(idx).padStart(6, '0'), ext: m2[2] };
-        }
-        return { index: fallback, paddedNum: String(fallback).padStart(6, '0'), ext: path.extname(filename).slice(1) || 'png' };
+      // Extract just the file extension — frame numbering uses sorted-list POSITION (i),
+      // so we never trust the integer embedded in the filename.
+      const fileExt = (filename: string): string => {
+        const m = filename.match(/\.(\w+)$/);
+        return (m && m[1]) || 'png';
       };
 
       const outputFormat = (job as any).outputSettings?.format || 'png';
       const manifestFrames = frameFiles.map((filename, i) => {
-        const { index } = extractFrameIndex(filename, i);
         // Each approved label carries THIS frame's individual confidence (from that
         // label's own frameResults), so multi-label exports show distinct scores
-        // per label per frame rather than a shared value.
+        // per label per frame rather than a shared value. Lookup is keyed by sorted
+        // position `i` — the same key the inference loop wrote with.
         const perFrameLabels = approvedLabels.map(l => ({
           intent: l.intent,
           target: l.target,
           modality: l.modality || null,
-          confidence: getLabelFrameConfidence(l, index),
+          confidence: getLabelFrameConfidence(l, i),
           model: l.model,
           approved: l.approved,
           bbox: l.bbox || null,
         }));
         return {
-          frame_number: index,
-          filename: `frame_${String(index).padStart(4, '0')}.${outputFormat}`,
-          split: determineSplit(index),
+          frame_number: i,
+          filename: `frame_${String(i).padStart(4, '0')}.${outputFormat}`,
+          split: determineSplit(i),
           has_mask: true,
           ai_labels: perFrameLabels,
         };
@@ -661,13 +659,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       );
       for (let i = 0; i < frameFiles.length; i++) {
         const filename = frameFiles[i];
-        const { index, paddedNum, ext } = extractFrameIndex(filename, i);
+        const ext = fileExt(filename);
+        // Sorted-list position is the canonical frame number across the whole ZIP.
+        const paddedNum = String(i).padStart(6, '0');
         const framePath = path.join(tempDir, filename);
         archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
 
         if (includeMasks) {
           for (let li = 0; li < approvedLabels.length; li++) {
-            const maskBuf = getLabelFrameMask(approvedLabels[li], index);
+            const maskBuf = getLabelFrameMask(approvedLabels[li], i);
             if (!maskBuf) continue;
             archive.append(maskBuf, {
               name: `masks/${analysisFolders[li]}/frame_${paddedNum}_mask.png`,
@@ -676,7 +676,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         if (includeOverlays) {
           for (let li = 0; li < approvedLabels.length; li++) {
-            const overlayBuf = getLabelFrameOverlay(approvedLabels[li], index);
+            const overlayBuf = getLabelFrameOverlay(approvedLabels[li], i);
             if (!overlayBuf) continue;
             archive.append(overlayBuf, {
               name: `overlays/${analysisFolders[li]}/frame_${paddedNum}_overlay.png`,
@@ -752,23 +752,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Collect all frames from temp_processed/{jobId}/ — inference runs on ALL of them
+      // 3. Collect all frames from temp_processed/{jobId}/ — inference runs on ALL of them.
+      //    Dedupe (by filename) and sort, then use each file's POSITION in this list as
+      //    its canonical frame number for the rest of the pipeline. We deliberately do
+      //    NOT parse the integer out of the filename, because upstream ffmpeg vfr/batch
+      //    extraction can leave holes or duplicates in the filename-embedded numbers,
+      //    which would surface as "repeated confidence values" in the manifest.
       const tempDir = path.join(process.cwd(), 'temp_processed', jobId);
       let frameFileNames: string[] = [];
       if (fs.existsSync(tempDir)) {
-        frameFileNames = fs.readdirSync(tempDir)
-          .filter(f => /\.(png|jpe?g)$/i.test(f))
-          .sort();
+        const raw = fs.readdirSync(tempDir).filter(f => /\.(png|jpe?g)$/i.test(f));
+        frameFileNames = Array.from(new Set(raw)).sort();
       }
-
-      // Helper: extract frame index from a filename (same rules as the download route)
-      const extractIdx = (filename: string, fallback: number): number => {
-        const m1 = filename.match(/^frame_(\d+)\.(\w+)$/);
-        if (m1) return parseInt(m1[1], 10);
-        const m2 = filename.match(/^image_(\d+)_.*\.(\w+)$/);
-        if (m2) return parseInt(m2[1], 10) - 1;
-        return fallback;
-      };
 
       // Fall back to request-body frame if temp folder is empty (single-frame path)
       const singleFrameFallback = !frameFileNames.length && frameBase64;
@@ -811,7 +806,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } else {
         for (let i = 0; i < frameFileNames.length; i++) {
           const filename = frameFileNames[i];
-          const frameIdx = extractIdx(filename, i);
 
           io?.to(jobId).emit('inference-progress', { jobId, current: i + 1, total: totalFrames });
 
@@ -825,10 +819,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
             jobId,
             bbox: bbox || null,
             useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
+            modality: resolvedModality,
           });
 
-          artifactFrameResults[frameIdx] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
-          metaFrameResults[frameIdx] = { confidence: r.confidence };
+          // Key by sorted-list POSITION (i) — NOT a number parsed out of the filename.
+          // Each file is processed exactly once because frameFileNames is a deduped Set.
+          artifactFrameResults[i] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
+          metaFrameResults[i] = { confidence: r.confidence };
           if (i === 0) firstResult = r;
         }
       }
