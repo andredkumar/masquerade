@@ -14,6 +14,8 @@ interface ProcessingControlsProps {
   jobId: string | null;
   maskData: MaskData | null;
   videoMetadata: any;
+  /** Frame extraction rate. null = native (every frame); number = -vf fps=N */
+  samplingFps?: number | null;
   onStartProcessing: (outputSettings: OutputSettings) => void;
   disabled: boolean;
   hasExistingMask?: boolean;
@@ -25,6 +27,7 @@ export default function ProcessingControls({
   jobId,
   maskData,
   videoMetadata,
+  samplingFps = null,
   onStartProcessing,
   disabled,
   hasExistingMask = false,
@@ -82,7 +85,8 @@ export default function ProcessingControls({
       console.log('🔧 WORKAROUND: Using non-API route to completely bypass Vite...');
       const response = await apiRequest('PATCH', `/internal/mask-processing/${jobId}`, {
         maskData,
-        outputSettings: settings
+        outputSettings: settings,
+        samplingFps,
       });
       
       return response.json();

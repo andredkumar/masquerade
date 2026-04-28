@@ -30,15 +30,23 @@ app.patch("/internal/mask-processing/:jobId", async (req, res) => {
     console.log('JobID:', req.params.jobId);
     console.log('Body keys:', Object.keys(req.body || {}));
     
-    const { maskData, outputSettings } = req.body || {};
-    
+    const { maskData, outputSettings, samplingFps: rawSamplingFps } = req.body || {};
+
     if (!maskData || !outputSettings) {
       console.log('❌ Missing required data');
-      return res.status(400).json({ 
-        success: false, 
-        error: "maskData and outputSettings are required" 
+      return res.status(400).json({
+        success: false,
+        error: "maskData and outputSettings are required"
       });
     }
+
+    // Sanitize samplingFps: null = native rate, positive number = -vf fps=N filter.
+    // Anything else (undefined / non-numeric / <= 0) collapses to null.
+    const samplingFps: number | null =
+      typeof rawSamplingFps === 'number' && isFinite(rawSamplingFps) && rawSamplingFps > 0
+        ? rawSamplingFps
+        : null;
+    console.log('✅ Frame sampling:', samplingFps == null ? 'native rate' : `${samplingFps}fps`);
     
     console.log('✅ Received mask data:', maskData.type);
     console.log('✅ Coordinates:', maskData.coordinates);
@@ -119,10 +127,11 @@ app.patch("/internal/mask-processing/:jobId", async (req, res) => {
     } else {
       // Process video (default behavior)
       videoProcessor.processVideo(
-        req.params.jobId, 
-        job.filePath, 
-        maskData, 
-        outputSettings
+        req.params.jobId,
+        job.filePath,
+        maskData,
+        outputSettings,
+        samplingFps,
       ).catch(error => {
         console.error("❌ Video processing error:", error);
       });

@@ -276,37 +276,66 @@ export class VideoProcessor {
     return rgbaBuffer;
   }
 
-  async processVideo(jobId: string, videoPath: string, maskData: MaskData, outputSettings: OutputSettings) {
+  async processVideo(
+    jobId: string,
+    videoPath: string,
+    maskData: MaskData,
+    outputSettings: OutputSettings,
+    samplingFps: number | null = null
+  ) {
     try {
       console.log('🔍 ENTERED processVideo method successfully!');
-      console.log('🔍 Parameters:', { jobId, videoPath, maskDataType: maskData?.type, hasOutputSettings: !!outputSettings });
-      
+      console.log('🔍 Parameters:', { jobId, videoPath, maskDataType: maskData?.type, hasOutputSettings: !!outputSettings, samplingFps });
+
       await this.updateProgress(jobId, { stage: 'extracting', progress: 5 });
 
       // Extract video metadata
       const metadata = await this.frameExtractor.extractVideoMetadata(videoPath);
-      
+
+      // ── SINGLE-PASS SEQUENTIAL FRAME EXTRACTION ────────────────────
+      // The previous batch-based approach (select=between(n,…) + -vsync vfr,
+      // run in parallel per batch) extracted frames non-sequentially and
+      // duplicated frames across overlapping batch ranges. We now extract
+      // ALL frames in one ffmpeg pass at a duration-based fps, write them
+      // to a staging directory, and feed the resulting buffers into the
+      // existing parallel batch pipeline. ffmpeg is invoked exactly once.
+      const extractedFramesDir = path.join(process.cwd(), 'temp_extracted', jobId);
+      const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
+        videoPath,
+        extractedFramesDir,
+        metadata.duration,
+        path.basename(videoPath),
+        samplingFps,
+        metadata.frameRate,
+      );
+      const extractedCount = extractedPaths.length;
+      const extractedBuffers: Buffer[] = await Promise.all(
+        extractedPaths.map(p => fs.readFile(p)),
+      );
+
       await storage.updateVideoJob(jobId, {
         duration: metadata.duration,
         width: metadata.width,
         height: metadata.height,
         frameRate: metadata.frameRate,
-        totalFrames: metadata.totalFrames,
+        // totalFrames now reflects how many frames we actually extracted, not
+        // the raw decoded frame count of the source video.
+        totalFrames: extractedCount,
         status: 'processing',
         maskData,
         outputSettings
       });
 
-      await this.updateProgress(jobId, { 
-        stage: 'processing', 
+      await this.updateProgress(jobId, {
+        stage: 'processing',
         progress: 10,
-        totalFrames: metadata.totalFrames 
+        totalFrames: extractedCount
       });
 
-      // Create frame batches
+      // Create frame batches OVER the already-extracted frame list
       const batchSize = outputSettings.batchSize || 12;
-      const batches = this.createFrameBatches(metadata.totalFrames, batchSize);
-      
+      const batches = this.createFrameBatches(extractedCount, batchSize);
+
       // Create batch records in storage
       for (let i = 0; i < batches.length; i++) {
         await storage.createFrameBatch({
@@ -318,10 +347,11 @@ export class VideoProcessor {
         });
       }
 
-      // Process batches in parallel
-      const processedFrames = await this.processBatchesInParallel(
+      // Process batches in parallel — each batch gets a SLICE of the already
+      // extracted frame buffers, so ffmpeg is never re-invoked here.
+      const processedFrames = await this.processFrameBuffersInParallel(
         jobId,
-        videoPath,
+        extractedBuffers,
         batches,
         maskData,
         outputSettings
@@ -343,6 +373,14 @@ export class VideoProcessor {
         savedCount++;
       }
       console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
+
+      // Clean up the raw-extracted staging dir — we no longer need the
+      // unmasked source PNGs once template-masking has produced the outputs.
+      try {
+        await fs.rm(extractedFramesDir, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        console.warn(`⚠️  Failed to clean up staging dir ${extractedFramesDir}:`, cleanupErr);
+      }
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
@@ -816,6 +854,104 @@ export class VideoProcessor {
     });
     
     console.log(`Total processed frames: ${processedFrames.length}`);
+
+    return processedFrames.sort((a, b) => a.frameNumber - b.frameNumber);
+  }
+
+  /**
+   * Apply the template mask to an in-memory list of pre-extracted frame
+   * buffers. Mirrors processBatchesInParallel but does NOT call ffmpeg per
+   * batch — it slices `extractedBuffers` instead, so the parallel batches
+   * can never race over the same physical frames or duplicate them.
+   *
+   * The list of `batches` defines the slice ranges over `extractedBuffers`.
+   */
+  private async processFrameBuffersInParallel(
+    jobId: string,
+    extractedBuffers: Buffer[],
+    batches: Array<{ start: number; end: number }>,
+    maskData: MaskData,
+    outputSettings: OutputSettings
+  ): Promise<Array<{ frameNumber: number; buffer: Buffer }>> {
+    console.log(`=== PROCESSING ${extractedBuffers.length} PRE-EXTRACTED FRAMES IN ${batches.length} BATCH(ES) ===`);
+
+    const processedFrames: Array<{ frameNumber: number; buffer: Buffer }> = [];
+    const startTime = Date.now();
+    let completedFrames = 0;
+
+    // Resolve output size — same logic as processBatchesInParallel, condensed
+    let outputSize: { width: number; height: number };
+    if (outputSettings.width && outputSettings.height) {
+      outputSize = { width: outputSettings.width, height: outputSettings.height };
+    } else if (outputSettings.size === 'custom') {
+      outputSize = { width: outputSettings.customWidth || 512, height: outputSettings.customHeight || 512 };
+    } else if (outputSettings.size === 'original') {
+      const job = await storage.getVideoJob(jobId);
+      outputSize = { width: job?.width || 512, height: job?.height || 512 };
+    } else if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
+      const [w, h] = outputSettings.size.split('x').map(Number);
+      outputSize = { width: w, height: h };
+    } else {
+      outputSize = { width: 512, height: 512 };
+    }
+
+    const totalFrames = extractedBuffers.length;
+    const VOLUME_BATCH_SIZE = 8;
+
+    const batchPromises = batches.map(async (batch, batchIndex) => {
+      const frameBuffers = extractedBuffers.slice(batch.start, batch.end + 1);
+      const batchResults: Array<{ success: boolean; processedBuffer: Buffer; error?: string; frameNumber: number }> = [];
+
+      for (let volumeStart = 0; volumeStart < frameBuffers.length; volumeStart += VOLUME_BATCH_SIZE) {
+        const volumeEnd = Math.min(volumeStart + VOLUME_BATCH_SIZE, frameBuffers.length);
+        const volumeFrameBuffers = frameBuffers.slice(volumeStart, volumeEnd);
+
+        const volumeTasks = volumeFrameBuffers.map((frameBuffer, index) => ({
+          frameBuffer,
+          maskData,
+          outputSize,
+          outputSettings,
+          // Frame number is the absolute index in the extracted-frame list,
+          // which is sequential and gap-free by construction.
+          frameNumber: batch.start + volumeStart + index,
+        }));
+
+        const volumeResults = await this.processFrameBatch(volumeTasks);
+
+        if (global.gc) global.gc();
+
+        completedFrames += volumeResults.length;
+        const progress = 10 + (completedFrames / totalFrames) * 80;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const fps = completedFrames / elapsed;
+        const eta = fps > 0 ? (totalFrames - completedFrames) / fps : 0;
+
+        await this.updateProgress(jobId, {
+          progress: Math.min(progress, 90),
+          currentFrame: completedFrames,
+          fps: parseFloat(fps.toFixed(1)),
+          eta: Math.ceil(eta),
+        });
+
+        batchResults.push(...volumeResults);
+      }
+
+      console.log(`✅ Batch ${batchIndex} (frames ${batch.start}-${batch.end}) complete`);
+      return batchResults;
+    });
+
+    const allBatchResults = await Promise.all(batchPromises);
+
+    allBatchResults.forEach(batchResults => {
+      batchResults.forEach(result => {
+        if (result.success) {
+          processedFrames.push({ frameNumber: result.frameNumber, buffer: result.processedBuffer });
+        } else {
+          console.log(`Frame ${result.frameNumber} failed: ${result.error}`);
+          processedFrames.push({ frameNumber: result.frameNumber, buffer: Buffer.alloc(0) });
+        }
+      });
+    });
 
     return processedFrames.sort((a, b) => a.frameNumber - b.frameNumber);
   }

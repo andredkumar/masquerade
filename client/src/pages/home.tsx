@@ -31,6 +31,19 @@ export default function Home() {
   // but resets on every new upload.
   const [modality, setModality] = useState<Modality | null>(null);
 
+  // Step 1: frame extraction rate.
+  // null = native (every frame). Number = -vf fps=N on the backend.
+  // 'custom' is held in samplingMode; samplingFps holds the resolved numeric value.
+  const [samplingMode, setSamplingMode] = useState<'native' | '1' | '0.5' | 'custom'>('native');
+  const [customFps, setCustomFps] = useState<string>('');
+  const samplingFps: number | null = (() => {
+    if (samplingMode === 'native') return null;
+    if (samplingMode === '1') return 1;
+    if (samplingMode === '0.5') return 0.5;
+    const parsed = parseFloat(customFps);
+    return isFinite(parsed) && parsed > 0 ? parsed : null;
+  })();
+
   // Monitor job status to reset processing state when complete
   const { data: jobData } = useQuery({
     queryKey: ['/api/videos', currentJob],
@@ -61,6 +74,8 @@ export default function Home() {
     setLastProcessedSettings(null);
     setAiLabels([]);
     setModality(null); // new job — user must pick a modality again
+    setSamplingMode('native');
+    setCustomFps('');
   };
 
   const handleMaskUpdate = (newMaskData: MaskData) => {
@@ -196,6 +211,91 @@ export default function Home() {
           </div>
           <FileUpload onUploadComplete={handleUploadComplete} />
 
+          {/* Frame extraction rate — appears in Step 1 once a video is uploaded.
+              Image batches use one frame per file, so we hide this for non-video jobs. */}
+          {videoMetadata && videoMetadata.duration > 0 && videoMetadata.totalFrames > 1 && (
+            <div className="px-6 pb-4 space-y-2 border-b border-border">
+              <p className="text-sm font-medium">Frame extraction rate:</p>
+              <div className="space-y-1 text-xs">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="sampling-mode"
+                    value="native"
+                    checked={samplingMode === 'native'}
+                    onChange={() => setSamplingMode('native')}
+                    className="mt-0.5"
+                    data-testid="sampling-native"
+                  />
+                  <span>
+                    <span className="font-medium">Every frame</span>
+                    <span className="text-muted-foreground"> — full dataset (recommended for labeling)</span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="sampling-mode"
+                    value="1"
+                    checked={samplingMode === '1'}
+                    onChange={() => setSamplingMode('1')}
+                    className="mt-0.5"
+                    data-testid="sampling-1fps"
+                  />
+                  <span>
+                    <span className="font-medium">1 per second</span>
+                    <span className="text-muted-foreground"> — quick overview</span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="sampling-mode"
+                    value="0.5"
+                    checked={samplingMode === '0.5'}
+                    onChange={() => setSamplingMode('0.5')}
+                    className="mt-0.5"
+                    data-testid="sampling-half-fps"
+                  />
+                  <span>
+                    <span className="font-medium">1 per 2 seconds</span>
+                    <span className="text-muted-foreground"> — fast preview</span>
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="sampling-mode"
+                    value="custom"
+                    checked={samplingMode === 'custom'}
+                    onChange={() => setSamplingMode('custom')}
+                    className="mt-0.5"
+                    data-testid="sampling-custom"
+                  />
+                  <span className="font-medium">Custom:</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.1"
+                    placeholder="fps"
+                    value={customFps}
+                    onChange={(e) => { setCustomFps(e.target.value); setSamplingMode('custom'); }}
+                    className="w-16 px-1.5 py-0.5 text-xs border border-border rounded bg-background"
+                    data-testid="sampling-custom-input"
+                  />
+                  <span className="text-muted-foreground">fps</span>
+                </label>
+              </div>
+              {/* Estimate: native shows source totalFrames; sampled shows duration * fps */}
+              <p className="text-[11px] text-muted-foreground" data-testid="frame-estimate">
+                {samplingFps == null
+                  ? `~${videoMetadata.totalFrames ?? Math.round(videoMetadata.duration * (videoMetadata.frameRate || 30))} frames at native rate`
+                  : `~${Math.max(1, Math.round(videoMetadata.duration * samplingFps))} frames at ${samplingFps}fps`
+                }
+              </p>
+            </div>
+          )}
+
           {/* Step 2: Template Mask */}
           <div className="p-4 border-b border-border">
             <div className="flex items-center gap-2">
@@ -230,6 +330,7 @@ export default function Home() {
               jobId={currentJob}
               maskData={maskData}
               videoMetadata={videoMetadata}
+              samplingFps={samplingFps}
               onStartProcessing={handleStartProcessing}
               disabled={!currentJob || !maskData}
               hasExistingMask={!!maskData}

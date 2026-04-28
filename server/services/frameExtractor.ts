@@ -167,6 +167,71 @@ export class FrameExtractor {
     }
   }
 
+  /**
+   * Single-pass sequential frame extraction. Replaces the previous
+   * batch-based `extractFrameBatch` approach which used `select=between(n,…)`
+   * + `-vsync vfr` running in parallel — that combination caused frames to be
+   * extracted non-sequentially and duplicated across overlapping batch ranges.
+   *
+   * Extraction rate is controlled by the caller via `samplingFps`:
+   *   - `null`      → no -vf fps filter, native rate (every frame)
+   *   - `1`         → -vf fps=1   (one frame per second)
+   *   - `0.5`       → -vf fps=0.5 (one frame every two seconds)
+   *   - any number  → -vf fps=<n>
+   *
+   * The exact ffmpeg command (after fluent-ffmpeg renders it):
+   *   native rate:    ffmpeg -i input.mp4 -vsync 0           <out>/frame_%06d.png
+   *   sampled:        ffmpeg -i input.mp4 -vf fps=<n> -vsync 0 <out>/frame_%06d.png
+   */
+  async extractAllFramesSequential(
+    videoPath: string,
+    outputDir: string,
+    durationSec: number,
+    sourceFilename: string,
+    samplingFps: number | null,
+    nativeFps: number,
+  ): Promise<string[]> {
+    const effectiveFps = samplingFps == null ? nativeFps : samplingFps;
+    const estimatedCount = Math.max(1, Math.round(durationSec * effectiveFps));
+
+    if (samplingFps == null) {
+      console.log(
+        `🎬 Extracting frames from ${sourceFilename}: ${nativeFps}fps native, ~${estimatedCount} frames`
+      );
+    } else {
+      console.log(
+        `🎬 Extracting frames from ${sourceFilename}: ${samplingFps}fps sampling, ~${estimatedCount} frames`
+      );
+    }
+
+    await fs.mkdir(outputDir, { recursive: true });
+
+    const outputPattern = path.join(outputDir, 'frame_%06d.png');
+    const outputOpts: string[] = ['-vsync', '0'];
+    if (samplingFps != null) {
+      outputOpts.unshift('-vf', `fps=${samplingFps}`);
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg(videoPath)
+        .outputOptions(outputOpts)
+        .output(outputPattern)
+        .on('end', () => resolve())
+        .on('error', (err) => reject(new Error(`Sequential frame extraction failed: ${err.message}`)))
+        .run();
+    });
+
+    // Read back the files we wrote (sorted by filename — these are sequential by construction)
+    const all = await fs.readdir(outputDir);
+    const created = all
+      .filter(f => /^frame_\d+\.png$/.test(f))
+      .sort()
+      .map(f => path.join(outputDir, f));
+
+    console.log(`🎬 Extracted ${created.length} sequential frames into ${outputDir}`);
+    return created;
+  }
+
   async extractFirstFrame(videoPath: string): Promise<Buffer> {
     // Check if file is DICOM
     const isDicom = await this.isDicomFile(videoPath);
