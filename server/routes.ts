@@ -10,6 +10,14 @@ import { IntentParser } from "./services/intentParser";
 import { AIInferenceClient } from "./services/aiInferenceClient";
 import { ModelRouter } from "./services/modelRouter";
 import { maskArtifactStore } from "./services/maskArtifactStore";
+import {
+  deleteUploadFile,
+  cleanupJobArtifacts,
+  sweepDirectory,
+  UPLOADS_DIR,
+  TEMP_EXTRACTED_DIR,
+  TEMP_PROCESSED_DIR,
+} from "./services/cleanup";
 import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
@@ -100,6 +108,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Upload video file and create job
   app.post("/api/videos/upload", upload.single('video'), async (req, res) => {
+    // If the client disconnects after multer finished writing but before we
+    // returned a response, the partial-but-valid file at uploads/<hash> would
+    // otherwise leak. Delete it on abort. Idempotent — a successful response
+    // path that already deleted the file (or moved on) is unaffected.
+    const uploadedPath = req.file?.path;
+    req.on('aborted', () => { void deleteUploadFile(uploadedPath); });
+
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No video file uploaded" });
@@ -153,13 +168,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         
         // STEP 4: Continue background processing asynchronously (pause/resume concept)
         console.log('🚀 DICOM: First frame displayed, continuing background extraction');
+        const dicomFilePath = req.file.path;
         setImmediate(() => {
-          videoProcessor.startBackgroundFrameExtraction(job.id, req.file!.path, quickMetadata.totalFrames)
+          videoProcessor.startBackgroundFrameExtraction(job.id, dicomFilePath, quickMetadata.totalFrames)
             .catch(error => {
               console.error('❌ DICOM background extraction failed:', error);
+              // Background task may never reach processVideo's finally — reclaim the upload now.
+              void deleteUploadFile(dicomFilePath);
             });
         });
-        
+
         return; // Early return for DICOM files
       }
 
@@ -192,10 +210,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       // 🚀 START BACKGROUND EXTRACTION OF ALL FRAMES IMMEDIATELY
       console.log('🚀 STARTING BACKGROUND FRAME EXTRACTION FOR ALL', metadata.totalFrames, 'FRAMES');
+      const stdFilePath = req.file.path;
       setImmediate(() => {
-        videoProcessor.startBackgroundFrameExtraction(job.id, req.file!.path, metadata.totalFrames)
+        videoProcessor.startBackgroundFrameExtraction(job.id, stdFilePath, metadata.totalFrames)
           .catch(error => {
             console.error('❌ Background extraction failed:', error);
+            // Background task may never reach processVideo's finally — reclaim the upload now.
+            void deleteUploadFile(stdFilePath);
           });
       });
       
@@ -215,16 +236,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     } catch (error) {
       console.error("Upload error:", error);
-      res.status(500).json({ 
-        error: error instanceof Error ? error.message : "Upload failed" 
+      // Reclaim the partial upload before responding — error path was previously
+      // leaking the multer-written file at uploads/<hash> indefinitely.
+      await deleteUploadFile(uploadedPath);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Upload failed"
       });
     }
   });
 
   // Upload multiple image files and create job
   app.post("/api/images/upload", imageUpload.array('images'), async (req, res) => {
+    // Snapshot the multer-written paths BEFORE any await so the abort listener
+    // and the catch block both have access even if the body-handler short-circuits.
+    const uploadedFiles = (req.files as Express.Multer.File[] | undefined) || [];
+    const uploadedPaths = uploadedFiles.map(f => f.path);
+    req.on('aborted', () => {
+      for (const p of uploadedPaths) void deleteUploadFile(p);
+    });
+
     try {
-      const files = req.files as Express.Multer.File[];
+      const files = uploadedFiles;
       if (!files || files.length === 0) {
         return res.status(400).json({ error: "No image files uploaded" });
       }
@@ -288,8 +320,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     } catch (error) {
       console.error("Image upload error:", error);
-      res.status(500).json({ 
-        error: error instanceof Error ? error.message : "Image upload failed" 
+      // Reclaim every partial upload from this batch before responding.
+      for (const p of uploadedPaths) await deleteUploadFile(p);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Image upload failed"
       });
     }
   });
@@ -629,6 +663,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Stream the ZIP to the client
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', `attachment; filename="processed_${job.filename}.zip"`);
+
+      // Post-download cleanup: when (and only when) the response finishes
+      // successfully, reclaim temp_processed/<jobId>/ and temp_extracted/<jobId>/.
+      // - 'finish' fires only when the response was fully flushed to the kernel
+      //   (i.e. the user's download is complete). 'close' fires on aborts too,
+      //   which is why we use 'finish' specifically.
+      // - cleanup runs async after we've returned; we never block the response,
+      //   and a cleanup failure must never bubble up to the user.
+      res.on('finish', () => {
+        cleanupJobArtifacts(job.id).catch(err =>
+          console.error('post-download cleanup failed', { jobId: job.id, err })
+        );
+      });
 
       const archive = archiver('zip', { zlib: { level: 9 } });
       archive.on('error', (err: Error) => {
@@ -1002,8 +1049,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Graceful shutdown
   process.on('SIGTERM', async () => {
     console.log('Shutting down video processor...');
-    await videoProcessor.cleanup();
-    httpServer.close();
+    // Each step is individually try/wrapped so one failure (e.g. an EBUSY
+    // on a still-open ffmpeg child) cannot block the rest of shutdown.
+    try {
+      await videoProcessor.cleanup();
+    } catch (err) {
+      console.warn('SIGTERM: videoProcessor.cleanup failed', err);
+    }
+    // maxAgeMs=0 means "delete every entry regardless of age" — the process
+    // is going away, no future request can reference any of these files.
+    try { await sweepDirectory(UPLOADS_DIR, 0); } catch (err) { console.warn('SIGTERM: uploads sweep failed', err); }
+    try { await sweepDirectory(TEMP_EXTRACTED_DIR, 0); } catch (err) { console.warn('SIGTERM: temp_extracted sweep failed', err); }
+    try { await sweepDirectory(TEMP_PROCESSED_DIR, 0); } catch (err) { console.warn('SIGTERM: temp_processed sweep failed', err); }
+    try {
+      httpServer.close();
+    } catch (err) {
+      console.warn('SIGTERM: httpServer.close failed', err);
+    }
   });
 
   return httpServer;

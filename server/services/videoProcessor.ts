@@ -6,6 +6,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import Sharp from 'sharp';
 import { TempFolderManager } from './tempFolderManager';
+import { deleteUploadFile, safeDelete, TEMP_EXTRACTED_DIR } from './cleanup';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -283,6 +284,15 @@ export class VideoProcessor {
     outputSettings: OutputSettings,
     samplingFps: number | null = null
   ) {
+    // Single staging-dir path used by both the success branch and the finally block.
+    const extractedFramesDir = path.join(TEMP_EXTRACTED_DIR, jobId);
+    // We delete the upload + staging dir in `finally` whenever the job reached
+    // a terminal status — i.e. processing actually started (success path) OR
+    // an exception was raised (failed path). Job that crashed before this
+    // method was even called won't reach `finally`, but the upload-handler's
+    // setImmediate `.catch` already covers that case.
+    let reachedTerminal = false;
+
     try {
       console.log('🔍 ENTERED processVideo method successfully!');
       console.log('🔍 Parameters:', { jobId, videoPath, maskDataType: maskData?.type, hasOutputSettings: !!outputSettings, samplingFps });
@@ -299,7 +309,6 @@ export class VideoProcessor {
       // ALL frames in one ffmpeg pass at a duration-based fps, write them
       // to a staging directory, and feed the resulting buffers into the
       // existing parallel batch pipeline. ffmpeg is invoked exactly once.
-      const extractedFramesDir = path.join(process.cwd(), 'temp_extracted', jobId);
       const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
         videoPath,
         extractedFramesDir,
@@ -374,14 +383,6 @@ export class VideoProcessor {
       }
       console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
 
-      // Clean up the raw-extracted staging dir — we no longer need the
-      // unmasked source PNGs once template-masking has produced the outputs.
-      try {
-        await fs.rm(extractedFramesDir, { recursive: true, force: true });
-      } catch (cleanupErr) {
-        console.warn(`⚠️  Failed to clean up staging dir ${extractedFramesDir}:`, cleanupErr);
-      }
-
       await storage.updateVideoJob(jobId, {
         status: 'completed',
         progress: 100,
@@ -393,23 +394,41 @@ export class VideoProcessor {
         progress: 100
       });
 
+      reachedTerminal = true;
       return tempDir;
 
     } catch (error) {
       console.error(`Error processing video ${jobId}:`, error);
-      
+
       await storage.updateVideoJob(jobId, {
         status: 'failed',
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
 
-      await this.updateProgress(jobId, { 
-        stage: 'failed', 
+      await this.updateProgress(jobId, {
+        stage: 'failed',
         progress: 0,
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
 
+      reachedTerminal = true;
       throw error;
+    } finally {
+      // Reclaim disk regardless of whether we succeeded or failed:
+      //   1. The staging dir holds intermediate raw frames we no longer need.
+      //   2. The original upload contains PHI and is never needed again once
+      //      the job has completed or definitively failed.
+      // Both deletes are bounded to their allowed roots by the cleanup module,
+      // and both swallow their own errors so cleanup can never re-throw out
+      // of `finally` and mask the original error or crash a background task.
+      if (reachedTerminal) {
+        try {
+          await safeDelete(extractedFramesDir, TEMP_EXTRACTED_DIR);
+        } catch (cleanupErr) {
+          console.warn(`⚠️  Failed to clean up staging dir ${extractedFramesDir}:`, cleanupErr);
+        }
+        await deleteUploadFile(videoPath);
+      }
     }
   }
 
@@ -422,6 +441,12 @@ export class VideoProcessor {
     maskData: MaskData,
     outputSettings: OutputSettings
   ): Promise<string> {
+    // Snapshot upload paths so finally can reclaim them regardless of which
+    // image triggered the failure. We delete them only after a terminal state
+    // is reached so retries that recover mid-flight don't lose source data.
+    const uploadPathsToReclaim = [...imageFiles];
+    let reachedTerminal = false;
+
     try {
       console.log('🖼️ ENTERED processImages method successfully!');
       console.log('🖼️ Parameters:', { 
@@ -632,23 +657,34 @@ export class VideoProcessor {
         progress: 100
       });
 
+      reachedTerminal = true;
       return tempDir;
 
     } catch (error) {
       console.error(`Error processing images ${jobId}:`, error);
-      
+
       await storage.updateVideoJob(jobId, {
         status: 'failed',
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
 
-      await this.updateProgress(jobId, { 
-        stage: 'failed', 
+      await this.updateProgress(jobId, {
+        stage: 'failed',
         progress: 0,
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
 
+      reachedTerminal = true;
       throw error;
+    } finally {
+      // Reclaim uploaded source images regardless of success/failure. Each
+      // delete is bounded to UPLOADS_DIR by deleteUploadFile, and each
+      // swallows its own errors so cleanup never re-throws out of `finally`.
+      if (reachedTerminal) {
+        for (const p of uploadPathsToReclaim) {
+          await deleteUploadFile(p);
+        }
+      }
     }
   }
 

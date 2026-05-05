@@ -187,7 +187,13 @@ app.use((req, res, next) => {
   // Initialize temporary folder system
   const { TempFolderManager } = await import('./services/tempFolderManager');
   await TempFolderManager.initialize();
-  
+
+  // Disk cleanup: purge orphaned uploads from any previous process, then
+  // arm the hourly retention sweep BEFORE the HTTP server starts listening.
+  const { purgeUploadsOnStartup, startCleanupScheduler } = await import('./services/cleanup');
+  await purgeUploadsOnStartup();
+  startCleanupScheduler();
+
   const server = await registerRoutes(app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
