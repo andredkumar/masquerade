@@ -14,7 +14,12 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
 |-----------|-------|-----------|
 | `uploads/` | Original user uploads (multer dest). Contains PHI. | **2 hours** |
 | `temp_extracted/<jobId>/` | Raw frames pulled from a video before template-masking. | **6 hours** |
-| `temp_processed/<jobId>/` | Masked output frames consumed by the ZIP/download builder. | **24 hours** |
+| `temp_processed/<jobId>/` | Masked output frames consumed by the ZIP/download builder and the frame viewer. | **24 hours, hourly sweep only** |
+
+`temp_processed/<jobId>/` is **not** deleted post-download. Folders persist
+after download to allow the frame viewer to be reopened. Practical effect:
+a user who downloads then comes back later sees their session intact for up
+to 24h. The hourly retention sweep is the only path that reclaims this dir.
 
 ### When does cleanup happen?
 
@@ -35,12 +40,11 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
   - The setImmediate fire-and-forget background tasks have a `.catch`
     that also calls `deleteUploadFile(...)` so a crash before
     `processVideo`'s `finally` is reached doesn't leak the upload.
-  - **Post-download hook**: `GET /api/videos/:jobId/download` registers
-    `res.on('finish', () => cleanupJobArtifacts(jobId))` so once the user
-    has fully received their ZIP, both `temp_extracted/<jobId>/` and
-    `temp_processed/<jobId>/` are reclaimed. We use `'finish'` (not
-    `'close'`) so aborted downloads do *not* drop the user's data — they
-    can re-request the ZIP, and the hourly sweep handles abandoned ones.
+  - **No post-download hook for `temp_processed/<jobId>/`**: the download
+    endpoint deliberately does not delete the masked-frame folder when the
+    response finishes. The frame viewer needs it readable after download
+    so users can reopen the viewer or re-download. Reclamation happens
+    exclusively via the hourly retention sweep (24h).
 - **SIGTERM** sweeps all three directories with `maxAgeMs = 0` (everything
   goes), then closes the HTTP server. Each step is individually
   try/wrapped so one failure cannot block shutdown.
@@ -68,6 +72,12 @@ without touching the filesystem. Combine flags freely:
 ```sh
 npm run cleanup -- --dir=temp_processed --dry-run
 ```
+
+### Known limitation: disk pressure
+
+With `temp_processed/` retained for 24h post-completion, expected disk
+use scales with sessions/day at roughly ~1 GB per session. Revisit the
+retention window or move to per-user expiry when auth lands (Phase 3).
 
 ### Future: when authentication lands
 
@@ -166,6 +176,10 @@ viewer locks the mode toggle to Clean and shows
 
 ### Known limitations
 
+- **Frames remain available for 24 hours post-completion.** Beyond that
+  the hourly sweep removes `temp_processed/<jobId>/`, and the viewer
+  surfaces a session-expired message via 410 — the same response shape
+  it uses on every endpoint when the folder is missing.
 - **Large videos (>1000 frames)** may scrub sluggishly on slower laptops.
   Each frame is a separate HTTP fetch; browser cache keeps it manageable
   but the prefetch radius isn't tuned for high frame counts. Not yet

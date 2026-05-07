@@ -12,7 +12,6 @@ import { ModelRouter } from "./services/modelRouter";
 import { maskArtifactStore } from "./services/maskArtifactStore";
 import {
   deleteUploadFile,
-  cleanupJobArtifacts,
   sweepDirectory,
   UPLOADS_DIR,
   TEMP_EXTRACTED_DIR,
@@ -671,18 +670,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', `attachment; filename="processed_${job.filename}.zip"`);
 
-      // Post-download cleanup: when (and only when) the response finishes
-      // successfully, reclaim temp_processed/<jobId>/ and temp_extracted/<jobId>/.
-      // - 'finish' fires only when the response was fully flushed to the kernel
-      //   (i.e. the user's download is complete). 'close' fires on aborts too,
-      //   which is why we use 'finish' specifically.
-      // - cleanup runs async after we've returned; we never block the response,
-      //   and a cleanup failure must never bubble up to the user.
-      res.on('finish', () => {
-        cleanupJobArtifacts(job.id).catch(err =>
-          console.error('post-download cleanup failed', { jobId: job.id, err })
-        );
-      });
+      // Intentionally NOT deleting temp_processed/<jobId>/ here.
+      // The frame viewer may need to read it after download. Folder is
+      // reclaimed by the hourly retention sweep (24h) instead.
 
       const archive = archiver('zip', { zlib: { level: 9 } });
       archive.on('error', (err: Error) => {
