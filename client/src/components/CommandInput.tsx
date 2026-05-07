@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import {
   Loader2, Sparkles, AlertTriangle, CheckCircle2, X,
   Square as IconSquare, Circle as IconCircle, Hexagon as IconHexagon, Paintbrush as IconBrush,
+  Undo2 as IconUndo, Eraser as IconClearAll,
 } from "lucide-react";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
@@ -270,6 +271,81 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
     setIsDragging(false);
   };
 
+  // True if there's anything an Undo would actually do. Drives the disabled
+  // state of the toolbar Undo button and silences Cmd/Ctrl+Z when there's
+  // nothing to undo.
+  const canUndo = (() => {
+    if (!shape) return false;
+    if (shape.type === 'polygon') return shape.points.length > 0; // any vertex is undoable
+    return true; // rect/circle/brush: shape exists ⇒ can undo
+  })();
+
+  // Step-by-step undo within the single active shape:
+  //   - polygon mid-drafting (vertices being placed): pop the last vertex
+  //     (drop the shape entirely once the last vertex is popped)
+  //   - polygon committed (post-double-click) but not yet submitted to AI:
+  //     discard the committed polygon
+  //   - rect / circle / brush (committed or in-progress): discard the shape
+  //   - nothing to undo: silent no-op
+  const handleUndo = () => {
+    if (!shape) return;
+    if (shape.type === 'polygon') {
+      if (shape.completed) {
+        // Committed polygon → drop it entirely. (Reverting to drafting with
+        // the same vertices would be confusing UX since the user already
+        // signaled "done" via dblclick.)
+        setShape(null);
+        setPolygonHover(null);
+        return;
+      }
+      // Mid-drafting: pop the most recent vertex
+      if (shape.points.length <= 1) {
+        setShape(null);
+        setPolygonHover(null);
+        return;
+      }
+      setShape({ ...shape, points: shape.points.slice(0, -1) });
+      return;
+    }
+    // rect / circle / brush — single-shape semantics, no history to walk back to
+    setShape(null);
+    setIsDragging(false);
+  };
+
+  // "Clear all" — same end state as clearShape, but confirms when there's
+  // a meaningful shape to erase. Spec says "confirm if there are >1 bboxes";
+  // we never have more than one, so we confirm whenever a shape exists at all
+  // to prevent accidental loss of polygon work.
+  const handleClearAll = () => {
+    if (!shape) return;
+    const meaningful =
+      (shape.type === 'polygon' && shape.points.length > 2) ||
+      (shape.type === 'brush' && shape.points.length > 4) ||
+      shape.type === 'rect' || shape.type === 'circle';
+    if (meaningful && !window.confirm('Discard the current bbox?')) return;
+    clearShape();
+  };
+
+  // Cmd/Ctrl+Z — undo when AI Analysis is the visible step AND focus is
+  // on body or the canvas (not in the intent input or another field).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isUndo = (e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z');
+      if (!isUndo) return;
+      const target = document.activeElement;
+      const isOnInput = target instanceof HTMLElement && (
+        target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable
+      );
+      if (isOnInput) return; // let the field handle native undo
+      if (!firstFrameBase64) return; // viewer not yet showing
+      e.preventDefault();
+      handleUndo();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shape, firstFrameBase64]);
+
   const pointFromEvent = (e: React.MouseEvent<HTMLCanvasElement>): Pt | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
@@ -520,12 +596,48 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
             {mode === 'polygon' && ' Click to add points, double-click to close.'}
           </p>
 
-          {/* Compact toolbar — icons only */}
+          {/* Compact toolbar — icons only.
+              Mode buttons | divider | Undo | Clear-all */}
           <div className="flex items-center gap-1">
             {modeBtn('rect', IconSquare, 'Rectangle')}
             {modeBtn('circle', IconCircle, 'Circle')}
             {modeBtn('polygon', IconHexagon, 'Polygon')}
             {modeBtn('brush', IconBrush, 'Brush')}
+            <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={!canUndo}
+              title={canUndo
+                ? (shape?.type === 'polygon' && !shape.completed
+                  ? 'Undo last vertex (⌘Z / Ctrl+Z)'
+                  : 'Undo last bbox (⌘Z / Ctrl+Z)')
+                : 'Nothing to undo'}
+              aria-label="Undo last"
+              className={`p-1.5 rounded ${
+                canUndo
+                  ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                  : 'text-muted-foreground/40 cursor-not-allowed'
+              }`}
+              data-testid="bbox-undo"
+            >
+              <IconUndo size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={handleClearAll}
+              disabled={!shape}
+              title={shape ? 'Clear all' : 'Nothing to clear'}
+              aria-label="Clear all"
+              className={`p-1.5 rounded ${
+                shape
+                  ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                  : 'text-muted-foreground/40 cursor-not-allowed'
+              }`}
+              data-testid="bbox-clear-all"
+            >
+              <IconClearAll size={14} />
+            </button>
           </div>
 
           <div className="relative inline-block w-full rounded-md overflow-hidden border border-border bg-black">

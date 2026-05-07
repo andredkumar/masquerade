@@ -1194,22 +1194,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
 
-      // Read first frame to determine canonical image dimensions. The bbox
-      // and mask were generated from this exact image (see processVideo +
-      // /api/ai/infer — both feed temp_processed PNGs to the GPU), so its
-      // dimensions are authoritative for client-side scaling.
-      let imageWidth = 0;
-      let imageHeight = 0;
-      const firstPath = await resolveFramePath(req.params.jobId, 0);
-      if (firstPath) {
-        try {
-          const meta = await Sharp(firstPath).metadata();
-          imageWidth = meta.width || 0;
-          imageHeight = meta.height || 0;
-        } catch (err) {
-          console.warn('inference.json: failed to read frame dimensions', err);
-        }
-      }
+      // imageWidth/imageHeight are the dimensions in which AI bbox coords are
+      // stored — i.e. SOURCE-VIDEO pixel space. CommandInput.toImagePixelBox
+      // scales drawn boxes by videoMetadata.width/height (= job.width/height)
+      // before POSTing, so bbox.x1/x2 ∈ [0, job.width] regardless of any
+      // outputSize re-scaling that was applied to the displayed frames.
+      // Using these values in a canonical SVG viewBox makes overlays align
+      // for outputSize='original' (and for letterbox-aspect resizes, where
+      // the rendered frame's content area still has the source video's
+      // aspect ratio inside any black bars).
+      const imageWidth = job.width || 0;
+      const imageHeight = job.height || 0;
+
+      // Surface the output settings the bbox alignment depends on so the
+      // viewer can decide whether to show the "alignment may be inaccurate"
+      // banner. Crop/stretch transforms that warp the rendered frame's
+      // geometry are the cases where the source-video bbox can drift from
+      // the visual content.
+      const outputSettings = (job as any).outputSettings || {};
+      const exposedOutputSettings = {
+        size: outputSettings.size ?? null,
+        aspectRatioMode: outputSettings.aspectRatioMode ?? null,
+      };
 
       // Label-level summary (same shape viewer-info returns, repeated here so
       // the viewer only has to fetch this one endpoint to render everything)
@@ -1261,6 +1267,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         jobId: job.id,
         imageWidth,
         imageHeight,
+        outputSettings: exposedOutputSettings,
         labels: labelSummary,
         frames,
       });

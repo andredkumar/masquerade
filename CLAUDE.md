@@ -118,7 +118,7 @@ the same `path.resolve + startsWith` pattern the cleanup module uses.
 |---|---|---|---|
 | `GET` | `/api/jobs/:jobId/viewer-info` | none | One-shot summary: `{totalFrames, status, labels, hasFrames, hasInference, hasArtifacts}`. 404 if job missing, 410 if `temp_processed/<jobId>/` swept. |
 | `GET` | `/api/jobs/:jobId/frames/:n.png` | `private, max-age=3600` | n-th processed frame PNG (sorted-list position). 400 invalid n, 404 missing, 410 swept. |
-| `GET` | `/api/jobs/:jobId/inference.json` | `no-store` | Frame-indexed pivot of `job.aiLabels`: `{imageWidth, imageHeight, labels[], frames: {n: [{labelId, name, modality, confidence, bbox, hasMask}]}}`. No base64 blobs — mask URLs are constructed client-side from labelId. |
+| `GET` | `/api/jobs/:jobId/inference.json` | `no-store` | Frame-indexed pivot of `job.aiLabels`: `{imageWidth, imageHeight, outputSettings:{size,aspectRatioMode}, labels[], frames: {n: [{labelId, name, modality, confidence, bbox, hasMask}]}}`. `imageWidth/Height` are SOURCE-VIDEO dimensions (the coord system bbox is stored in), not the temp_processed frame's natural dimensions. No base64 blobs — mask URLs are constructed client-side from labelId. |
 | `GET` | `/api/jobs/:jobId/masks/:labelId/:n.png` | `private, max-age=3600` | Decodes from `maskArtifactStore` and streams a binary mask PNG. **410 with `{reason: "artifacts_lost_on_restart"}`** when the label exists in `job.aiLabels` but the in-memory store has no entry — the frontend uses this to show a re-run banner. |
 | `GET` | `/api/jobs/:jobId/overlays/:labelId/:n.png` | `private, max-age=3600` | Same as masks but serves the GPU's pre-rendered RGBA overlay (green tint on the mask region). Used by the viewer's "Overlay" mode. |
 
@@ -144,11 +144,13 @@ mount and renders three view modes via a segmented control:
   `hasArtifacts === false` (post-restart case) — the toggle button stays
   visible but shows a tooltip explaining why and the user can still use
   Clean and Bbox modes.
-- **Bbox** — frame + SVG `<rect>` per visible label, scaled from
-  image-pixel coords to display coords using `imageWidth/imageHeight` from
-  inference.json. Each rect uses the label's deterministic color
-  (`colorForLabelId`, FNV-1a → HSL hue with fixed S/L) so colors stay
-  stable across reloads.
+- **Bbox** — frame + SVG `<rect>` per visible label. The SVG uses a
+  `viewBox` set to `imageWidth × imageHeight` (source-video pixels) with
+  `preserveAspectRatio="xMidYMid meet"`, so `<rect>` coords pass through
+  as-is and the browser handles all display scaling. No manual measurement
+  of the rendered img is needed. Each rect uses the label's deterministic
+  color (`colorForLabelId`, FNV-1a → HSL hue with fixed S/L), matching
+  the swatch shown in the AI Analysis panel's label list.
 
 Keyboard: ←/→ (±1), Shift+←/→ (±10), Home/End, Space cycles modes
 (skips Overlay when artifacts are unavailable).
@@ -192,10 +194,18 @@ viewer locks the mode toggle to Clean and shows
   matches the inference loop and the manifest builder. If upstream
   processing changes the file naming convention again, both inference.json
   and the viewer need to be re-aligned.
-- **Image dimensions** in inference.json come from `Sharp(firstFrame).metadata()`.
-  If the temp_processed frame dimensions don't match the dimensions the
-  GPU saw (which would only happen via an outputSettings re-process path),
-  bbox display would be slightly mis-aligned. Not a current issue.
+- **Bbox overlay assumes letterbox or original output mode.** Bbox coords
+  are stored in source-video pixel space (`job.width × job.height`), and
+  inference.json now reports `imageWidth/imageHeight` in that space so the
+  viewer's SVG `viewBox` aligns with the displayed frame for `outputSize=
+  'original'` and for any non-original size with `aspectRatioMode='letterbox'`
+  (the rendered frame's content area still has source-video aspect inside
+  black bars). Crop and stretch modes warp frame geometry but the stored
+  bbox doesn't get re-projected, so positions can drift. The viewer detects
+  this via the `outputSettings` block in inference.json and shows an inline
+  amber warning when bbox mode is active under those conditions. Full fix
+  is bbox coordinate transformation at inference time — parked for future
+  work.
 
 ### Future work parking lot
 
@@ -212,3 +222,74 @@ viewer locks the mode toggle to Clean and shows
 - Extracting `FrameViewer.tsx` into smaller pieces (`<ModeToggle>`,
   `<LabelsPanel>`, `<PrefetchLayer>`) once a second viewer-like component
   appears.
+
+## AI Analysis
+
+Step 4 in the linear workflow. The user draws a region of interest (bbox /
+circle / polygon / brush) on the first processed frame, types an intent
+("segment the pleural line"), and clicks Run. Inference runs on every
+frame in `temp_processed/<jobId>/`; results are stored as one `AiLabel`
+per Run on `job.aiLabels` (lightweight metadata) plus a per-frame
+`maskArtifactStore` entry (heavy base64 blobs, in-memory only).
+
+### Drawing canvas controls
+
+The drawing toolbar in the AI Analysis sidebar panel has four mode
+buttons (Rectangle / Circle / Polygon / Brush) followed by a divider and
+two action buttons:
+
+- **Undo last** (Undo2 icon) — single-shape semantics with step-by-step
+  revert:
+  - **Polygon mid-drafting**: pops the most recently placed vertex.
+    Pops the last vertex → discards the shape entirely.
+  - **Polygon committed** (post double-click, before Run): discards the
+    polygon. Does not revert to drafting; if you want to keep editing,
+    don't double-click.
+  - **Rect / Circle / Brush** (committed or in-progress): discards the shape.
+  - **Nothing to undo**: silent no-op.
+- **Clear all** (Eraser icon) — clears the current shape after a
+  `window.confirm` if it's a meaningful shape (polygon with >2 vertices,
+  brush stroke with >4 points, or any rect/circle). Trivial in-progress
+  shapes clear without asking.
+
+Keyboard shortcut: **Cmd/Ctrl+Z** runs Undo when the AI Analysis panel is
+visible AND focus is on `<body>` or the canvas (not in the intent input
+or any other text field — those keep native undo). Multi-step undo is
+supported by the rules above; the shortcut is a silent no-op when there's
+nothing to undo.
+
+There is **no multi-bbox composition** — only one shape is ever sent to
+the GPU per Run click. Drawing a new shape replaces the previous one.
+
+### Approve vs. delete
+
+Each label in the sidebar list has two distinct controls, deliberately
+separated because they have different consequences:
+
+- **Approve toggle** — reversible. Click flips `label.approved`. Visual
+  state shows current value: filled green "Approved ✓" when true, gray
+  outline "Not approved ✕" when false. Hits `PATCH /api/ai/labels/:jobId/:labelId`
+  with `{approved: !current}`. Only approved labels are written into the
+  download ZIP's manifest. **Use this when you're not sure yet** — you
+  can flip it back later without re-running inference.
+- **Delete** (Trash2 icon, red on hover) — permanent. Click prompts
+  `window.confirm("Permanently delete label 'foo'? This cannot be undone.")`.
+  Confirm hits `DELETE /api/ai/labels/:jobId/:labelId`, which splices the
+  label out of `job.aiLabels` AND evicts its entries from
+  `maskArtifactStore`. The mask/overlay artifacts cannot be recovered
+  without re-running inference. **Use this when you definitely don't want
+  this label.**
+
+A small color swatch leads each row, computed via
+`client/src/lib/labelColor.ts` (FNV-1a → HSL). It matches the bbox
+stroke color the FrameViewer renders for the same label, so users can
+mentally connect rows to overlay rectangles.
+
+### Layout
+
+```
+[swatch] [name] [confidence]   [approve toggle] [delete]
+```
+
+On narrow widths the name truncates with `truncate`; the toggle and
+delete button stay full-size since they're shrink-0.

@@ -43,6 +43,10 @@ interface InferenceData {
   jobId: string;
   imageWidth: number;
   imageHeight: number;
+  outputSettings?: {
+    size: string | null;             // 'original' | '512x512' | … | 'custom' | null
+    aspectRatioMode: string | null;  // 'letterbox' | 'crop' | 'stretch' | null
+  };
   labels: ViewerLabelSummary[];
   frames: Record<string, PerFrameLabel[]>;
 }
@@ -79,11 +83,11 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Image element ref for measuring rendered display size (used to scale
-  // bbox image-pixel coords down to display coords for the SVG overlay).
-  const imgRef = useRef<HTMLImageElement | null>(null);
+  // We no longer measure the rendered img size. The SVG overlay uses a
+  // viewBox in IMAGE pixel coords (= source-video coords on the wire) and
+  // sits absolutely over the img in an inline-block wrapper, so the
+  // browser handles all scaling. See bbox <svg> below.
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [displaySize, setDisplaySize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
   // ── Initial fetch (parallel) ────────────────────────────────────────
 
@@ -132,21 +136,6 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
 
     return () => { cancelled = true; };
   }, [jobId]);
-
-  // ── Display size tracking ───────────────────────────────────────────
-
-  const measureImage = useCallback(() => {
-    const img = imgRef.current;
-    if (!img) return;
-    const rect = img.getBoundingClientRect();
-    setDisplaySize({ w: Math.round(rect.width), h: Math.round(rect.height) });
-  }, []);
-
-  useEffect(() => {
-    measureImage();
-    window.addEventListener('resize', measureImage);
-    return () => window.removeEventListener('resize', measureImage);
-  }, [measureImage]);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────
 
@@ -237,27 +226,19 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
     [jobId]
   );
 
-  // ── Bbox display-coord transform ────────────────────────────────────
-
-  const bboxToDisplay = useCallback(
-    (bbox: { x1: number; y1: number; x2: number; y2: number }): { x: number; y: number; w: number; h: number } | null => {
-      if (!inferenceData || inferenceData.imageWidth <= 0 || inferenceData.imageHeight <= 0) return null;
-      if (displaySize.w <= 0 || displaySize.h <= 0) return null;
-      const sx = displaySize.w / inferenceData.imageWidth;
-      const sy = displaySize.h / inferenceData.imageHeight;
-      const x1 = Math.min(bbox.x1, bbox.x2);
-      const y1 = Math.min(bbox.y1, bbox.y2);
-      const x2 = Math.max(bbox.x1, bbox.x2);
-      const y2 = Math.max(bbox.y1, bbox.y2);
-      return {
-        x: x1 * sx,
-        y: y1 * sy,
-        w: (x2 - x1) * sx,
-        h: (y2 - y1) * sy,
-      };
-    },
-    [inferenceData, displaySize]
-  );
+  // ── Aspect-mode warning gate ────────────────────────────────────────
+  // Bbox coords are stored in source-video pixel space. When outputSize is
+  // 'original' OR aspectRatioMode is 'letterbox', the displayed frame's
+  // content area still has the source-video aspect ratio (with possible
+  // black bars), so the SVG viewBox aligns. With 'crop' or 'stretch', the
+  // frame is geometrically warped and bbox positions can drift.
+  const aspectMaybeOff = useMemo(() => {
+    const os = inferenceData?.outputSettings;
+    if (!os) return false;
+    const size = os.size || 'original';
+    const mode = os.aspectRatioMode || 'letterbox';
+    return size !== 'original' && mode !== 'letterbox';
+  }, [inferenceData?.outputSettings]);
 
   // ── Mode-aware prefetch window ──────────────────────────────────────
   // Render hidden <img> nodes for currentFrame ± PREFETCH_RADIUS to warm
@@ -371,17 +352,31 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
         </div>
       )}
 
-      {/* Frame display + SVG overlay */}
+      {/* Banner: bbox alignment may be inaccurate (crop/stretch + non-original size) */}
+      {aspectMaybeOff && mode === 'bbox' && (
+        <div
+          className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          data-testid="viewer-aspect-warning"
+        >
+          Bbox positions may be inaccurate when output size differs from source with crop/stretch aspect mode. Use letterbox or original for precise overlay.
+        </div>
+      )}
+
+      {/* Frame display + overlays.
+          Wrapper is `inline-block` and sized to the img content (img has its
+          own max-w/max-h constraints). Both the overlay PNG and the bbox SVG
+          are absolute-positioned and `inset-0`; because the wrapper hugs the
+          img, inset-0 = the painted image area. The bbox <svg> uses a viewBox
+          in IMAGE pixel coords (= source-video coords) so the browser handles
+          all scaling — no manual displaySize math required. */}
       <div className="flex-1 flex items-center justify-center min-h-0 overflow-hidden bg-black rounded-md">
         <div className="relative inline-block max-w-[80vw] max-h-[70vh]">
           <img
-            ref={imgRef}
             src={frameUrl(currentFrame)}
             alt={`Frame ${currentFrame}`}
             className="block max-w-full max-h-[70vh] object-contain select-none"
             draggable={false}
             loading="eager"
-            onLoad={measureImage}
             onError={() => setLoadError("Frame failed to load. The session may have expired.")}
             data-testid="viewer-frame"
           />
@@ -402,46 +397,52 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
             ))
           }
 
-          {/* SVG bbox layer (only in 'bbox' mode) */}
-          {mode === 'bbox' && displaySize.w > 0 && (
+          {/* SVG bbox layer (only in 'bbox' mode). viewBox = source-video
+              pixel space; preserveAspectRatio matches the img's object-contain
+              behavior so the SVG content area aligns with the visible image
+              content area (including any letterboxing inside the wrapper). */}
+          {mode === 'bbox' && inferenceData && inferenceData.imageWidth > 0 && inferenceData.imageHeight > 0 && (
             <svg
-              className="absolute inset-0 pointer-events-none"
-              width={displaySize.w}
-              height={displaySize.h}
-              viewBox={`0 0 ${displaySize.w} ${displaySize.h}`}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+              viewBox={`0 0 ${inferenceData.imageWidth} ${inferenceData.imageHeight}`}
+              preserveAspectRatio="xMidYMid meet"
               data-testid="viewer-bbox-svg"
             >
               {visiblePerFrameLabels.map(l => {
                 if (!l.bbox) return null;
-                const dims = bboxToDisplay(l.bbox);
-                if (!dims) return null;
-                const labelSummary = inferenceData?.labels.find(x => x.labelId === l.labelId);
+                const labelSummary = inferenceData.labels.find(x => x.labelId === l.labelId);
                 const color = labelSummary?.color || 'rgba(34, 211, 238, 0.95)';
+                const x1 = Math.min(l.bbox.x1, l.bbox.x2);
+                const y1 = Math.min(l.bbox.y1, l.bbox.y2);
+                const w = Math.abs(l.bbox.x2 - l.bbox.x1);
+                const h = Math.abs(l.bbox.y2 - l.bbox.y1);
+                // Stroke / font scale with image natural dims so the rect is
+                // visible whether the image is 512px wide or 1920px wide.
+                const stroke = Math.max(2, inferenceData.imageWidth / 400);
+                const fontSize = Math.max(11, inferenceData.imageWidth / 60);
+                const tagH = fontSize * 1.5;
                 return (
                   <g key={l.labelId}>
                     <rect
-                      x={dims.x}
-                      y={dims.y}
-                      width={dims.w}
-                      height={dims.h}
+                      x={x1} y={y1} width={w} height={h}
                       fill={color}
                       fillOpacity={0.15}
                       stroke={color}
-                      strokeWidth={2}
+                      strokeWidth={stroke}
                     />
-                    {/* Label tag in top-left of the box */}
+                    {/* Label tag above the box (clamped to top edge) */}
                     <rect
-                      x={dims.x}
-                      y={Math.max(0, dims.y - 18)}
-                      width={Math.min(displaySize.w - dims.x, l.name.length * 7 + 8)}
-                      height={16}
+                      x={x1}
+                      y={Math.max(0, y1 - tagH)}
+                      width={Math.min(inferenceData.imageWidth - x1, (l.name.length + 5) * fontSize * 0.6)}
+                      height={tagH}
                       fill={color}
                       fillOpacity={0.95}
                     />
                     <text
-                      x={dims.x + 4}
-                      y={Math.max(12, dims.y - 5)}
-                      fontSize={11}
+                      x={x1 + fontSize * 0.4}
+                      y={Math.max(fontSize, y1 - fontSize * 0.4)}
+                      fontSize={fontSize}
                       fill="white"
                       fontFamily="system-ui, sans-serif"
                     >

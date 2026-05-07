@@ -9,9 +9,10 @@ import CommandInput, { type Modality } from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
 import FrameViewer from "@/components/FrameViewer";
 import { Button } from "@/components/ui/button";
-import { Settings, Video, Download, Lock, Upload, Check, X, Info, Eye } from "lucide-react";
+import { Settings, Video, Download, Lock, Upload, Check, X, Info, Eye, Trash2 } from "lucide-react";
 import type { MaskData, OutputSettings, AiLabel } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
+import { colorForLabelId } from "@/lib/labelColor";
 
 export default function Home() {
   const [currentJob, setCurrentJob] = useState<string | null>(null);
@@ -151,6 +152,19 @@ export default function Home() {
     } catch (err) {
       console.error('Failed to remove label:', err);
     }
+  };
+
+  // Confirm-then-delete wrapper for the label-list trash button. The bare
+  // handleRemoveLabel is left unchanged so any keyboard / programmatic
+  // callers don't get a confirm injected, but every UI-driven delete now
+  // gates on user intent because deletion is permanent and cascades into
+  // maskArtifactStore eviction on the server.
+  const handleDeleteLabelWithConfirm = (label: AiLabel) => {
+    const ok = window.confirm(
+      `Permanently delete label '${label.target}'? This cannot be undone.`
+    );
+    if (!ok) return;
+    void handleRemoveLabel(label.id);
   };
 
   const handleDownload = () => {
@@ -398,43 +412,67 @@ export default function Home() {
                         frameCount = values.length;
                       }
                     }
+                    const swatchColor = colorForLabelId(label.id);
                     return (
                     <div
                       key={label.id}
-                      className={`flex items-center justify-between rounded-md px-3 py-2 text-xs ${
+                      className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs ${
                         label.approved ? 'bg-muted/50' : 'bg-muted/20 opacity-60'
                       }`}
                       data-testid={`ai-label-${label.id}`}
                     >
-                      <div className="flex-1 min-w-0 mr-2">
-                        {label.approved && <span className="text-green-500 mr-1">✓</span>}
-                        <span className="font-medium">{label.target}</span>
+                      {/* Color swatch — matches FrameViewer bbox stroke color */}
+                      <span
+                        className="inline-block w-3 h-3 rounded-sm shrink-0"
+                        style={{ backgroundColor: swatchColor }}
+                        aria-hidden
+                      />
+
+                      {/* Name + confidence + meta */}
+                      <div className="flex-1 min-w-0">
+                        <span className="font-medium truncate">{label.target}</span>
                         {avgConfidence !== null && (
                           <span className="text-muted-foreground ml-1">
-                            ({Math.round(avgConfidence * 100)}%{frameCount > 1 ? ' avg confidence' : ''})
+                            ({Math.round(avgConfidence * 100)}%{frameCount > 1 ? ' avg' : ''})
                           </span>
                         )}
-                        <span className="text-muted-foreground ml-1 text-[10px]">
+                        <div className="text-muted-foreground text-[10px] truncate">
                           {label.intent} · {label.model}
                           {frameCount > 1 ? ` · ${frameCount} frames` : ''}
-                        </span>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => handleToggleLabel(label.id, true)}
-                          className={`p-1 rounded hover:bg-muted ${label.approved ? 'text-green-500' : 'text-muted-foreground'}`}
-                          title="Approve"
-                        >
-                          <Check size={14} />
-                        </button>
-                        <button
-                          onClick={() => handleRemoveLabel(label.id)}
-                          className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-muted"
-                          title="Remove"
-                        >
-                          <X size={14} />
-                        </button>
-                      </div>
+
+                      {/* Approve toggle — reversible. Click flips approved state. */}
+                      <button
+                        type="button"
+                        onClick={() => handleToggleLabel(label.id, !label.approved)}
+                        title={label.approved ? 'Approved (click to un-approve)' : 'Not approved (click to approve)'}
+                        aria-pressed={label.approved}
+                        className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium border transition-colors ${
+                          label.approved
+                            ? 'bg-green-500/15 text-green-600 dark:text-green-400 border-green-500/40 hover:bg-green-500/25'
+                            : 'bg-transparent text-muted-foreground border-border hover:bg-muted'
+                        }`}
+                        data-testid={`ai-label-toggle-${label.id}`}
+                      >
+                        {label.approved ? (
+                          <><Check size={12} /> Approved</>
+                        ) : (
+                          <><X size={12} /> Not approved</>
+                        )}
+                      </button>
+
+                      {/* Permanent delete — distinct from un-approve. Confirms first. */}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteLabelWithConfirm(label)}
+                        title="Delete label permanently"
+                        aria-label="Delete label"
+                        className="shrink-0 p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                        data-testid={`ai-label-delete-${label.id}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
                     </div>
                     );
                   })}
