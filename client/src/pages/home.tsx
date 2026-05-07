@@ -7,8 +7,9 @@ import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import CommandInput, { type Modality } from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
+import FrameViewer from "@/components/FrameViewer";
 import { Button } from "@/components/ui/button";
-import { Settings, Video, Download, Lock, Upload, Check, X, Info } from "lucide-react";
+import { Settings, Video, Download, Lock, Upload, Check, X, Info, Eye } from "lucide-react";
 import type { MaskData, OutputSettings, AiLabel } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
 
@@ -30,6 +31,12 @@ export default function Home() {
   // Step 4: modality selection — persists across AI runs on the same job,
   // but resets on every new upload.
   const [modality, setModality] = useState<Modality | null>(null);
+
+  // Frame viewer (Phase 4 of the linear flow). When active, the main canvas
+  // area swaps from the template-mask canvas to the read-only FrameViewer.
+  // Toggleable — user can enter from the sidebar's "Review Frames" panel
+  // and leave via the viewer's own back/continue buttons.
+  const [viewerActive, setViewerActive] = useState(false);
 
   // Step 1: frame extraction rate.
   // null = native (every frame). Number = -vf fps=N on the backend.
@@ -76,6 +83,7 @@ export default function Home() {
     setModality(null); // new job — user must pick a modality again
     setSamplingMode('native');
     setCustomFps('');
+    setViewerActive(false);
   };
 
   const handleMaskUpdate = (newMaskData: MaskData) => {
@@ -439,6 +447,52 @@ export default function Home() {
             </div>
           )}
 
+          {/* Review Frames — opt-in viewer between Step 4 and Step 5.
+              Enabled as soon as Step 3 produces a temp_processed/<jobId>/
+              folder; doesn't require AI inference to have run. */}
+          <div className="p-4 border-b border-border">
+            <div className="flex items-center gap-2">
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center ${jobCompleted ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
+                <Eye size={14} />
+              </div>
+              <h2 className="text-lg font-semibold">Review Frames</h2>
+              {!jobCompleted && <Lock size={14} className="text-muted-foreground ml-auto" />}
+            </div>
+          </div>
+          {jobCompleted ? (
+            <div className="px-4 py-3 space-y-2">
+              {viewerActive ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => setViewerActive(false)}
+                  data-testid="sidebar-close-viewer"
+                >
+                  <X size={14} className="mr-1" />
+                  Close viewer
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  className="w-full"
+                  onClick={() => setViewerActive(true)}
+                  data-testid="sidebar-open-viewer"
+                >
+                  <Eye size={14} className="mr-1" />
+                  Open frame viewer
+                </Button>
+              )}
+              <p className="text-[11px] text-muted-foreground">
+                Scrub processed frames and toggle AI overlays before downloading. Optional — you can skip straight to download below.
+              </p>
+            </div>
+          ) : (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              Available after Step 3 completes.
+            </div>
+          )}
+
           {/* Step 5: Download ZIP */}
           <div className="p-4 border-b border-border">
             <div className="flex items-center gap-2">
@@ -520,29 +574,39 @@ export default function Home() {
 
         {/* Main Content Area */}
         <main className="flex-1 flex flex-col">
-          <div className="flex-1 p-6 relative">
-            <MaskingCanvas
-              firstFrame={firstFrame}
-              selectedTool={selectedTool}
-              onMaskUpdate={handleMaskUpdate}
-              zoom={canvasZoom}
-              onZoomChange={setCanvasZoom}
-              maskData={maskData}
+          {viewerActive && currentJob && jobCompleted ? (
+            // Read-only frame viewer takes over the main canvas area when active.
+            // Sidebar (Step 5 download, etc.) remains accessible the whole time.
+            <FrameViewer
+              jobId={currentJob}
+              onContinueToDownload={() => setViewerActive(false)}
+              onBackToInference={() => setViewerActive(false)}
             />
+          ) : (
+            <div className="flex-1 p-6 relative">
+              <MaskingCanvas
+                firstFrame={firstFrame}
+                selectedTool={selectedTool}
+                onMaskUpdate={handleMaskUpdate}
+                zoom={canvasZoom}
+                onZoomChange={setCanvasZoom}
+                maskData={maskData}
+              />
 
-            {/* Processing Started Indicator - Top Right of Canvas */}
-            {isProcessing && (
-              <div className="absolute top-8 right-8 bg-card border border-border rounded-lg shadow-lg p-4 z-10" data-testid="processing-indicator">
-                <div className="flex items-center gap-3">
-                  <div className="w-3 h-3 bg-primary rounded-full animate-pulse"></div>
-                  <div>
-                    <p className="font-medium text-sm">Processing Started</p>
-                    <p className="text-xs text-muted-foreground">Applying mask to all frames...</p>
+              {/* Processing Started Indicator - Top Right of Canvas */}
+              {isProcessing && (
+                <div className="absolute top-8 right-8 bg-card border border-border rounded-lg shadow-lg p-4 z-10" data-testid="processing-indicator">
+                  <div className="flex items-center gap-3">
+                    <div className="w-3 h-3 bg-primary rounded-full animate-pulse"></div>
+                    <div>
+                      <p className="font-medium text-sm">Processing Started</p>
+                      <p className="text-xs text-muted-foreground">Applying mask to all frames...</p>
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
 
           {/* Processing Status - stays in main content area */}
           {currentJob && (

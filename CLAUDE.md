@@ -87,3 +87,114 @@ disk. Once Phase 3 (Clerk auth + sessions table) lands:
 
 The cleanup module is structured so this rework is local to that file
 plus the call sites — nothing leaks the retention policy outward.
+
+## Frame viewer
+
+A read-only scrub viewer sits between Step 4 (AI Analysis) and Step 5
+(Download) in the sidebar. It is opt-in: the user clicks **Open frame
+viewer** in the "Review Frames" sidebar panel, the main canvas area swaps
+from `MaskingCanvas` to `FrameViewer`, and the user can leave via either
+**Continue to Download** or **Close viewer**. The direct path from Step 4
+to Step 5 is preserved — skipping the viewer is allowed.
+
+### Endpoints
+
+All five endpoints are pure read. None write to disk. Every filesystem
+path is bounded by `server/services/frameAccess.ts`'s `resolveFramePath`
+(or its mask/overlay equivalents) against `TEMP_PROCESSED_DIR`, using
+the same `path.resolve + startsWith` pattern the cleanup module uses.
+
+| Method | Path | Cache | Purpose |
+|---|---|---|---|
+| `GET` | `/api/jobs/:jobId/viewer-info` | none | One-shot summary: `{totalFrames, status, labels, hasFrames, hasInference, hasArtifacts}`. 404 if job missing, 410 if `temp_processed/<jobId>/` swept. |
+| `GET` | `/api/jobs/:jobId/frames/:n.png` | `private, max-age=3600` | n-th processed frame PNG (sorted-list position). 400 invalid n, 404 missing, 410 swept. |
+| `GET` | `/api/jobs/:jobId/inference.json` | `no-store` | Frame-indexed pivot of `job.aiLabels`: `{imageWidth, imageHeight, labels[], frames: {n: [{labelId, name, modality, confidence, bbox, hasMask}]}}`. No base64 blobs — mask URLs are constructed client-side from labelId. |
+| `GET` | `/api/jobs/:jobId/masks/:labelId/:n.png` | `private, max-age=3600` | Decodes from `maskArtifactStore` and streams a binary mask PNG. **410 with `{reason: "artifacts_lost_on_restart"}`** when the label exists in `job.aiLabels` but the in-memory store has no entry — the frontend uses this to show a re-run banner. |
+| `GET` | `/api/jobs/:jobId/overlays/:labelId/:n.png` | `private, max-age=3600` | Same as masks but serves the GPU's pre-rendered RGBA overlay (green tint on the mask region). Used by the viewer's "Overlay" mode. |
+
+### Component
+
+`client/src/components/FrameViewer.tsx`. Props:
+```ts
+{
+  jobId: string;
+  onContinueToDownload: () => void;
+  onBackToInference?: () => void;
+}
+```
+The viewer fetches `viewer-info` and `inference.json` in parallel on
+mount and renders three view modes via a segmented control:
+
+- **Clean** — just the frame PNG.
+- **Overlay** — frame + GPU overlay PNG(s) stacked with `mix-blend-mode: lighten`.
+  One overlay layer per visible label. We chose `lighten` over `screen`
+  because medical imagery preserves contrast better — `lighten` only
+  brightens the mask region (where the green tint is the brighter pixel)
+  and leaves the rest of the frame identical. Disabled when
+  `hasArtifacts === false` (post-restart case) — the toggle button stays
+  visible but shows a tooltip explaining why and the user can still use
+  Clean and Bbox modes.
+- **Bbox** — frame + SVG `<rect>` per visible label, scaled from
+  image-pixel coords to display coords using `imageWidth/imageHeight` from
+  inference.json. Each rect uses the label's deterministic color
+  (`colorForLabelId`, FNV-1a → HSL hue with fixed S/L) so colors stay
+  stable across reloads.
+
+Keyboard: ←/→ (±1), Shift+←/→ (±10), Home/End, Space cycles modes
+(skips Overlay when artifacts are unavailable).
+Slider is the primary scrub control.
+
+Prefetch window is mode-aware: ±10 frames around current, capped at 30
+total `<img>` nodes. In Overlay mode the budget is split across the
+visible labels' overlay PNGs. Clean and Bbox modes only prefetch frame
+PNGs (bboxes already arrived in inference.json). The window is rebuilt
+from scratch on every `currentFrame` / `mode` / `visibleLabels` change —
+no accumulation.
+
+The viewer is **read-only** in v1 — no per-frame editing, no saving back
+to inference state. Per-frame label visibility is the only client-side
+mutation, and it's purely UI state (not POSTed anywhere).
+
+### Panel gating
+
+The "Review Frames" sidebar panel is enabled when `jobCompleted` is true
+(i.e. `temp_processed/<jobId>/` exists). It is **not** gated on AI labels
+existing — a user with completed template-masking but no AI run yet can
+still scrub their masked frames to verify quality. In that case the
+viewer locks the mode toggle to Clean and shows
+"No AI labels yet — run inference to enable overlays" in the labels panel.
+
+### Known limitations
+
+- **Large videos (>1000 frames)** may scrub sluggishly on slower laptops.
+  Each frame is a separate HTTP fetch; browser cache keeps it manageable
+  but the prefetch radius isn't tuned for high frame counts. Not yet
+  optimized.
+- **Artifacts are RAM-only**. After a `pm2 restart` the `maskArtifactStore`
+  is empty even though `job.aiLabels` is still in MemStorage. The viewer
+  detects this via `hasArtifacts: false` and shows a banner with a
+  re-run-inference shortcut.
+- **Bbox display uses sorted-list position as the frame key**. This
+  matches the inference loop and the manifest builder. If upstream
+  processing changes the file naming convention again, both inference.json
+  and the viewer need to be re-aligned.
+- **Image dimensions** in inference.json come from `Sharp(firstFrame).metadata()`.
+  If the temp_processed frame dimensions don't match the dimensions the
+  GPU saw (which would only happen via an outputSettings re-process path),
+  bbox display would be slightly mis-aligned. Not a current issue.
+
+### Future work parking lot
+
+- Per-frame approval / disapproval (operator marks individual frames as
+  "good" or "discard"). Would need a new POST endpoint + a flag on
+  `frameResults[n]`.
+- Side-by-side Clean + Overlay rendering at the same time, for direct
+  visual comparison.
+- In-viewer bbox correction with re-inference: drag a corner of a bbox
+  to tighten it, click Re-run AI for that one label, replace its
+  `frameResults` in place.
+- Server-side frame-strip thumbnail for an MP4-style scrubber preview
+  along the slider.
+- Extracting `FrameViewer.tsx` into smaller pieces (`<ModeToggle>`,
+  `<LabelsPanel>`, `<PrefetchLayer>`) once a second viewer-like component
+  appears.

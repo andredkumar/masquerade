@@ -18,6 +18,13 @@ import {
   TEMP_EXTRACTED_DIR,
   TEMP_PROCESSED_DIR,
 } from "./services/cleanup";
+import {
+  resolveFramePath,
+  tempDirExists,
+  countFrames,
+  colorForLabelId,
+} from "./services/frameAccess";
+import Sharp from "sharp";
 import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
@@ -1044,6 +1051,324 @@ export async function registerRoutes(app: Express): Promise<Server> {
     socket.on('disconnect', () => {
       console.log('Client disconnected');
     });
+  });
+
+  // ── Frame viewer (read-only) ─────────────────────────────────────────
+  // These four endpoints feed the in-app frame viewer (Phase 4 of the
+  // 5-step workflow). They never write to disk, never mutate job state,
+  // and every filesystem path is bounded by frameAccess helpers.
+
+  /**
+   * GET /api/jobs/:jobId/viewer-info
+   *   200: { jobId, totalFrames, status, labels[], hasFrames, hasInference, hasArtifacts }
+   *   404: job record doesn't exist (typo'd jobId)
+   *   410: job exists in MemStorage but temp_processed/<jobId>/ has been
+   *        swept by retention. UI should show "session expired" + offer rerun.
+   */
+  app.get("/api/jobs/:jobId/viewer-info", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const framesPresent = await tempDirExists(req.params.jobId);
+      if (!framesPresent) {
+        // 410 specifically signals "this used to exist, retention swept it"
+        return res.status(410).json({
+          error: "This session's frames are no longer available",
+          reason: "frames_swept_by_retention",
+        });
+      }
+
+      const totalFrames = await countFrames(req.params.jobId);
+      const allLabels = ((job as any).aiLabels || []) as AiLabel[];
+
+      // Per A: hasArtifacts is true iff at least one approved label has
+      // an entry in the in-memory store. After a PM2 restart this flips
+      // to false even though `aiLabels` is still in MemStorage's map.
+      let hasArtifacts = false;
+      for (const l of allLabels) {
+        if (l.approved && maskArtifactStore.has(l.id)) {
+          hasArtifacts = true;
+          break;
+        }
+      }
+
+      const labels = allLabels.map(l => {
+        const fr = l.frameResults || {};
+        const confValues = Object.values(fr).map((v: any) => v.confidence).filter((c: any) => typeof c === 'number');
+        const avg = confValues.length > 0
+          ? confValues.reduce((a, b) => a + b, 0) / confValues.length
+          : (l.confidence ?? 0);
+        return {
+          labelId: l.id,
+          name: l.target,
+          modality: l.modality || null,
+          color: colorForLabelId(l.id),
+          approved: l.approved,
+          avgConfidence: avg,
+          frameCount: confValues.length,
+        };
+      });
+
+      res.json({
+        jobId: job.id,
+        totalFrames,
+        status: job.status,
+        labels,
+        hasFrames: totalFrames > 0,
+        hasInference: allLabels.length > 0,
+        hasArtifacts,
+      });
+    } catch (error) {
+      console.error("viewer-info error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load viewer info" });
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/frames/:n.png
+   *
+   * Streams the n-th processed frame. `n` is the 0-indexed sorted-list
+   * position used by the inference loop and the manifest builder, so it
+   * always matches the keys in inference.json.
+   *
+   * Cache-Control: private, max-age=3600 — the browser keeps frames in
+   * its cache while the user scrubs back and forth without revalidating.
+   * Marked private so intermediate proxies don't share frames between users.
+   */
+  app.get("/api/jobs/:jobId/frames/:n.png", async (req, res) => {
+    try {
+      const n = parseInt(req.params.n, 10);
+      if (!Number.isInteger(n) || n < 0 || String(n) !== req.params.n) {
+        return res.status(400).json({ error: "frame index must be a non-negative integer" });
+      }
+
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      if (!(await tempDirExists(req.params.jobId))) {
+        return res.status(410).json({
+          error: "This session's frames are no longer available",
+          reason: "frames_swept_by_retention",
+        });
+      }
+
+      const absPath = await resolveFramePath(req.params.jobId, n);
+      if (!absPath) return res.status(404).json({ error: `frame ${n} not found` });
+
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.setHeader('Content-Type', 'image/png');
+      // sendFile validates the absolute path; we already validated against
+      // TEMP_PROCESSED_DIR in resolveFramePath, so this is doubly safe.
+      res.sendFile(absPath, (err) => {
+        if (err && !res.headersSent) {
+          console.error('frame sendFile error:', err);
+          res.status(500).end();
+        }
+      });
+    } catch (error) {
+      console.error("GET frame error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load frame" });
+      }
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/inference.json
+   *
+   * Pivots `job.aiLabels` into a frame-indexed view the viewer can render:
+   *   {
+   *     imageWidth, imageHeight,
+   *     labels: [{ labelId, name, modality, color, approved, avgConfidence, frameCount }],
+   *     frames: { "<n>": [{ labelId, name, modality, confidence, bbox, approved, hasMask }] }
+   *   }
+   *
+   * Bbox is in IMAGE pixel coords (whatever was stored on the AiLabel —
+   * same coordinate system the GPU received). The viewer rescales to its
+   * displayed image size client-side using imageWidth / imageHeight.
+   *
+   * No base64 blobs. Mask URLs are constructed client-side from labelId.
+   */
+  app.get("/api/jobs/:jobId/inference.json", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      if (!(await tempDirExists(req.params.jobId))) {
+        return res.status(410).json({
+          error: "This session's frames are no longer available",
+          reason: "frames_swept_by_retention",
+        });
+      }
+
+      const allLabels = ((job as any).aiLabels || []) as AiLabel[];
+
+      // Read first frame to determine canonical image dimensions. The bbox
+      // and mask were generated from this exact image (see processVideo +
+      // /api/ai/infer — both feed temp_processed PNGs to the GPU), so its
+      // dimensions are authoritative for client-side scaling.
+      let imageWidth = 0;
+      let imageHeight = 0;
+      const firstPath = await resolveFramePath(req.params.jobId, 0);
+      if (firstPath) {
+        try {
+          const meta = await Sharp(firstPath).metadata();
+          imageWidth = meta.width || 0;
+          imageHeight = meta.height || 0;
+        } catch (err) {
+          console.warn('inference.json: failed to read frame dimensions', err);
+        }
+      }
+
+      // Label-level summary (same shape viewer-info returns, repeated here so
+      // the viewer only has to fetch this one endpoint to render everything)
+      const labelSummary = allLabels.map(l => {
+        const fr = l.frameResults || {};
+        const confValues = Object.values(fr).map((v: any) => v.confidence).filter((c: any) => typeof c === 'number');
+        const avg = confValues.length > 0
+          ? confValues.reduce((a, b) => a + b, 0) / confValues.length
+          : (l.confidence ?? 0);
+        return {
+          labelId: l.id,
+          name: l.target,
+          modality: l.modality || null,
+          color: colorForLabelId(l.id),
+          approved: l.approved,
+          avgConfidence: avg,
+          frameCount: confValues.length,
+        };
+      });
+
+      // Frame-indexed pivot. Each frame lists the labels that have a
+      // confidence entry for that frame number in their frameResults.
+      const totalFrames = await countFrames(req.params.jobId);
+      const frames: Record<string, Array<Record<string, any>>> = {};
+      for (let i = 0; i < totalFrames; i++) {
+        const perFrame: Array<Record<string, any>> = [];
+        for (const l of allLabels) {
+          const r = l.frameResults?.[i];
+          if (!r) continue;
+          // hasMask: artifact store may be empty post-restart even though
+          // the metadata says this frame had a mask. Probe the store.
+          const artifacts = maskArtifactStore.get(l.id);
+          const hasMask = !!artifacts?.frameResults?.[i]?.maskB64;
+          perFrame.push({
+            labelId: l.id,
+            name: l.target,
+            modality: l.modality || null,
+            confidence: r.confidence,
+            bbox: l.bbox || null,
+            approved: l.approved,
+            hasMask,
+          });
+        }
+        if (perFrame.length > 0) frames[String(i)] = perFrame;
+      }
+
+      res.setHeader('Cache-Control', 'no-store'); // inference shape can change between runs
+      res.json({
+        jobId: job.id,
+        imageWidth,
+        imageHeight,
+        labels: labelSummary,
+        frames,
+      });
+    } catch (error) {
+      console.error("inference.json error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load inference data" });
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/masks/:labelId/:n.png
+   *
+   *   200: streams the binary mask PNG for the (label, frame) pair
+   *   404: labelId doesn't exist on this job (or job not found)
+   *   410: { reason: "artifacts_lost_on_restart" } — the label exists in
+   *        job.aiLabels but the in-memory artifact store has no entry for
+   *        it. Happens after PM2 restart. Frontend uses this distinction
+   *        to display the "re-run inference" banner.
+   */
+  app.get("/api/jobs/:jobId/masks/:labelId/:n.png", async (req, res) => {
+    try {
+      const n = parseInt(req.params.n, 10);
+      if (!Number.isInteger(n) || n < 0 || String(n) !== req.params.n) {
+        return res.status(400).json({ error: "frame index must be a non-negative integer" });
+      }
+
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const allLabels = ((job as any).aiLabels || []) as AiLabel[];
+      const label = allLabels.find(l => l.id === req.params.labelId);
+      if (!label) return res.status(404).json({ error: "Label not found" });
+
+      const artifacts = maskArtifactStore.get(label.id);
+      if (!artifacts) {
+        return res.status(410).json({
+          error: "Mask artifacts unavailable",
+          reason: "artifacts_lost_on_restart",
+        });
+      }
+      const b64 = artifacts.frameResults?.[n]?.maskB64;
+      if (!b64) return res.status(404).json({ error: `mask for frame ${n} not found` });
+
+      const buf = Buffer.from(b64, 'base64');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Content-Length', String(buf.length));
+      res.end(buf);
+    } catch (error) {
+      console.error("GET mask error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load mask" });
+      }
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/overlays/:labelId/:n.png
+   *
+   * Same shape as the mask endpoint, but serves the GPU's pre-rendered
+   * overlay PNG (original frame with green tint on the mask region).
+   * Used by the viewer's "Overlay" mode.
+   */
+  app.get("/api/jobs/:jobId/overlays/:labelId/:n.png", async (req, res) => {
+    try {
+      const n = parseInt(req.params.n, 10);
+      if (!Number.isInteger(n) || n < 0 || String(n) !== req.params.n) {
+        return res.status(400).json({ error: "frame index must be a non-negative integer" });
+      }
+
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const allLabels = ((job as any).aiLabels || []) as AiLabel[];
+      const label = allLabels.find(l => l.id === req.params.labelId);
+      if (!label) return res.status(404).json({ error: "Label not found" });
+
+      const artifacts = maskArtifactStore.get(label.id);
+      if (!artifacts) {
+        return res.status(410).json({
+          error: "Overlay artifacts unavailable",
+          reason: "artifacts_lost_on_restart",
+        });
+      }
+      const b64 = artifacts.frameResults?.[n]?.overlayB64;
+      if (!b64) return res.status(404).json({ error: `overlay for frame ${n} not found` });
+
+      const buf = Buffer.from(b64, 'base64');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Content-Length', String(buf.length));
+      res.end(buf);
+    } catch (error) {
+      console.error("GET overlay error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load overlay" });
+      }
+    }
   });
 
   // Graceful shutdown
