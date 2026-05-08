@@ -1,0 +1,66 @@
+Multi-Format File Troubleshooting
+1. DICOM File Troubleshooting
+
+    Metadata Analysis: Extracts DICOM-specific parameters like window center/width, pixel representation, photometric interpretation
+    Coordinate Issues Detection:
+        Signed pixel values that cause coordinate offset
+        MONOCHROME1 inversion affecting mask alignment
+        Multi-sample pixels affecting coordinate mapping
+        Bit depth mismatches between stored and allocated
+        Large dynamic ranges affecting mask visibility
+        Odd-numbered dimensions causing alignment drift
+
+2. Video File Troubleshooting (MP4, MOV, AVI)
+
+    Frame Analysis: Extracts fps, duration, resolution, aspect ratio
+    Video-Specific Issues:
+        Unusual aspect ratios requiring letterboxing/pillarboxing
+        High frame rates causing template timing issues
+        Low frame rates indicating variable timing
+        Ultra-high resolutions impacting performance
+        Low resolutions limiting mask precision
+        High frame counts affecting memory usage
+
+3. Generic Image File Support
+
+    Format Detection: Automatically identifies DICOM, video, image, or unknown files
+    Color Space Analysis: Detects non-standard color spaces requiring conversion
+    Bit Depth Validation: Identifies non-standard bit depths needing normalization
+
+4. Format-Specific Coordinate Strategies
+
+    DICOM: Standard scaling → Preprocessing corrections → Custom transformation
+    Video: Standard frame scaling → Aspect ratio correction → Frame-by-frame alignment
+    Image: Direct scaling → Color/bit depth normalization
+
+5. Integrated Troubleshooting Workflow
+
+    Complete Analysis: Single function analyzes any file format
+    Processing Steps: Step-by-step coordinate alignment plan
+    Issue Prediction: Identifies expected problems before processing
+    Recommendations: Specific solutions for detected issues
+
+Key Troubleshooting Features
+
+DICOM-Specific Handling:
+
+    Windowing parameter analysis
+    Pixel representation validation
+    Photometric interpretation checks
+    Multi-frame dimension analysis
+
+Video-Specific Handling:
+
+    Aspect ratio compatibility checks
+    Frame rate temporal analysis
+    Resolution boundary validation
+    Memory usage optimization
+
+Universal Solutions:
+
+    Automatic file type detection
+    Format-specific preprocessing
+    Coordinate transformation calculation
+    Alignment validation and correction
+
+This comprehensive approach ensures that template masks are accurately applied across all supported medical imaging formats, with format-specific optimizations and troubleshooting for coordinate alignment issues.

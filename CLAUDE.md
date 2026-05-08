@@ -1,11 +1,31 @@
 # Masquerade
 
+**Phase 2 landed (May 2026):** Schema and storage plumbing for the hub-and-spoke refactor. New `Job`, `TemplateMaskState`, `AIState`, `AIRun` types in `shared/schema.ts`. New MemStorage methods. Spoke directories (`spokes/template_mask/`, `spokes/ai/`, `spokes/labeling/`) created on boot. `temp_processed/` purged on every startup. Generalized cleanup sweep targets. Endpoints still write to `temp_processed/`; Phase 3 moves them.
+
 Project-level notes for engineers and Claude when working on this codebase.
+
+## Hub-and-spoke data model (Phase 2)
+
+The codebase is mid-refactor from a 5-step linear pipeline to a hub-and-spoke
+model. The target types live in `shared/schema.ts` (search for "Hub-and-spoke
+types"):
+
+- `Job` — the hub: upload metadata + optional per-spoke state
+- `TemplateMaskState` — Path A (template mask + export)
+- `AIState` / `AIRun` — Path C (AI segmentation, multiple runs per job)
+- `LabelingState` — Path B (placeholder, shape TBD)
+
+`MemStorage` in `server/storage.ts` has methods for these types (`getJobV2`,
+`setTemplateMaskState`, `addAiRun`, etc.) but **no callers exist yet**. Phase 3
+wires them into endpoints.
+
+The existing `VideoJob`, `MaskData`, `OutputSettings`, and `AiLabel` types
+remain the active runtime types until Phase 3 completes the migration.
 
 ## Disk lifecycle
 
-Three transient directories live at the project root and hold short-lived
-data. All of them are managed by `server/services/cleanup.ts`; nothing else
+Transient directories live at the project root and hold short-lived data.
+All of them are managed by `server/services/cleanup.ts`; nothing else
 in the codebase should call `fs.rm` / `fs.unlink` against these paths
 directly — go through `safeDelete`, `deleteUploadFile`, or
 `cleanupJobArtifacts` instead so deletes stay bounded to their allowed root.
@@ -14,7 +34,16 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
 |-----------|-------|-----------|
 | `uploads/` | Original user uploads (multer dest). Contains PHI. | **2 hours** |
 | `temp_extracted/<jobId>/` | Raw frames pulled from a video before template-masking. | **6 hours** |
-| `temp_processed/<jobId>/` | Masked output frames consumed by the ZIP/download builder and the frame viewer. | **24 hours, hourly sweep only** |
+| `temp_processed/<jobId>/` | **(RETIRING)** Masked output frames. Still written by old endpoints during Phase 2. | **Purged on every boot** + 24h hourly sweep |
+| `spokes/template_mask/<jobId>/` | Path A output (Phase 3). | **24 hours** |
+| `spokes/ai/<jobId>/<runId>/` | Path C output, one folder per AI run (Phase 3). | **24 hours** |
+| `spokes/labeling/<jobId>/` | Path B reserved (placeholder). | **24 hours** |
+
+`temp_processed/` is being retired by the hub-and-spoke refactor. Endpoints
+still write to it during Phase 2; Phase 3 moves writes to `spokes/` directories.
+It is purged on every server boot (`purgeTempProcessedOnStartup`) and swept
+hourly as a safety net. `spokes/` directories are created on boot by
+`ensureSpokeDirectories()` and swept hourly alongside the legacy directories.
 
 `temp_processed/<jobId>/` is **not** deleted post-download. Folders persist
 after download to allow the frame viewer to be reopened. Practical effect:
@@ -23,13 +52,20 @@ to 24h. The hourly retention sweep is the only path that reclaims this dir.
 
 ### When does cleanup happen?
 
-- **On every server start**, `purgeUploadsOnStartup()` deletes everything
-  in `uploads/`. Storage is in-memory (`server/storage.ts`), so any upload
-  from a previous process is orphaned by definition — no live request
-  handler can reference it.
-- **Hourly cron** (minute 0): `startCleanupScheduler()` sweeps each
-  directory for entries older than its retention window. Wrapped in
-  try/catch at every layer — cleanup must never crash the app.
+- **On every server start**:
+  - `purgeUploadsOnStartup()` deletes everything in `uploads/`. Storage is
+    in-memory (`server/storage.ts`), so any upload from a previous process
+    is orphaned by definition — no live request handler can reference it.
+  - `purgeTempProcessedOnStartup()` deletes everything in `temp_processed/`.
+    Same MemStorage rationale. (Added in Phase 2.)
+  - `ensureSpokeDirectories()` creates `spokes/template_mask/`, `spokes/ai/`,
+    `spokes/labeling/` if they don't exist. (Added in Phase 2.)
+- **Hourly cron** (minute 0): `startCleanupScheduler()` sweeps all targets
+  in the `SWEEP_TARGETS` list (uploads, temp_extracted, temp_processed, and
+  all three spoke dirs) for entries older than their retention window.
+  Adding a future spoke is a one-line addition to `SWEEP_TARGETS` in
+  `cleanup.ts`. Wrapped in try/catch at every layer — cleanup must never
+  crash the app.
 - **Eager deletes** along the request lifecycle:
   - The video upload handler (`POST /api/videos/upload`) deletes the
     multer file on `req.on('aborted')` and on the catch path.
@@ -45,14 +81,15 @@ to 24h. The hourly retention sweep is the only path that reclaims this dir.
     response finishes. The frame viewer needs it readable after download
     so users can reopen the viewer or re-download. Reclamation happens
     exclusively via the hourly retention sweep (24h).
-- **SIGTERM** sweeps all three directories with `maxAgeMs = 0` (everything
-  goes), then closes the HTTP server. Each step is individually
-  try/wrapped so one failure cannot block shutdown.
+- **SIGTERM** sweeps all directories (uploads, temp_extracted, temp_processed)
+  with `maxAgeMs = 0` (everything goes), then closes the HTTP server. Each
+  step is individually try/wrapped so one failure cannot block shutdown.
+  (Note: SIGTERM does not yet sweep spoke dirs — will be added in Phase 3.)
 
 ### Manual cleanup
 
 ```sh
-# Sweep all three dirs respecting the configured retention windows
+# Sweep all dirs (including spoke dirs) respecting retention windows
 npm run cleanup
 
 # Show what would be deleted, delete nothing
@@ -62,6 +99,12 @@ npm run cleanup -- --dry-run
 npm run cleanup -- --dir=uploads
 npm run cleanup -- --dir=temp_extracted
 npm run cleanup -- --dir=temp_processed
+npm run cleanup -- --dir=template_mask
+npm run cleanup -- --dir=ai
+npm run cleanup -- --dir=labeling
+
+# Delete all artifacts for a specific job (across all directories)
+npm run cleanup -- --job=<jobId>
 
 # Override the age threshold (delete everything regardless of age)
 npm run cleanup -- --max-age-ms=0
@@ -72,6 +115,8 @@ without touching the filesystem. Combine flags freely:
 ```sh
 npm run cleanup -- --dir=temp_processed --dry-run
 ```
+
+`--job` and `--dir` are mutually exclusive.
 
 ### Known limitation: disk pressure
 

@@ -8,6 +8,10 @@ import {
   type FrameProcessingBatch,
   type InsertFrameBatch,
   type ProcessingProgress,
+  type Job,
+  type TemplateMaskState,
+  type AIRun,
+  type AttestationRecord,
 } from '@shared/schema';
 import type { IStorage } from './storage';
 
@@ -112,5 +116,39 @@ export class PgStorage implements IStorage {
     };
 
     this.processingProgress.set(jobId, { ...existing, ...progress });
+  }
+
+  // ── Hub-and-spoke stubs (Phase 2) ──────────────────────────────────
+  // PgStorage is scaffolding (never used at runtime; MemStorage is the
+  // active implementation). These stubs satisfy the IStorage interface.
+  // Real Postgres-backed implementations will be added during the
+  // Postgres migration, separate from this refactor.
+
+  async getJobV2(_jobId: string): Promise<Job | undefined> {
+    throw new Error('PgStorage.getJobV2 not implemented — use MemStorage');
+  }
+  async setPhiStatus(_jobId: string, _phiStatus: 'raw' | 'user_attested', _attestationRecord?: AttestationRecord): Promise<Job | undefined> {
+    throw new Error('PgStorage.setPhiStatus not implemented — use MemStorage');
+  }
+  async setTemplateMaskState(_jobId: string, _state: TemplateMaskState): Promise<Job | undefined> {
+    throw new Error('PgStorage.setTemplateMaskState not implemented — use MemStorage');
+  }
+  async getTemplateMaskState(_jobId: string): Promise<TemplateMaskState | undefined> {
+    throw new Error('PgStorage.getTemplateMaskState not implemented — use MemStorage');
+  }
+  async addAiRun(_jobId: string, _run: AIRun): Promise<Job | undefined> {
+    throw new Error('PgStorage.addAiRun not implemented — use MemStorage');
+  }
+  async updateAiRun(_jobId: string, _runId: string, _updates: Partial<AIRun>): Promise<AIRun | undefined> {
+    throw new Error('PgStorage.updateAiRun not implemented — use MemStorage');
+  }
+  async getAiRun(_jobId: string, _runId: string): Promise<AIRun | undefined> {
+    throw new Error('PgStorage.getAiRun not implemented — use MemStorage');
+  }
+  async listAiRuns(_jobId: string): Promise<AIRun[]> {
+    throw new Error('PgStorage.listAiRuns not implemented — use MemStorage');
+  }
+  async deleteAiRun(_jobId: string, _runId: string): Promise<boolean> {
+    throw new Error('PgStorage.deleteAiRun not implemented — use MemStorage');
   }
 }

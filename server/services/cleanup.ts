@@ -1,18 +1,27 @@
 /**
- * Disk-cleanup service for the three transient directories Masquerade writes to:
+ * Disk-cleanup service for Masquerade's transient directories.
  *
- *   uploads/         — original user uploads (multer dest). Contain PHI; shortest TTL.
- *   temp_extracted/  — raw frames pulled out of a video before template-masking.
- *   temp_processed/  — masked output frames consumed by the ZIP/download builder.
+ * Managed directories (Phase 2 — hub-and-spoke refactor):
+ *
+ *   uploads/                       — original user uploads (multer dest). Contain PHI; shortest TTL.
+ *   temp_extracted/                — raw frames pulled out of a video before template-masking.
+ *   temp_processed/                — (RETIRING) masked output frames. Still written by old endpoints
+ *                                    during Phase 2; purged on every startup and swept hourly.
+ *   spokes/template_mask/<jobId>/  — Path A output.   24h retention.
+ *   spokes/ai/<jobId>/<runId>/     — Path C output.   24h retention.
+ *   spokes/labeling/<jobId>/       — Path B reserved.  24h retention.
  *
  * Every write happens at known absolute paths (resolved once at module load), so
  * every delete in this file is bounded by `safeDelete` to its allowed root —
- * a path-traversal attempt cannot reach files outside these three directories.
+ * a path-traversal attempt cannot reach files outside these directories.
  *
  * Lifetime:
  *   - On every server start, `purgeUploadsOnStartup()` wipes uploads/ entirely.
- *     Safe because storage is in-memory (server/storage.ts:116 uses MemStorage)
+ *     Safe because storage is in-memory (server/storage.ts uses MemStorage)
  *     so any upload from a previous process is orphaned.
+ *   - On every server start, `purgeTempProcessedOnStartup()` wipes temp_processed/.
+ *     Safe for the same MemStorage reason. Old endpoints still write there during
+ *     Phase 2, but those writes are throwaway between restarts.
  *   - `startCleanupScheduler()` runs an hourly cron (minute 0) that sweeps
  *     each directory for entries older than its retention window.
  *   - Request handlers and background tasks delete eagerly via `deleteUploadFile`
@@ -35,10 +44,32 @@ export const UPLOADS_DIR        = path.resolve(process.cwd(), 'uploads');
 export const TEMP_EXTRACTED_DIR = path.resolve(process.cwd(), 'temp_extracted');
 export const TEMP_PROCESSED_DIR = path.resolve(process.cwd(), 'temp_processed');
 
+// ── Spoke directory constants (Phase 2) ─────────────────────────────────
+export const SPOKES_ROOT_DIR         = path.resolve(process.cwd(), 'spokes');
+export const SPOKE_TEMPLATE_MASK_DIR = path.resolve(SPOKES_ROOT_DIR, 'template_mask');
+export const SPOKE_AI_DIR            = path.resolve(SPOKES_ROOT_DIR, 'ai');
+export const SPOKE_LABELING_DIR      = path.resolve(SPOKES_ROOT_DIR, 'labeling');
+
 // ── Retention windows ────────────────────────────────────────────────────
 export const UPLOADS_MAX_AGE_MS        = 2  * 60 * 60 * 1000;   // 2h  — PHI, shortest
 export const TEMP_EXTRACTED_MAX_AGE_MS = 6  * 60 * 60 * 1000;   // 6h
 export const TEMP_PROCESSED_MAX_AGE_MS = 24 * 60 * 60 * 1000;   // 24h — user may still be downloading
+export const SPOKES_MAX_AGE_MS         = 24 * 60 * 60 * 1000;   // 24h — uniform across all spokes
+
+/**
+ * Generalized sweep target list. Adding a future spoke (e.g., `spokes/foo/`)
+ * is a one-line addition here — no new function needed.
+ *
+ * Each entry is [absolutePath, maxAgeMs]. The hourly cron iterates this list.
+ */
+export const SWEEP_TARGETS: ReadonlyArray<readonly [string, number]> = [
+  [UPLOADS_DIR,              UPLOADS_MAX_AGE_MS],
+  [TEMP_EXTRACTED_DIR,       TEMP_EXTRACTED_MAX_AGE_MS],
+  [TEMP_PROCESSED_DIR,       TEMP_PROCESSED_MAX_AGE_MS],
+  [SPOKE_TEMPLATE_MASK_DIR,  SPOKES_MAX_AGE_MS],
+  [SPOKE_AI_DIR,             SPOKES_MAX_AGE_MS],
+  [SPOKE_LABELING_DIR,       SPOKES_MAX_AGE_MS],
+];
 
 // ── Internals ────────────────────────────────────────────────────────────
 
@@ -91,28 +122,30 @@ export async function deleteUploadFile(uploadPath: string | null | undefined): P
 }
 
 /**
- * Delete both the staging dir (temp_extracted/<jobId>/) and the masked-output
- * dir (temp_processed/<jobId>/) for a given job. Idempotent.
+ * Delete all artifacts for a given job across every directory: temp_extracted,
+ * temp_processed (legacy), and all spoke output directories.
  *
- * Called after the user successfully downloads the ZIP, and from background
- * task `.catch` handlers. Each delete is bounded to its respective allowed
- * root so a tampered jobId cannot break out of the directory tree.
+ * Idempotent. Each delete is individually try/wrapped — one failure does not
+ * block the others. Used by the manual CLI's `--job=<jobId>` flag and will
+ * be called by per-job retention logic once auth lands.
  */
 export async function cleanupJobArtifacts(jobId: string): Promise<void> {
   if (!jobId) return;
-  const extractedPath = path.join(TEMP_EXTRACTED_DIR, jobId);
-  const processedPath = path.join(TEMP_PROCESSED_DIR, jobId);
 
-  try {
-    await safeDelete(extractedPath, TEMP_EXTRACTED_DIR);
-  } catch (err) {
-    console.warn(`⚠️  cleanupJobArtifacts(${jobId}) failed on temp_extracted:`, err instanceof Error ? err.message : err);
-  }
+  const targets: Array<[string, string]> = [
+    [path.join(TEMP_EXTRACTED_DIR, jobId),      TEMP_EXTRACTED_DIR],
+    [path.join(TEMP_PROCESSED_DIR, jobId),      TEMP_PROCESSED_DIR],
+    [path.join(SPOKE_TEMPLATE_MASK_DIR, jobId), SPOKE_TEMPLATE_MASK_DIR],
+    [path.join(SPOKE_AI_DIR, jobId),            SPOKE_AI_DIR],
+    [path.join(SPOKE_LABELING_DIR, jobId),      SPOKE_LABELING_DIR],
+  ];
 
-  try {
-    await safeDelete(processedPath, TEMP_PROCESSED_DIR);
-  } catch (err) {
-    console.warn(`⚠️  cleanupJobArtifacts(${jobId}) failed on temp_processed:`, err instanceof Error ? err.message : err);
+  for (const [absPath, root] of targets) {
+    try {
+      await safeDelete(absPath, root);
+    } catch (err) {
+      console.warn(`⚠️  cleanupJobArtifacts(${jobId}) failed on ${path.basename(root)}:`, err instanceof Error ? err.message : err);
+    }
   }
 }
 
@@ -243,25 +276,88 @@ export async function purgeUploadsOnStartup(): Promise<void> {
 }
 
 /**
+ * Wipe temp_processed/ on every boot.
+ *
+ * During Phase 2, old endpoints still write to temp_processed/ but MemStorage
+ * is wiped on restart, so every entry is orphaned. This startup purge keeps
+ * disk usage bounded. The hourly sweep remains as a safety net for files
+ * written between restarts.
+ */
+export async function purgeTempProcessedOnStartup(): Promise<void> {
+  try {
+    await fs.mkdir(TEMP_PROCESSED_DIR, { recursive: true });
+  } catch {
+    // mkdir failures are non-fatal
+  }
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(TEMP_PROCESSED_DIR);
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      console.log('🧹 Startup purge: temp_processed/ does not exist yet, nothing to remove');
+      return;
+    }
+    console.warn('⚠️  purgeTempProcessedOnStartup readdir failed:', err instanceof Error ? err.message : err);
+    return;
+  }
+
+  let removed = 0;
+  let errors = 0;
+  for (const name of entries) {
+    const entryPath = path.join(TEMP_PROCESSED_DIR, name);
+    try {
+      await safeDelete(entryPath, TEMP_PROCESSED_DIR);
+      removed += 1;
+    } catch (err) {
+      errors += 1;
+      console.warn(`⚠️  purgeTempProcessedOnStartup: failed to delete ${entryPath}:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  console.log(
+    `🧹 Startup purge: removed ${removed} entries from temp_processed/` +
+    (errors > 0 ? ` (${errors} failed)` : '')
+  );
+}
+
+/**
+ * Ensure spoke directories exist on boot. Idempotent.
+ */
+export async function ensureSpokeDirectories(): Promise<void> {
+  for (const dir of [SPOKE_TEMPLATE_MASK_DIR, SPOKE_AI_DIR, SPOKE_LABELING_DIR]) {
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch (err) {
+      console.warn(`⚠️  ensureSpokeDirectories: failed to create ${dir}:`, err instanceof Error ? err.message : err);
+    }
+  }
+  console.log('🧹 Spoke directories ensured: spokes/template_mask/, spokes/ai/, spokes/labeling/');
+}
+
+/**
  * Register the hourly cleanup cron. The job runs at minute 0 of every hour
  * and never throws — every step is individually try/wrapped so a transient
  * filesystem error cannot propagate up and crash the Node process.
  *
+ * Sweeps all targets in the generalized SWEEP_TARGETS list, so adding a
+ * future spoke is a one-line addition to that array.
+ *
  * Returns the scheduled cron task so callers can cancel it for tests.
  */
 export function startCleanupScheduler(): ScheduledTask {
-  console.log('🧹 Cleanup scheduler armed (runs every hour at :00)');
+  const targetNames = SWEEP_TARGETS.map(([dir]) => path.basename(dir)).join(', ');
+  console.log(`🧹 Cleanup scheduler armed (runs every hour at :00) — targets: ${targetNames}`);
   const task = cron.schedule('0 * * * *', async () => {
     try {
       console.log('🧹 Hourly sweep starting…');
-      try { await sweepDirectory(UPLOADS_DIR, UPLOADS_MAX_AGE_MS); }
-      catch (err) { console.warn('⚠️  hourly sweep uploads failed:', err instanceof Error ? err.message : err); }
-
-      try { await sweepDirectory(TEMP_EXTRACTED_DIR, TEMP_EXTRACTED_MAX_AGE_MS); }
-      catch (err) { console.warn('⚠️  hourly sweep temp_extracted failed:', err instanceof Error ? err.message : err); }
-
-      try { await sweepDirectory(TEMP_PROCESSED_DIR, TEMP_PROCESSED_MAX_AGE_MS); }
-      catch (err) { console.warn('⚠️  hourly sweep temp_processed failed:', err instanceof Error ? err.message : err); }
+      for (const [dir, maxAge] of SWEEP_TARGETS) {
+        try {
+          await sweepDirectory(dir, maxAge);
+        } catch (err) {
+          console.warn(`⚠️  hourly sweep ${path.basename(dir)} failed:`, err instanceof Error ? err.message : err);
+        }
+      }
     } catch (err) {
       console.warn('⚠️  hourly cleanup job failed at top level:', err instanceof Error ? err.message : err);
     }

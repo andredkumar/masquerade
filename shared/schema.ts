@@ -146,6 +146,97 @@ export interface AiLabel {
   }>;
 }
 
+// ── Hub-and-spoke types (Phase 2) ──────────────────────────────────────
+//
+// These types represent the TARGET data model for the hub-and-spoke refactor.
+// During Phase 2, no code references them yet — they are plumbing for Phase 3.
+// The existing VideoJob / MaskData / OutputSettings / AiLabel types above
+// remain the active runtime types until Phase 3 migrates endpoints.
+//
+// NOTE: Drizzle table definitions above are NOT updated here. The runtime is
+// MemStorage; Drizzle table changes will be reconciled in the Postgres
+// migration (separate from this refactor).
+
+/** PHI attestation record, stored on the Job when user attests PHI is removed. */
+export interface AttestationRecord {
+  checked: boolean;
+  timestamp: string;
+  text: string; // verbatim attestation copy shown to user
+}
+
+/** Source media metadata, set at upload time. */
+export interface JobSource {
+  duration: number;
+  width: number;
+  height: number;
+  frameRate: number;
+  totalFrames: number;
+  type: 'video' | 'image_batch';
+}
+
+/**
+ * Hub-and-spoke Job shape. Replaces the linear-pipeline VideoJob in Phase 3.
+ *
+ * `templateMask`, `labeling`, and `ai` are optional per-spoke state objects.
+ * A spoke's state is absent until the user first interacts with that spoke.
+ */
+export interface Job {
+  id: string;
+  filename: string;
+  uploadedAt: string;
+  phiStatus: 'raw' | 'user_attested';
+  attestationRecord?: AttestationRecord;
+  source: JobSource;
+  extractionRate: number; // locked at upload, video only; images default to 1
+  status: 'extracting' | 'ready' | 'failed';
+  errorMessage: string | null;
+
+  // Per-spoke state, all optional
+  templateMask?: TemplateMaskState;
+  labeling?: LabelingState;
+  ai?: AIState;
+}
+
+/** Path A — Template mask + export spoke state. */
+export interface TemplateMaskState {
+  status: 'idle' | 'applying' | 'complete' | 'failed';
+  maskData: MaskData;
+  outputSettings: OutputSettings;
+  outputDir: string; // spokes/template_mask/<jobId>/
+  completedAt: string | null;
+}
+
+/**
+ * Path B — Labeling spoke state (placeholder).
+ * Shape is TBD; reserved so Phase 3+ can populate it without a schema change.
+ */
+export type LabelingState = unknown;
+
+/** Path C — AI segmentation spoke state. */
+export interface AIState {
+  runs: AIRun[];
+}
+
+/**
+ * A single AI inference run within Path C.
+ *
+ * `labels` reuses the existing AiLabel interface (metadata only — no base64
+ * blobs). Heavy mask/overlay PNGs will persist to disk under
+ * `spokes/ai/<jobId>/<runId>/` in Phase 3.
+ */
+export interface AIRun {
+  id: string; // UUID
+  name: string; // user-supplied or auto-generated
+  inputSource: 'extracted' | 'template_mask'; // which frames it ran against
+  modality: Modality | null;
+  bbox: { x1: number; y1: number; x2: number; y2: number } | null;
+  target: string; // user's prompt label
+  outputDir: string; // spokes/ai/<jobId>/<runId>/
+  labels: AiLabel[]; // existing AiLabel shape — metadata only
+  approved: boolean;
+  createdAt: string;
+}
+
 // AI intent parsing result
 export interface ParsedIntent {
   intent: 'segment' | 'classify' | 'detect' | 'label' | 'export' | 'clarify';

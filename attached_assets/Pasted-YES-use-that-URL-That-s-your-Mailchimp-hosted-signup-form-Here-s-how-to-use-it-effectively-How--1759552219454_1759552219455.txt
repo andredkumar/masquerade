@@ -1,0 +1,196 @@
+YES, use that URL! That's your Mailchimp hosted signup form.
+
+Here's how to use it effectively:
+How to Use This URL on Your Landing Page
+Option 1: Big Call-to-Action Button (Simplest)
+
+Put this prominently on your landing page:
+html
+
+<a href="http://eepurl.com/joPd1E" 
+   target="_blank"
+   class="cta-button">
+   Join Free Beta
+</a>
+
+CSS to make it pop:
+css
+
+.cta-button {
+  display: inline-block;
+  background: #0066cc;
+  color: white;
+  padding: 16px 32px;
+  font-size: 18px;
+  font-weight: bold;
+  text-decoration: none;
+  border-radius: 8px;
+  transition: background 0.2s;
+}
+
+.cta-button:hover {
+  background: #0052a3;
+}
+
+Option 2: Multiple Placement (Recommended)
+
+Use this URL in 3 places on your landing page:
+
+1. Hero Section (top):
+html
+
+<div class="hero">
+  <h1>Turn Hours of Ultrasound Dataset Prep Into Minutes</h1>
+  <p>DICOM-optimized video masking for POCUS ML research</p>
+  <a href="http://eepurl.com/joPd1E" target="_blank" class="cta-button">
+    Get Free Beta Access →
+  </a>
+</div>
+
+2. After Features Section (middle):
+html
+
+<div class="cta-section">
+  <h2>Ready to speed up your dataset prep?</h2>
+  <a href="http://eepurl.com/joPd1E" target="_blank" class="cta-button">
+    Join Beta (Free) →
+  </a>
+</div>
+
+3. Bottom of Page (footer):
+html
+
+<footer>
+  <p>Join 50+ researchers using Masquerade</p>
+  <a href="http://eepurl.com/joPd1E" target="_blank" class="cta-button">
+    Sign Up for Beta
+  </a>
+</footer>
+
+Option 3: Inline Preview (Slightly Better UX)
+
+If you want to show the email field on YOUR page but still use Mailchimp:
+html
+
+<div class="signup-section">
+  <h3>Get Beta Access</h3>
+  <p>Join researchers from Stanford, MIT, and Johns Hopkins</p>
+  
+  <div class="email-preview">
+    <input type="email" 
+           placeholder="your@email.com" 
+           disabled 
+           style="opacity: 0.6;">
+    <a href="http://eepurl.com/joPd1E" 
+       target="_blank" 
+       class="cta-button">
+       Continue to Sign Up →
+    </a>
+  </div>
+  
+  <p class="privacy-note">No spam. Unsubscribe anytime.</p>
+</div>
+
+This gives the visual of an email form but clicking opens the Mailchimp page.
+Track Clicks with PostHog
+
+Add tracking when they click:
+javascript
+
+// If using React
+<a 
+  href="http://eepurl.com/joPd1E" 
+  target="_blank"
+  onClick={() => posthog.capture('clicked_signup_cta', {
+    location: 'hero' // or 'middle', 'footer'
+  })}
+>
+  Join Free Beta
+</a>
+
+Customize Your Mailchimp Form
+
+Before launching, make sure your Mailchimp form looks good:
+
+    Go back to Audience → Signup forms → Form builder
+    Customize:
+        ✅ Form title: "Join Masquerade Beta"
+        ✅ Button text: "Get Beta Access"
+        ✅ Success message: "Thanks! Check your email for next steps."
+        ✅ Remove unnecessary fields (keep just Email + First Name)
+    Enable double opt-in (recommended for deliverability)
+    Set up welcome email (see previous instructions)
+
+Test It Right Now
+
+    Click your link: http://eepurl.com/joPd1E
+    Sign up with your own email
+    Check:
+        ✅ Does the form look professional?
+        ✅ Do you receive the welcome email?
+        ✅ Does the email have clear next steps?
+        ✅ Can you reply to it (not noreply@)?
+
+Pro Tips
+Improve Conversion:
+
+    Use action-oriented button text:
+        ✅ "Get Beta Access"
+        ✅ "Start Free Trial"
+        ❌ "Submit"
+        ❌ "Sign Up"
+
+Add Social Proof Near Button:
+html
+
+<div class="social-proof">
+  <a href="http://eepurl.com/joPd1E" target="_blank" class="cta-button">
+    Join Free Beta
+  </a>
+  <p class="small-text">Join 50+ POCUS researchers already testing</p>
+</div>
+
+Create Urgency (Optional):
+html
+
+<div class="urgency">
+  <p>⏰ Limited beta spots - accepting first 100 researchers</p>
+  <a href="http://eepurl.com/joPd1E" target="_blank" class="cta-button">
+    Claim Your Spot
+  </a>
+</div>
+
+What This Looks Like in Practice
+
+Landing Page Flow:
+
+    User scrolls your landing page
+    Sees "Join Free Beta" button (linked to your Mailchimp URL)
+    Clicks → Opens Mailchimp form in new tab
+    Enters email + name → Submits
+    Mailchimp sends automated welcome email
+    User gets started
+
+Downsides of this approach:
+
+    ⚠️ Takes user off your site (less seamless)
+    ⚠️ Can't fully customize the form design
+
+Upsides:
+
+    ✅ Works in 5 minutes
+    ✅ No code needed
+    ✅ Automated welcome email
+    ✅ Good enough for beta launch
+
+Your Next 10 Minutes:
+
+    ✅ Test your Mailchimp form: http://eepurl.com/joPd1E
+    ✅ Customize it if needed (form builder)
+    ✅ Set up welcome email automation
+    ✅ Add the link to your landing page as a button
+    ✅ Test the full flow with your email
+
+Bottom line: Yes, use that URL! It's perfectly fine for Week 1. You can always upgrade to an embedded form later when you have more time.
+
+Ready to move on to landing page copy or demo video script?

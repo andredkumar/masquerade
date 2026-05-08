@@ -1,0 +1,46 @@
+3D VOLUMETRIC BATCH PROCESSING IMPLEMENTATION:
+
+CORE ARCHITECTURE:
+- Process frames in batches of 10-20 (adjustable based on available memory)
+- Load each batch into a 3D buffer: [width, height, frameCount]
+- Apply mask coordinates once to entire volume
+- Extract processed frames from 3D buffer simultaneously
+
+TECHNICAL IMPLEMENTATION:
+
+1. BATCH EXTRACTION:
+   - Use FFmpeg with frame range parameters: -ss startTime -frames:v 10
+   - Extract directly to memory buffers instead of temporary files
+   - Target format: Raw RGB24 pixel data for maximum processing speed
+
+2. 3D BUFFER CREATION:
+   - Allocate typed array: new Uint8Array(width * height * 3 * batchSize)
+   - Organize as [frame0_pixels, frame1_pixels, ..., frameN_pixels]
+   - Validate all frames have identical dimensions before processing
+
+3. VOLUMETRIC MASK APPLICATION:
+   - Calculate mask region once: startX, startY, width, height in pixels
+   - Use nested loops: for each frame -> for each row -> for each pixel
+   - Apply mask operation to corresponding pixels across all frames simultaneously
+   - Use memcpy operations for rectangular masks (faster than pixel-by-pixel)
+
+4. BATCH OUTPUT:
+   - Convert processed 3D buffer back to individual frame buffers
+   - Use Sharp.buffer() to create images from raw pixel data
+   - Save all frames in parallel using Promise.all()
+
+MEMORY MANAGEMENT:
+- Calculate batch size: maxMemoryMB / (frameWidth * frameHeight * 3 * bytesPerPixel)
+- Clear 3D buffer after each batch to prevent memory leaks
+- Use Buffer.allocUnsafe() for better performance on large allocations
+
+PERFORMANCE OPTIMIZATIONS:
+- Use worker threads for parallel batch processing
+- Implement double-buffering: process batch N while extracting batch N+1
+- Consider WASM for pixel manipulation if JavaScript becomes bottleneck
+- Pre-allocate all buffers to avoid garbage collection during processing
+
+ERROR HANDLING:
+- Validate frame dimensions match before 3D buffer creation
+- Handle partial batches for videos not divisible by batch size
+- Implement graceful fallback to sequential processing if memory insufficient

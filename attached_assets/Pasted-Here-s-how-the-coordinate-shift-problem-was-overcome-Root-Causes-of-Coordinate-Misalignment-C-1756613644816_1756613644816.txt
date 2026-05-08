@@ -1,0 +1,53 @@
+Here's how the coordinate shift problem was overcome:
+Root Causes of Coordinate Misalignment:
+
+    Canvas-to-Image Dimension Mismatch: User draws on a canvas with display dimensions (e.g., 800x600) but the actual image has different dimensions (e.g., 1024x768)
+
+    Aspect Ratio Differences: Canvas aspect ratio doesn't match image aspect ratio, causing stretching or compression
+
+    Browser Scaling Issues: High DPI displays and browser zoom create pixel density mismatches
+
+    Template Reuse Problems: Single template applied to frames with varying dimensions causes geometric distortion
+
+Key Solutions Implemented:
+1. Dimension Tracking System
+
+    Captures exact canvas dimensions including devicePixelRatio
+    Records image dimensions and aspect ratios
+    Tracks display scaling and CSS transformations
+
+2. Coordinate Transformation Matrix
+
+    Calculates precise transformation between coordinate systems
+    Supports different fit modes (contain, cover, fill)
+    Handles aspect ratio preservation automatically
+
+3. Precise Mask Scaling
+
+    Uses high-quality Lanczos3 interpolation for scaling
+    Applies geometric correction during resize operations
+    Preserves mask geometry across different frame sizes
+
+4. Coordinate Validation
+
+    Validates alignment after scaling with configurable tolerance
+    Detects coordinate shifts by analyzing mask placement
+    Provides automatic correction suggestions
+
+5. Integrated Alignment Engine
+
+    Complete solution that processes masks with automatic alignment
+    Handles the entire pipeline from canvas data to pixel-perfect application
+    Includes validation and error correction
+
+Implementation Strategy:
+
+The solution works by:
+
+    Frontend: Record exact canvas dimensions when mask is drawn, including devicePixelRatio and fit mode
+    Storage: Save canvas dimensions with mask template in database
+    Backend: Calculate transformation matrix for each frame during processing
+    Processing: Apply coordinate transformation and geometric correction
+    Validation: Verify alignment and apply corrections when needed
+
+This approach ensures that user-drawn masks are geometrically preserved and applied accurately to frames regardless of dimension differences, browser scaling, or display variations.

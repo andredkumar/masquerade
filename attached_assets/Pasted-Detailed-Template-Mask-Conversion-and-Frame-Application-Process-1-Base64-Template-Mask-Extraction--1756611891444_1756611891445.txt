@@ -1,0 +1,123 @@
+Detailed Template Mask Conversion and Frame Application Process
+1. Base64 Template Mask Extraction
+
+Input Format: Canvas-generated data URL from frontend
+
+// Frontend canvas output:
+"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABQAAAALQCAYAAADPfd..."
+
+Server Processing:
+
+// Extract pure base64 data by splitting on comma
+const base64Data = maskData.split(',')[1];  // Remove "data:image/png;base64," prefix
+const maskBuffer = Buffer.from(base64Data, 'base64');  // Convert to binary buffer
+
+2. Mask Template Scaling and Dimension Matching
+
+Per-Frame Processing: Each frame gets individually scaled mask
+
+// Load original frame to get target dimensions
+const originalImage = sharp(originalFramePath);
+const { width, height } = await originalImage.metadata();
+
+// Resize mask template to exact frame dimensions
+const maskInfo = await sharp(maskBuffer)
+  .resize(width, height)  // Automatic scaling with interpolation
+  .raw()                  // Convert to raw pixel buffer
+  .toBuffer({ resolveWithObject: true });
+
+const maskRaw = maskInfo.data;           // Raw pixel buffer
+const maskChannels = maskInfo.info.channels;  // RGBA = 4, RGB = 3
+
+3. Pixel-Level Mask Detection Algorithm
+
+Red Color Detection: Identifies user-drawn mask areas
+
+// Per-pixel analysis loop
+for (let i = 0; i < width * height; i++) {
+  const maskPixelIndex = i * maskChannels;
+  
+  // Extract RGBA values from mask pixel
+  const maskR = maskRaw[maskPixelIndex] || 0;        // Red channel
+  const maskG = maskRaw[maskPixelIndex + 1] || 0;    // Green channel  
+  const maskB = maskRaw[maskPixelIndex + 2] || 0;    // Blue channel
+  const maskA = maskChannels > 3 ? maskRaw[maskPixelIndex + 3] : 255;  // Alpha
+  
+  // Dual-condition mask detection:
+  const isDrawn = maskA > 128;  // Alpha threshold (visible pixel)
+  const isRed = maskR > 150 &&  // Red dominance detection
+            maskR > maskG * 1.5 &&  // Red > 1.5x Green
+            maskR > maskB * 1.5;    // Red > 1.5x Blue
+}
+
+4. Frame Pixel Manipulation Process
+
+Direct Memory Buffer Editing:
+
+// Load original frame as raw RGB buffer
+const originalRaw = await originalImage.raw().toBuffer();
+const imageChannels = 3;  // RGB format
+const maskedPixels = Buffer.from(originalRaw);  // Copy for modification
+
+// Apply blackening to detected mask regions
+if (isDrawn && isRed) {
+  const imagePixelIndex = i * imageChannels;
+  maskedPixels[imagePixelIndex] = 0;      // Red = 0 (black)
+  maskedPixels[imagePixelIndex + 1] = 0;  // Green = 0 (black)  
+  maskedPixels[imagePixelIndex + 2] = 0;  // Blue = 0 (black)
+}
+
+5. Masked Frame Generation and File Output
+
+PNG Reconstruction:
+
+// Create new PNG from modified pixel buffer
+const maskedImage = await sharp(maskedPixels, {
+  raw: {
+    width: width,
+    height: height,
+    channels: 3  // RGB output
+  }
+})
+.png()  // Convert to PNG format
+.toBuffer();
+
+// Write to disk with _masked suffix
+const maskedPath = originalPath.replace('.png', '_masked.png');
+await fs.writeFile(maskedPath, maskedImage);
+
+6. Batch Processing File Structure
+
+Directory Layout After Processing:
+
+processed/ANON_xyz123/
+├── frame_001.png          # Original frame
+├── frame_001_masked.png   # Masked frame
+├── frame_002.png          # Original frame  
+├── frame_002_masked.png   # Masked frame
+├── ...
+└── frame_N_masked.png     # Final masked frame
+
+Processing Order:
+
+    Template stored once in database as base64 string
+    Applied sequentially to each frame in study directory
+    Individual scaling per frame (handles varying dimensions)
+    Parallel file I/O for multiple frames simultaneously
+    Error recovery - copies original if masking fails
+
+7. Memory and Performance Optimizations
+
+Buffer Management:
+
+    Raw pixel buffers processed in memory (no disk I/O during pixel manipulation)
+    Sharp.js handles format conversions and memory optimization
+    Mask template cached and reused across all frames in study
+
+Scaling Handling:
+
+    Automatic interpolation when mask template differs from frame dimensions
+    Preserves mask geometry proportions across varying frame sizes
+    Maintains pixel-perfect accuracy for consistent PHI removal
+
+This workflow ensures that a single user-drawn mask template is geometrically preserved and applied consistently across all frames in a study, regardless of individual frame dimensions or the number of frames processed.

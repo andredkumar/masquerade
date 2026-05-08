@@ -1,0 +1,59 @@
+Create a high-performance video processing application with these specifications: WORKFLOW: 1. Upload video file (MP4/MOV/AVI/DICOM, up to 500mb) 2. Extract frames using fastest possible method 3. Apply template masking to each frame 4. Resize all outputs to standardized 512x512 format 5. Export as ZIP containing PNG files + metadata CSV 6. Target: Complete processing in under 30 seconds for 90MB files PERFORMANCE REQUIREMENTS: - Use Node.js worker threads for parallel frame processing - Implement streaming video processing (don't load entire video into memory) - Use Sharp library for image operations instead of Python/OpenCV - Process frames in batches of 10-20 simultaneously - Use memory-mapped files for large video handling - Implement progress tracking with real-time updates to frontend TECHNICAL STACK: - Backend: Node.js with Express - Video processing: FFmpeg via fluent-ffmpeg (not Python) - Image processing: Sharp library (fastest Node.js image processor) - Frontend: React with real-time progress updates - Database: SQLite for simplicity (no PostgreSQL dependency issues) - File handling: Streaming uploads with busboy/multer ARCHITECTURE OPTIMIZATIONS: - Use Node.js streams throughout the pipeline - Implement worker thread pool for CPU-intensive tasks - Cache frequently used template masks in memory - Use temporary files in /tmp with automatic cleanup - Implement frame processing queue with concurrency control SPECIFIC REQUIREMENTS: - All frames must output as 512x512 PNG - Generate CSV with: filename, original_width, original_height, timestamp, frame_number - Support drag-and-drop file uploads - Real-time progress bar showing: upload%, extraction%, processing%, export% - Maximum file size: 500MB - Target processing speed: 4 frames per second minimum AVOID: - Python dependencies (causes deployment issues) - Loading entire videos into memory - Sequential frame processing - Complex database setups - import.meta.dirname usage (deployment problems) Create the complete application with optimized performance as the primary goal. 
+
+HIGH PERFORMANCE TARGET: - Process 4+ frames per second consistently - Complete 90MB video processing in under 60 seconds total - Use FFmpeg with optimized settings for speed/quality balance - Implement true parallel processing across multiple CPU cores PERFORMANCE ARCHITECTURE: - Extract frames directly to memory buffers (skip temporary PNG files) - Process frames in parallel batches of 8-12 simultaneously - Use Sharp's pipeline() method for chained operations (extract → mask → resize → save) - Implement frame queue with backpressure control to prevent memory overflow - Use worker_threads module with round-robin frame distribution OPTIMIZED PROCESSING CHAIN: - FFmpeg extraction: -threads 0 -preset medium -pix_fmt rgb24 (balance speed/quality) - Template masking: Pre-load masks as Sharp buffers, use composite() operation - Resize operation: Sharp's resize() with lanczos3 resampling for quality - Output: Direct Sharp buffer to PNG without intermediate files CONCURRENCY SETTINGS: - Worker threads: min(os.cpus().length, 6) to avoid resource contention - Frame batch size: 8 frames per worker - Memory per worker: 512MB buffer allocation - Queue depth: 24 frames maximum in processing pipeline
+
+INTERACTIVE TEMPLATE MASKING WORKFLOW:
+- Extract first frame immediately upon upload (under 2 seconds)
+- Display frame in browser with interactive masking tools
+- Allow user to draw/adjust template mask on first frame using canvas/fabric.js
+- Provide preset mask shapes (circular, rectangular, freeform polygon)
+- Once mask is approved, apply identical mask to ALL remaining frames automatically
+- Skip individual frame masking - use same coordinates/shape for entire video
+
+INTERACTIVE UI REQUIREMENTS:
+- Canvas-based mask editor with zoom/pan capabilities
+- Real-time mask preview overlay on first frame
+- Undo/redo functionality for mask adjustments
+- Preset templates: circular ROI, rectangular crop, custom polygon
+- "Apply to All Frames" button to start batch processing
+- Live progress bar showing frame-by-frame application
+
+PERFORMANCE BENEFITS:
+- No AI/computer vision needed for mask detection
+- User defines mask once, applies to thousands of frames instantly
+- Processing becomes simple coordinate-based cropping operation
+- Can achieve 15-20 FPS processing since no complex analysis needed
+- Total time: 30 seconds setup + 60 seconds batch processing
+
+TECHNICAL IMPLEMENTATION:
+- Store mask as JSON coordinates/shape data
+- Convert mask to Sharp composite operation
+- Apply same transformation matrix to all frames in parallel
+- Use this for consistent ROI extraction across entire ultrasound sequence
+
+
+
+
+DEPLOYMENT CONSIDERATIONS:
+- Create a single-file deployment script that installs all Node.js dependencies
+- Use only npm packages (no system dependencies like Python/OpenCV)
+- Include Dockerfile for containerized deployment if needed
+- Set all file paths relative to process.cwd() for deployment flexibility
+- Include environment variable configuration for different deployment targets
+
+MEMORY MANAGEMENT:
+- Implement automatic garbage collection triggers after processing batches
+- Use streaming transforms to avoid memory accumulation
+- Set Node.js --max-old-space-size=4096 for large file processing
+- Monitor memory usage and warn if approaching limits
+
+ERROR HANDLING:
+- Graceful degradation: if parallel processing fails, fall back to sequential
+- Detailed error logging with timestamps for debugging
+- Automatic retry logic for transient failures
+- Clear user feedback for unsupported file formats
+
+TESTING REQUIREMENTS:
+- Include sample test files of different sizes (5MB, 30MB, 90MB)
+- Performance benchmarks for each processing stage
+- Memory usage profiling during processing
