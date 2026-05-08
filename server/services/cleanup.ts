@@ -65,7 +65,7 @@ export const SPOKES_MAX_AGE_MS         = 24 * 60 * 60 * 1000;   // 24h — unifo
 export const SWEEP_TARGETS: ReadonlyArray<readonly [string, number]> = [
   [UPLOADS_DIR,              UPLOADS_MAX_AGE_MS],
   [TEMP_EXTRACTED_DIR,       TEMP_EXTRACTED_MAX_AGE_MS],
-  [TEMP_PROCESSED_DIR,       TEMP_PROCESSED_MAX_AGE_MS],
+  [TEMP_PROCESSED_DIR,       TEMP_PROCESSED_MAX_AGE_MS], // retained as defensive sweep target post-3a; remove once confirmed no writes occur
   [SPOKE_TEMPLATE_MASK_DIR,  SPOKES_MAX_AGE_MS],
   [SPOKE_AI_DIR,             SPOKES_MAX_AGE_MS],
   [SPOKE_LABELING_DIR,       SPOKES_MAX_AGE_MS],

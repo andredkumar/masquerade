@@ -1,29 +1,35 @@
 /**
- * Read-only filesystem helpers for the frame viewer.
+ * Read-only filesystem helpers for the frame viewer and download/inference
+ * endpoints.
  *
- * Every path operation here is bounded against TEMP_PROCESSED_DIR (or its
- * per-job sub-directory) using the same `path.resolve + startsWith` pattern
- * the cleanup module uses. A tampered jobId or frame index can never escape
- * the temp_processed/ tree, even via `..` segments or absolute-path injections.
+ * Every path operation here is bounded against the caller-supplied `baseDir`
+ * (defaulting to `SPOKE_TEMPLATE_MASK_DIR`) using the same
+ * `path.resolve + startsWith` pattern the cleanup module uses. A tampered
+ * jobId or frame index can never escape the allowed directory tree, even via
+ * `..` segments or absolute-path injections.
  *
  * Nothing in this file writes to disk. All exports are pure read operations.
  */
 
 import path from 'path';
 import { promises as fs } from 'fs';
-import { TEMP_PROCESSED_DIR } from './cleanup';
+import { SPOKE_TEMPLATE_MASK_DIR } from './cleanup';
 
 /**
  * Resolve the absolute path of a single processed frame and validate it sits
- * inside TEMP_PROCESSED_DIR. Throws on traversal or invalid frame index.
+ * inside `baseDir`. Throws on traversal or invalid frame index.
  *
  * Filename convention matches `processVideo`'s save loop:
- *   temp_processed/<jobId>/frame_NNNNNN.<ext>
+ *   spokes/template_mask/<jobId>/frame_NNNNNN.<ext>
  *
  * Since the on-disk extension may be png OR jpg (depends on outputSettings.format),
  * the caller can pass an explicit ext or we'll probe both.
  */
-export async function resolveFramePath(jobId: string, frameIndex: number): Promise<string | null> {
+export async function resolveFramePath(
+  jobId: string,
+  frameIndex: number,
+  baseDir: string = SPOKE_TEMPLATE_MASK_DIR,
+): Promise<string | null> {
   if (!jobId || typeof jobId !== 'string') {
     throw new Error('resolveFramePath: jobId must be a non-empty string');
   }
@@ -31,14 +37,15 @@ export async function resolveFramePath(jobId: string, frameIndex: number): Promi
     throw new Error(`resolveFramePath: frameIndex must be a non-negative integer (got ${frameIndex})`);
   }
 
-  const jobDir = path.resolve(TEMP_PROCESSED_DIR, jobId);
+  const resolvedBase = path.resolve(baseDir);
+  const jobDir = path.resolve(resolvedBase, jobId);
 
   // Path-traversal guard: a maliciously crafted jobId like "../../etc" would
-  // resolve outside TEMP_PROCESSED_DIR. Reject unless the resolved path is a
+  // resolve outside the allowed root. Reject unless the resolved path is a
   // descendant of the allowed root.
-  const rootWithSep = path.resolve(TEMP_PROCESSED_DIR) + path.sep;
+  const rootWithSep = resolvedBase + path.sep;
   if (!jobDir.startsWith(rootWithSep)) {
-    throw new Error(`resolveFramePath refused: ${jobDir} is not inside ${TEMP_PROCESSED_DIR}`);
+    throw new Error(`resolveFramePath refused: ${jobDir} is not inside ${resolvedBase}`);
   }
 
   const padded = String(frameIndex).padStart(6, '0');
@@ -63,12 +70,17 @@ export async function frameExists(absPath: string): Promise<boolean> {
 }
 
 /**
- * True if temp_processed/<jobId>/ exists. Used by viewer-info to decide
- * between 410 (retention swept) and 200 (frames available).
+ * True if spokes/template_mask/<jobId>/ (or `baseDir/<jobId>/`) exists.
+ * Used by viewer-info to decide between 410 (retention swept) and 200
+ * (frames available).
  */
-export async function tempDirExists(jobId: string): Promise<boolean> {
-  const jobDir = path.resolve(TEMP_PROCESSED_DIR, jobId);
-  const rootWithSep = path.resolve(TEMP_PROCESSED_DIR) + path.sep;
+export async function tempDirExists(
+  jobId: string,
+  baseDir: string = SPOKE_TEMPLATE_MASK_DIR,
+): Promise<boolean> {
+  const resolvedBase = path.resolve(baseDir);
+  const jobDir = path.resolve(resolvedBase, jobId);
+  const rootWithSep = resolvedBase + path.sep;
   if (!jobDir.startsWith(rootWithSep)) return false;
   try {
     const stat = await fs.stat(jobDir);
@@ -83,9 +95,13 @@ export async function tempDirExists(jobId: string): Promise<boolean> {
  * Returns 0 if the directory doesn't exist. Sort + dedupe to match the
  * canonical numbering used by the inference loop and the download route.
  */
-export async function countFrames(jobId: string): Promise<number> {
-  const jobDir = path.resolve(TEMP_PROCESSED_DIR, jobId);
-  const rootWithSep = path.resolve(TEMP_PROCESSED_DIR) + path.sep;
+export async function countFrames(
+  jobId: string,
+  baseDir: string = SPOKE_TEMPLATE_MASK_DIR,
+): Promise<number> {
+  const resolvedBase = path.resolve(baseDir);
+  const jobDir = path.resolve(resolvedBase, jobId);
+  const rootWithSep = resolvedBase + path.sep;
   if (!jobDir.startsWith(rootWithSep)) return 0;
   try {
     const entries = await fs.readdir(jobDir);
@@ -93,6 +109,34 @@ export async function countFrames(jobId: string): Promise<number> {
     return Array.from(new Set(filtered)).length;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * List all image frame filenames in a job's directory, sorted and deduped.
+ *
+ * Returns the absolute directory path and the sorted filename list. Used by
+ * the download endpoint and AI inference endpoint to enumerate frames without
+ * hardcoding a directory path.
+ *
+ * Returns `{ dir, files: [] }` if the directory doesn't exist (caller
+ * should check `files.length`).
+ */
+export async function listFrameFiles(
+  jobId: string,
+  baseDir: string = SPOKE_TEMPLATE_MASK_DIR,
+): Promise<{ dir: string; files: string[] }> {
+  const resolvedBase = path.resolve(baseDir);
+  const jobDir = path.resolve(resolvedBase, jobId);
+  const rootWithSep = resolvedBase + path.sep;
+  if (!jobDir.startsWith(rootWithSep)) return { dir: jobDir, files: [] };
+  try {
+    const raw = await fs.readdir(jobDir);
+    const filtered = raw.filter(f => /\.(png|jpe?g)$/i.test(f));
+    const files = Array.from(new Set(filtered)).sort();
+    return { dir: jobDir, files };
+  } catch {
+    return { dir: jobDir, files: [] };
   }
 }
 

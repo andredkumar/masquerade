@@ -1,8 +1,16 @@
+/**
+ * Manages the template-mask spoke output directory.
+ *
+ * Despite the legacy name, this no longer touches `temp_processed/`.
+ * Filename rename deferred to a future cleanup PR.
+ */
+
 import fs from 'fs/promises';
 import path from 'path';
+import { SPOKE_TEMPLATE_MASK_DIR } from './cleanup';
 
 export class TempFolderManager {
-  private static readonly TEMP_BASE = path.join(process.cwd(), 'temp_processed');
+  private static readonly TEMP_BASE = SPOKE_TEMPLATE_MASK_DIR;
   
   /**
    * Create a temporary folder for a job

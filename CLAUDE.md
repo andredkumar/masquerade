@@ -1,6 +1,8 @@
 # Masquerade
 
-**Phase 2 landed (May 2026):** Schema and storage plumbing for the hub-and-spoke refactor. New `Job`, `TemplateMaskState`, `AIState`, `AIRun` types in `shared/schema.ts`. New MemStorage methods. Spoke directories (`spokes/template_mask/`, `spokes/ai/`, `spokes/labeling/`) created on boot. `temp_processed/` purged on every startup. Generalized cleanup sweep targets. Endpoints still write to `temp_processed/`; Phase 3 moves them.
+**Phase 3a landed (May 2026):** Processing writes migrated from `temp_processed/` to `spokes/template_mask/<jobId>/`. Two bypass callsites (download endpoint, AI inference endpoint) now use `frameAccess.ts` helpers. `temp_processed/` is no longer written to; retained as defensive sweep target.
+
+**Phase 2 landed (May 2026):** Schema and storage plumbing for the hub-and-spoke refactor. New `Job`, `TemplateMaskState`, `AIState`, `AIRun` types in `shared/schema.ts`. New MemStorage methods. Spoke directories (`spokes/template_mask/`, `spokes/ai/`, `spokes/labeling/`) created on boot. `temp_processed/` purged on every startup. Generalized cleanup sweep targets.
 
 Project-level notes for engineers and Claude when working on this codebase.
 
@@ -34,18 +36,17 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
 |-----------|-------|-----------|
 | `uploads/` | Original user uploads (multer dest). Contains PHI. | **2 hours** |
 | `temp_extracted/<jobId>/` | Raw frames pulled from a video before template-masking. | **6 hours** |
-| `temp_processed/<jobId>/` | **(RETIRING)** Masked output frames. Still written by old endpoints during Phase 2. | **Purged on every boot** + 24h hourly sweep |
-| `spokes/template_mask/<jobId>/` | Path A output (Phase 3). | **24 hours** |
+| `temp_processed/<jobId>/` | **(LEGACY — no longer written to post-3a.)** Retained as defensive sweep target. | **Purged on every boot** + 24h hourly sweep |
+| `spokes/template_mask/<jobId>/` | Path A output — **active processing target post-3a.** `tempFolderManager.ts` and `frameAccess.ts` both resolve against this directory. | **24 hours** |
 | `spokes/ai/<jobId>/<runId>/` | Path C output, one folder per AI run (Phase 3). | **24 hours** |
 | `spokes/labeling/<jobId>/` | Path B reserved (placeholder). | **24 hours** |
 
-`temp_processed/` is being retired by the hub-and-spoke refactor. Endpoints
-still write to it during Phase 2; Phase 3 moves writes to `spokes/` directories.
-It is purged on every server boot (`purgeTempProcessedOnStartup`) and swept
-hourly as a safety net. `spokes/` directories are created on boot by
-`ensureSpokeDirectories()` and swept hourly alongside the legacy directories.
+`temp_processed/` is fully retired post-Phase 3a — no code writes to it
+anymore. It remains as a defensive sweep target in `SWEEP_TARGETS` and is
+purged on every server boot (`purgeTempProcessedOnStartup`). Remove from
+`SWEEP_TARGETS` once confirmed quiet in production.
 
-`temp_processed/<jobId>/` is **not** deleted post-download. Folders persist
+`spokes/template_mask/<jobId>/` is **not** deleted post-download. Folders persist
 after download to allow the frame viewer to be reopened. Practical effect:
 a user who downloads then comes back later sees their session intact for up
 to 24h. The hourly retention sweep is the only path that reclaims this dir.

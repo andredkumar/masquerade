@@ -13,14 +13,13 @@ import { maskArtifactStore } from "./services/maskArtifactStore";
 import {
   deleteUploadFile,
   sweepDirectory,
-  UPLOADS_DIR,
-  TEMP_EXTRACTED_DIR,
-  TEMP_PROCESSED_DIR,
+  SWEEP_TARGETS,
 } from "./services/cleanup";
 import {
   resolveFramePath,
   tempDirExists,
   countFrames,
+  listFrameFiles,
   colorForLabelId,
 } from "./services/frameAccess";
 import Sharp from "sharp";
@@ -450,7 +449,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Download processed ZIP — built lazily from temp_processed/{jobId}/ on demand.
+  // Download processed ZIP — built lazily from spokes/template_mask/{jobId}/ on demand.
   // Optional query params: ?masks=true&overlays=true
   app.get("/api/videos/:jobId/download", async (req, res) => {
     try {
@@ -471,21 +470,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log(`📦 Building ZIP for job ${job.id} (masks: ${includeMasks}, overlays: ${includeOverlays})`);
 
-      // Source of truth for processed frames is the temp folder
-      const tempDir = path.join(process.cwd(), 'temp_processed', job.id);
-      if (!fs.existsSync(tempDir)) {
-        return res.status(404).json({ error: "Processed frames not found on disk" });
-      }
-
-      // Deduplicate (by filename) and sort. Each file's POSITION in this list is its
-      // canonical frame number — the manifest ignores any number embedded in the
-      // filename, so upstream ffmpeg/batch quirks can't surface as repeated entries.
-      const rawFrameFiles = fs.readdirSync(tempDir)
-        .filter(f => /\.(png|jpe?g)$/i.test(f));
-      const frameFiles = Array.from(new Set(rawFrameFiles)).sort();
-
+      // Source of truth for processed frames is the template-mask spoke directory.
+      // listFrameFiles handles path-traversal validation, dedup, and sorting.
+      const { dir: tempDir, files: frameFiles } = await listFrameFiles(job.id);
       if (frameFiles.length === 0) {
-        return res.status(404).json({ error: "No processed frames available to download" });
+        return res.status(404).json({ error: "Processed frames not found on disk" });
       }
 
       // Get approved AI labels from the job record
@@ -670,7 +659,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', `attachment; filename="processed_${job.filename}.zip"`);
 
-      // Intentionally NOT deleting temp_processed/<jobId>/ here.
+      // Intentionally NOT deleting spokes/template_mask/<jobId>/ here.
       // The frame viewer may need to read it after download. Folder is
       // reclaimed by the hourly retention sweep (24h) instead.
 
@@ -796,18 +785,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Collect all frames from temp_processed/{jobId}/ — inference runs on ALL of them.
+      // 3. Collect all frames from spokes/template_mask/{jobId}/ — inference runs on ALL of them.
       //    Dedupe (by filename) and sort, then use each file's POSITION in this list as
       //    its canonical frame number for the rest of the pipeline. We deliberately do
       //    NOT parse the integer out of the filename, because upstream ffmpeg vfr/batch
       //    extraction can leave holes or duplicates in the filename-embedded numbers,
       //    which would surface as "repeated confidence values" in the manifest.
-      const tempDir = path.join(process.cwd(), 'temp_processed', jobId);
-      let frameFileNames: string[] = [];
-      if (fs.existsSync(tempDir)) {
-        const raw = fs.readdirSync(tempDir).filter(f => /\.(png|jpe?g)$/i.test(f));
-        frameFileNames = Array.from(new Set(raw)).sort();
-      }
+      const { dir: tempDir, files: frameFileNames } = await listFrameFiles(jobId);
 
       // Fall back to request-body frame if temp folder is empty (single-frame path)
       const singleFrameFallback = !frameFileNames.length && frameBase64;
@@ -1052,7 +1036,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
    * GET /api/jobs/:jobId/viewer-info
    *   200: { jobId, totalFrames, status, labels[], hasFrames, hasInference, hasArtifacts }
    *   404: job record doesn't exist (typo'd jobId)
-   *   410: job exists in MemStorage but temp_processed/<jobId>/ has been
+   *   410: job exists in MemStorage but spokes/template_mask/<jobId>/ has been
    *        swept by retention. UI should show "session expired" + offer rerun.
    */
   app.get("/api/jobs/:jobId/viewer-info", async (req, res) => {
@@ -1149,7 +1133,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.setHeader('Cache-Control', 'private, max-age=3600');
       res.setHeader('Content-Type', 'image/png');
       // sendFile validates the absolute path; we already validated against
-      // TEMP_PROCESSED_DIR in resolveFramePath, so this is doubly safe.
+      // SPOKE_TEMPLATE_MASK_DIR in resolveFramePath, so this is doubly safe.
       res.sendFile(absPath, (err) => {
         if (err && !res.headersSent) {
           console.error('frame sendFile error:', err);
@@ -1380,9 +1364,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
     // maxAgeMs=0 means "delete every entry regardless of age" — the process
     // is going away, no future request can reference any of these files.
-    try { await sweepDirectory(UPLOADS_DIR, 0); } catch (err) { console.warn('SIGTERM: uploads sweep failed', err); }
-    try { await sweepDirectory(TEMP_EXTRACTED_DIR, 0); } catch (err) { console.warn('SIGTERM: temp_extracted sweep failed', err); }
-    try { await sweepDirectory(TEMP_PROCESSED_DIR, 0); } catch (err) { console.warn('SIGTERM: temp_processed sweep failed', err); }
+    for (const [dir] of SWEEP_TARGETS) {
+      try { await sweepDirectory(dir, 0); } catch (err) { console.warn(`SIGTERM: ${path.basename(dir)} sweep failed`, err); }
+    }
     try {
       httpServer.close();
     } catch (err) {
