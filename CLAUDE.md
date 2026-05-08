@@ -1,5 +1,7 @@
 # Masquerade
 
+**Phase 3b landed (May 2026):** AI inference now persists mask/overlay PNGs to disk under `spokes/ai/<jobId>/<runId>/`. Each `/api/ai/infer` call creates an `AIRun` record. `maskArtifactStore.ts` deleted — all mask/overlay reads come from disk. Dual-write: every `AiLabel` goes to both `AIRun.labels[]` and `job.aiLabels[]` for backward compat. Zero endpoint URL changes, zero frontend changes.
+
 **Phase 3a landed (May 2026):** Processing writes migrated from `temp_processed/` to `spokes/template_mask/<jobId>/`. Two bypass callsites (download endpoint, AI inference endpoint) now use `frameAccess.ts` helpers. `temp_processed/` is no longer written to; retained as defensive sweep target.
 
 **Phase 2 landed (May 2026):** Schema and storage plumbing for the hub-and-spoke refactor. New `Job`, `TemplateMaskState`, `AIState`, `AIRun` types in `shared/schema.ts`. New MemStorage methods. Spoke directories (`spokes/template_mask/`, `spokes/ai/`, `spokes/labeling/`) created on boot. `temp_processed/` purged on every startup. Generalized cleanup sweep targets.
@@ -18,8 +20,9 @@ types"):
 - `LabelingState` — Path B (placeholder, shape TBD)
 
 `MemStorage` in `server/storage.ts` has methods for these types (`getJobV2`,
-`setTemplateMaskState`, `addAiRun`, etc.) but **no callers exist yet**. Phase 3
-wires them into endpoints.
+`setTemplateMaskState`, `addAiRun`, etc.). Phase 3b wired `createJobV2`,
+`addAiRun`, `updateAiRun`, `getAiRun`, `listAiRuns`, `deleteAiRun` into
+the AI inference and label endpoints.
 
 The existing `VideoJob`, `MaskData`, `OutputSettings`, and `AiLabel` types
 remain the active runtime types until Phase 3 completes the migration.
@@ -38,7 +41,7 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
 | `temp_extracted/<jobId>/` | Raw frames pulled from a video before template-masking. | **6 hours** |
 | `temp_processed/<jobId>/` | **(LEGACY — no longer written to post-3a.)** Retained as defensive sweep target. | **Purged on every boot** + 24h hourly sweep |
 | `spokes/template_mask/<jobId>/` | Path A output — **active processing target post-3a.** `tempFolderManager.ts` and `frameAccess.ts` both resolve against this directory. | **24 hours** |
-| `spokes/ai/<jobId>/<runId>/` | Path C output, one folder per AI run (Phase 3). | **24 hours** |
+| `spokes/ai/<jobId>/<runId>/` | Path C output — **active post-3b.** One folder per AI run. Contains `mask_<n>.png` and `overlay_<n>.png` per frame. `routes.ts` mask/overlay serving endpoints read from here. | **24 hours** |
 | `spokes/labeling/<jobId>/` | Path B reserved (placeholder). | **24 hours** |
 
 `temp_processed/` is fully retired post-Phase 3a — no code writes to it
@@ -82,10 +85,10 @@ to 24h. The hourly retention sweep is the only path that reclaims this dir.
     response finishes. The frame viewer needs it readable after download
     so users can reopen the viewer or re-download. Reclamation happens
     exclusively via the hourly retention sweep (24h).
-- **SIGTERM** sweeps all directories (uploads, temp_extracted, temp_processed)
-  with `maxAgeMs = 0` (everything goes), then closes the HTTP server. Each
-  step is individually try/wrapped so one failure cannot block shutdown.
-  (Note: SIGTERM does not yet sweep spoke dirs — will be added in Phase 3.)
+- **SIGTERM** sweeps all `SWEEP_TARGETS` directories (uploads, temp_extracted,
+  temp_processed, and all spoke dirs) with `maxAgeMs = 0` (everything goes),
+  then closes the HTTP server. Each step is individually try/wrapped so one
+  failure cannot block shutdown.
 
 ### Manual cleanup
 
@@ -165,8 +168,8 @@ the same `path.resolve + startsWith` pattern the cleanup module uses.
 | `GET` | `/api/jobs/:jobId/viewer-info` | none | One-shot summary: `{totalFrames, status, labels, hasFrames, hasInference, hasArtifacts}`. 404 if job missing, 410 if `temp_processed/<jobId>/` swept. |
 | `GET` | `/api/jobs/:jobId/frames/:n.png` | `private, max-age=3600` | n-th processed frame PNG (sorted-list position). 400 invalid n, 404 missing, 410 swept. |
 | `GET` | `/api/jobs/:jobId/inference.json` | `no-store` | Frame-indexed pivot of `job.aiLabels`: `{imageWidth, imageHeight, outputSettings:{size,aspectRatioMode}, labels[], frames: {n: [{labelId, name, modality, confidence, bbox, hasMask}]}}`. `imageWidth/Height` are SOURCE-VIDEO dimensions (the coord system bbox is stored in), not the temp_processed frame's natural dimensions. No base64 blobs — mask URLs are constructed client-side from labelId. |
-| `GET` | `/api/jobs/:jobId/masks/:labelId/:n.png` | `private, max-age=3600` | Decodes from `maskArtifactStore` and streams a binary mask PNG. **410 with `{reason: "artifacts_lost_on_restart"}`** when the label exists in `job.aiLabels` but the in-memory store has no entry — the frontend uses this to show a re-run banner. |
-| `GET` | `/api/jobs/:jobId/overlays/:labelId/:n.png` | `private, max-age=3600` | Same as masks but serves the GPU's pre-rendered RGBA overlay (green tint on the mask region). Used by the viewer's "Overlay" mode. |
+| `GET` | `/api/jobs/:jobId/masks/:labelId/:n.png` | `private, max-age=3600` | Reads `mask_<n>.png` from `spokes/ai/<jobId>/<runId>/` via `findRunByLabelId`. **410 with `{reason: "artifacts_lost_on_restart"}`** when no AIRun owns the label (shouldn't happen post-3b). |
+| `GET` | `/api/jobs/:jobId/overlays/:labelId/:n.png` | `private, max-age=3600` | Same as masks but serves `overlay_<n>.png` — the GPU's pre-rendered RGBA overlay (green tint on mask region). Used by the viewer's "Overlay" mode. |
 
 ### Component
 
@@ -232,10 +235,11 @@ viewer locks the mode toggle to Clean and shows
   Each frame is a separate HTTP fetch; browser cache keeps it manageable
   but the prefetch radius isn't tuned for high frame counts. Not yet
   optimized.
-- **Artifacts are RAM-only**. After a `pm2 restart` the `maskArtifactStore`
-  is empty even though `job.aiLabels` is still in MemStorage. The viewer
-  detects this via `hasArtifacts: false` and shows a banner with a
-  re-run-inference shortcut.
+- **Artifacts survive restarts (post-3b)** but MemStorage job metadata
+  does not. After `pm2 restart`, mask/overlay PNGs remain on disk under
+  `spokes/ai/` but `job.aiLabels` and AIRun records are lost (MemStorage
+  is volatile). The viewer detects this via `hasArtifacts: false` (no
+  AIRuns in memory) and shows a banner with a re-run-inference shortcut.
 - **Bbox display uses sorted-list position as the frame key**. This
   matches the inference loop and the manifest builder. If upstream
   processing changes the file naming convention again, both inference.json
@@ -274,9 +278,9 @@ viewer locks the mode toggle to Clean and shows
 Step 4 in the linear workflow. The user draws a region of interest (bbox /
 circle / polygon / brush) on the first processed frame, types an intent
 ("segment the pleural line"), and clicks Run. Inference runs on every
-frame in `temp_processed/<jobId>/`; results are stored as one `AiLabel`
-per Run on `job.aiLabels` (lightweight metadata) plus a per-frame
-`maskArtifactStore` entry (heavy base64 blobs, in-memory only).
+frame in `spokes/template_mask/<jobId>/`; results are stored as one `AiLabel`
+per Run on `job.aiLabels` (lightweight metadata, dual-written to `AIRun.labels[]`)
+plus per-frame mask/overlay PNGs on disk under `spokes/ai/<jobId>/<runId>/`.
 
 ### Drawing canvas controls
 
@@ -321,10 +325,10 @@ separated because they have different consequences:
 - **Delete** (Trash2 icon, red on hover) — permanent. Click prompts
   `window.confirm("Permanently delete label 'foo'? This cannot be undone.")`.
   Confirm hits `DELETE /api/ai/labels/:jobId/:labelId`, which splices the
-  label out of `job.aiLabels` AND evicts its entries from
-  `maskArtifactStore`. The mask/overlay artifacts cannot be recovered
-  without re-running inference. **Use this when you definitely don't want
-  this label.**
+  label out of `job.aiLabels` AND its `AIRun`, and deletes the run's
+  output directory from disk. The mask/overlay artifacts cannot be
+  recovered without re-running inference. **Use this when you definitely
+  don't want this label.**
 
 A small color swatch leads each row, computed via
 `client/src/lib/labelColor.ts` (FNV-1a → HSL). It matches the bbox

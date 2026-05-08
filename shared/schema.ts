@@ -123,10 +123,9 @@ export interface OutputSettings {
 
 // AI label stored per-session on the job record.
 //
-// IMPORTANT: Heavy base64 mask/overlay artifacts are DELIBERATELY not persisted on
-// this interface. They live in server/services/maskArtifactStore.ts (in-memory only,
-// keyed by label id) to avoid blowing through Neon's data transfer quota.
-// Only lightweight per-frame metadata (confidence scores) is stored here.
+// IMPORTANT: Heavy mask/overlay PNG artifacts are persisted on disk under
+// spokes/ai/<jobId>/<runId>/ (Phase 3b), not on this interface. Only
+// lightweight per-frame metadata (confidence scores) is stored here.
 export type Modality = 'cardiac' | 'lung' | 'abdominal' | 'other';
 
 export interface AiLabel {
@@ -140,7 +139,7 @@ export interface AiLabel {
   approved: boolean;
   bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn prompt (image pixel coords)
   // Per-frame confidence scores — populated when Step 4 runs across all frames.
-  // Mask/overlay base64 blobs for each frame live in maskArtifactStore, not here.
+  // Mask/overlay PNGs live on disk under spokes/ai/<jobId>/<runId>/, not here.
   frameResults?: Record<number, {
     confidence: number;
   }>;

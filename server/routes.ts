@@ -3,17 +3,18 @@ import { createServer, type Server } from "http";
 import { Server as SocketIOServer } from "socket.io";
 import multer from "multer";
 import { storage } from "./storage";
-import { insertVideoJobSchema, type FileInfo, type AiLabel } from "@shared/schema";
+import { insertVideoJobSchema, type FileInfo, type AiLabel, type AIRun, type Job } from "@shared/schema";
 import { VideoProcessor } from "./services/videoProcessor";
 import { FrameExtractor } from "./services/frameExtractor";
 import { IntentParser } from "./services/intentParser";
 import { AIInferenceClient } from "./services/aiInferenceClient";
 import { ModelRouter } from "./services/modelRouter";
-import { maskArtifactStore } from "./services/maskArtifactStore";
 import {
   deleteUploadFile,
   sweepDirectory,
+  safeDelete,
   SWEEP_TARGETS,
+  SPOKE_AI_DIR,
 } from "./services/cleanup";
 import {
   resolveFramePath,
@@ -26,7 +27,46 @@ import Sharp from "sharp";
 import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
+import { promises as fsPromises } from "fs";
 import archiver from "archiver";
+
+// ── Helpers for AI run → label lookup ────────────────────────────────────
+
+/**
+ * Walk `job.ai.runs[*].labels` to find which run contains a given labelId.
+ * Returns the run or undefined if no match. O(runs × labels-per-run) —
+ * fine at single-tenant scale.
+ */
+function findRunByLabelId(runs: AIRun[], labelId: string): AIRun | undefined {
+  return runs.find(r => r.labels.some(l => l.id === labelId));
+}
+
+/**
+ * Ensure a Job exists in the hub-and-spoke store (jobsV2). Lazily creates
+ * one from the legacy VideoJob on first AI run. Phase 3d will move this
+ * to the upload handler.
+ */
+async function ensureJobV2(jobId: string, videoJob: { filename: string; createdAt?: string | null; duration: number; width: number; height: number; frameRate: number; totalFrames: number; jobType?: string }): Promise<Job> {
+  const existing = await storage.getJobV2(jobId);
+  if (existing) return existing;
+  return storage.createJobV2({
+    id: jobId,
+    filename: videoJob.filename,
+    uploadedAt: videoJob.createdAt || new Date().toISOString(),
+    phiStatus: 'raw',
+    source: {
+      duration: videoJob.duration,
+      width: videoJob.width,
+      height: videoJob.height,
+      frameRate: videoJob.frameRate,
+      totalFrames: videoJob.totalFrames,
+      type: videoJob.jobType === 'images' ? 'image_batch' : 'video',
+    },
+    extractionRate: videoJob.frameRate,
+    status: 'ready',
+    errorMessage: null,
+  });
+}
 
 const upload = multer({
   dest: 'uploads/',
@@ -488,23 +528,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return slug || 'unknown';
       };
 
-      // Per-label, per-frame getters — base64 artifacts come from the IN-MEMORY store,
-      // not the database. Confidence still lives on the label (lightweight).
-      const getLabelFrameMask = (label: AiLabel, frameIdx: number): Buffer | null => {
-        const artifacts = maskArtifactStore.get(label.id);
-        if (!artifacts) return null;
-        const r = artifacts.frameResults?.[frameIdx];
-        if (r?.maskB64) return Buffer.from(r.maskB64, 'base64');
-        if (artifacts.maskB64) return Buffer.from(artifacts.maskB64, 'base64'); // single-frame fallback
-        return null;
+      // Per-label, per-frame path resolvers — artifacts live on disk under
+      // spokes/ai/<jobId>/<runId>/. Build a lookup of labelId → run.outputDir.
+      const allRuns = await storage.listAiRuns(job.id);
+      const labelRunDirMap = new Map<string, string>();
+      for (const r of allRuns) {
+        for (const l of r.labels) labelRunDirMap.set(l.id, r.outputDir);
+      }
+
+      const getLabelFrameMaskPath = (label: AiLabel, frameIdx: number): string | null => {
+        const dir = labelRunDirMap.get(label.id);
+        if (!dir) return null;
+        const p = path.join(dir, `mask_${frameIdx}.png`);
+        return fs.existsSync(p) ? p : null;
       };
-      const getLabelFrameOverlay = (label: AiLabel, frameIdx: number): Buffer | null => {
-        const artifacts = maskArtifactStore.get(label.id);
-        if (!artifacts) return null;
-        const r = artifacts.frameResults?.[frameIdx];
-        if (r?.overlayB64) return Buffer.from(r.overlayB64, 'base64');
-        if (artifacts.overlayB64) return Buffer.from(artifacts.overlayB64, 'base64');
-        return null;
+      const getLabelFrameOverlayPath = (label: AiLabel, frameIdx: number): string | null => {
+        const dir = labelRunDirMap.get(label.id);
+        if (!dir) return null;
+        const p = path.join(dir, `overlay_${frameIdx}.png`);
+        return fs.existsSync(p) ? p : null;
       };
       const getLabelFrameConfidence = (label: AiLabel, frameIdx: number): number | null => {
         const r = label.frameResults?.[frameIdx];
@@ -512,16 +554,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return label.confidence ?? null;
       };
 
-      // True if at least one approved label has at least one per-frame artifact in memory
+      // True if at least one approved label has at least one mask/overlay on disk
       const hasAnyMasks = includeMasks && approvedLabels.some(l => {
-        const a = maskArtifactStore.get(l.id);
-        if (!a) return false;
-        return !!a.maskB64 || (a.frameResults && Object.values(a.frameResults).some(r => !!r.maskB64));
+        const dir = labelRunDirMap.get(l.id);
+        return dir ? fs.existsSync(path.join(dir, 'mask_0.png')) : false;
       });
       const hasAnyOverlays = includeOverlays && approvedLabels.some(l => {
-        const a = maskArtifactStore.get(l.id);
-        if (!a) return false;
-        return !!a.overlayB64 || (a.frameResults && Object.values(a.frameResults).some(r => !!r.overlayB64));
+        const dir = labelRunDirMap.get(l.id);
+        return dir ? fs.existsSync(path.join(dir, 'overlay_0.png')) : false;
       });
 
       // Top-level AI labels in the manifest (unchanged top-level confidence is the first-frame one)
@@ -700,18 +740,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         if (includeMasks) {
           for (let li = 0; li < approvedLabels.length; li++) {
-            const maskBuf = getLabelFrameMask(approvedLabels[li], i);
-            if (!maskBuf) continue;
-            archive.append(maskBuf, {
+            const maskPath = getLabelFrameMaskPath(approvedLabels[li], i);
+            if (!maskPath) continue;
+            archive.file(maskPath, {
               name: `masks/${analysisFolders[li]}/frame_${paddedNum}_mask.png`,
             });
           }
         }
         if (includeOverlays) {
           for (let li = 0; li < approvedLabels.length; li++) {
-            const overlayBuf = getLabelFrameOverlay(approvedLabels[li], i);
-            if (!overlayBuf) continue;
-            archive.append(overlayBuf, {
+            const overlayPath = getLabelFrameOverlayPath(approvedLabels[li], i);
+            if (!overlayPath) continue;
+            archive.file(overlayPath, {
               name: `overlays/${analysisFolders[li]}/frame_${paddedNum}_overlay.png`,
             });
           }
@@ -806,12 +846,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const modelConfig = router.route(parsedIntent);
       console.log(`🔀 Model router selected: ${modelConfig.id} (${modelConfig.name}) — type: ${modelConfig.type}, available: ${modelConfig.available}`);
 
-      // 5. Run inference on every frame, emitting progress via Socket.IO.
-      //    Heavy base64 blobs are collected into `artifactFrameResults` (in-memory only),
-      //    while lightweight per-frame confidence goes into `metaFrameResults` (persisted).
+      // 5. Create an AIRun record and output directory.
+      const runId = randomUUID();
+      const runOutputDir = path.join(SPOKE_AI_DIR, jobId, runId);
+      await fsPromises.mkdir(runOutputDir, { recursive: true });
+
+      await ensureJobV2(jobId, job);
+      const existingRuns = await storage.listAiRuns(jobId);
+      const newLabelId = randomUUID();
+
+      const run: AIRun = {
+        id: runId,
+        name: `Run ${existingRuns.length + 1}`,
+        inputSource: 'template_mask',
+        modality: resolvedModality,
+        bbox: bbox && typeof bbox.x1 === 'number' ? { x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2 } : null,
+        target: parsedIntent.target || 'unknown',
+        outputDir: runOutputDir,
+        labels: [],
+        approved: false,
+        createdAt: new Date().toISOString(),
+      };
+      await storage.addAiRun(jobId, run);
+
+      // 6. Run inference on every frame, writing mask/overlay PNGs to disk per-frame.
+      //    Base64 strings are decoded and written immediately, then discarded to keep
+      //    heap usage bounded.
       const aiClient = new AIInferenceClient();
 
-      const artifactFrameResults: Record<number, { maskB64: string; overlayB64?: string }> = {};
       const metaFrameResults: Record<number, { confidence: number }> = {};
       let firstResult: { maskBase64: string; overlayBase64?: string; confidence: number; modelUsed: string; inferenceMs: number } | null = null;
       const totalFrames = frameFileNames.length || 1;
@@ -828,7 +890,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
           useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
           modality: resolvedModality,
         });
-        artifactFrameResults[0] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
+        // Write mask/overlay to disk, discard base64 immediately
+        const writes: Promise<void>[] = [];
+        writes.push(fsPromises.writeFile(path.join(runOutputDir, 'mask_0.png'), Buffer.from(r.maskBase64, 'base64')));
+        if (r.overlayBase64) writes.push(fsPromises.writeFile(path.join(runOutputDir, 'overlay_0.png'), Buffer.from(r.overlayBase64, 'base64')));
+        await Promise.all(writes);
         metaFrameResults[0] = { confidence: r.confidence };
         firstResult = r;
       } else {
@@ -850,9 +916,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
             modality: resolvedModality,
           });
 
-          // Key by sorted-list POSITION (i) — NOT a number parsed out of the filename.
-          // Each file is processed exactly once because frameFileNames is a deduped Set.
-          artifactFrameResults[i] = { maskB64: r.maskBase64, overlayB64: r.overlayBase64 };
+          // Write mask/overlay to disk per-frame, discard base64 immediately
+          const writes: Promise<void>[] = [];
+          writes.push(fsPromises.writeFile(path.join(runOutputDir, `mask_${i}.png`), Buffer.from(r.maskBase64, 'base64')));
+          if (r.overlayBase64) writes.push(fsPromises.writeFile(path.join(runOutputDir, `overlay_${i}.png`), Buffer.from(r.overlayBase64, 'base64')));
+          await Promise.all(writes);
+
           metaFrameResults[i] = { confidence: r.confidence };
           if (i === 0) firstResult = r;
         }
@@ -864,20 +933,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ error: "Inference produced no results" });
       }
 
-      // 6a. Write heavy base64 artifacts to the IN-MEMORY store (never touches the DB).
-      const newLabelId = randomUUID();
-      maskArtifactStore.set(newLabelId, {
-        maskB64: firstResult.maskBase64 || undefined,
-        overlayB64: firstResult.overlayBase64 || undefined,
-        frameResults: artifactFrameResults,
-      });
-
-      // 6b. Write the LEAN label (metadata only) to the database.
-      //    Re-fetch the job first to see any labels added by concurrent Run clicks;
-      //    without this re-fetch, two in-flight runs would both start from the same
-      //    snapshot and the second write would clobber the first.
-      const latestJob = await storage.getVideoJob(jobId);
-      const existingLabels = ((latestJob as any)?.aiLabels || []) as AiLabel[];
+      // 7a. Build the AiLabel (metadata only — no base64 fields).
       const newLabel: AiLabel = {
         id: newLabelId,
         intent: parsedIntent.intent,
@@ -889,15 +945,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         approved: true,
         bbox: bbox && typeof bbox.x1 === 'number' ? { x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2 } : null,
         frameResults: metaFrameResults,
-        // NOTE: maskB64 / overlayB64 are deliberately omitted — they live in
-        //       maskArtifactStore (in-memory) to avoid Neon data transfer costs.
       };
+
+      // 7b. Dual-write: push to BOTH the new AIRun.labels[] AND legacy job.aiLabels[].
+      //     Frontend reads aiLabels; Phase 4 migrates to ai.runs.
+      await storage.updateAiRun(jobId, runId, { labels: [newLabel] });
+
+      const latestJob = await storage.getVideoJob(jobId);
+      const existingLabels = ((latestJob as any)?.aiLabels || []) as AiLabel[];
       await storage.updateVideoJob(jobId, {
         aiLabels: [...existingLabels, newLabel] as any,
       });
-      console.log(`🏷️  Appended AI label "${newLabel.target}" — job now has ${existingLabels.length + 1} label(s) (artifact store: ~${Math.round(maskArtifactStore.approximateSize() / 1024)} KB)`);
+      console.log(`🏷️  AI run "${run.name}" — label "${newLabel.target}" — artifacts at ${runOutputDir}`);
 
-      // 7. Return the first-frame result (the UI only displays one preview overlay)
+      // 8. Return the first-frame result (the UI only displays one preview overlay)
       res.json({
         parsedIntent,
         maskBase64: firstResult.maskBase64,
@@ -982,6 +1043,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       labels[idx].approved = approved;
       await storage.updateVideoJob(req.params.jobId, { aiLabels: labels as any });
+
+      // Dual-write: also update in the AIRun's labels[]
+      const runs = await storage.listAiRuns(req.params.jobId);
+      const matchedRun = findRunByLabelId(runs, req.params.labelId);
+      if (matchedRun) {
+        const updatedLabels = matchedRun.labels.map(l =>
+          l.id === req.params.labelId ? { ...l, approved } : l
+        );
+        await storage.updateAiRun(req.params.jobId, matchedRun.id, { labels: updatedLabels });
+      }
+
       res.json({ label: labels[idx] });
     } catch (error) {
       console.error("Patch label error:", error);
@@ -1004,8 +1076,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       await storage.updateVideoJob(req.params.jobId, { aiLabels: filtered as any });
-      // Evict the heavy base64 artifacts from the in-memory store too
-      maskArtifactStore.delete(req.params.labelId);
+
+      // Also remove from AIRun + delete the run's output directory.
+      // In Phase 3b each run has exactly one label, so deleting the label
+      // is equivalent to deleting the entire run.
+      const runs = await storage.listAiRuns(req.params.jobId);
+      const matchedRun = findRunByLabelId(runs, req.params.labelId);
+      if (matchedRun) {
+        try {
+          await safeDelete(matchedRun.outputDir, SPOKE_AI_DIR);
+        } catch (err) {
+          console.warn(`⚠️  Failed to delete run output dir: ${matchedRun.outputDir}`, err instanceof Error ? err.message : err);
+        }
+        await storage.deleteAiRun(req.params.jobId, matchedRun.id);
+      }
+
       res.json({ success: true });
     } catch (error) {
       console.error("Delete label error:", error);
@@ -1056,12 +1141,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const totalFrames = await countFrames(req.params.jobId);
       const allLabels = ((job as any).aiLabels || []) as AiLabel[];
 
-      // Per A: hasArtifacts is true iff at least one approved label has
-      // an entry in the in-memory store. After a PM2 restart this flips
-      // to false even though `aiLabels` is still in MemStorage's map.
+      // hasArtifacts is true if any completed AI run has mask files on disk.
+      // Post-3b artifacts survive restarts, so this is essentially always true
+      // for jobs with completed runs.
+      const viewerRuns = await storage.listAiRuns(req.params.jobId);
       let hasArtifacts = false;
-      for (const l of allLabels) {
-        if (l.approved && maskArtifactStore.has(l.id)) {
+      for (const r of viewerRuns) {
+        if (fs.existsSync(path.join(r.outputDir, 'mask_0.png'))) {
           hasArtifacts = true;
           break;
         }
@@ -1220,6 +1306,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         };
       });
 
+      // Build label→run output dir map for disk-based hasMask checks
+      const inferRuns = await storage.listAiRuns(req.params.jobId);
+      const labelDirMap = new Map<string, string>();
+      for (const r of inferRuns) {
+        for (const rl of r.labels) labelDirMap.set(rl.id, r.outputDir);
+      }
+
       // Frame-indexed pivot. Each frame lists the labels that have a
       // confidence entry for that frame number in their frameResults.
       const totalFrames = await countFrames(req.params.jobId);
@@ -1229,10 +1322,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         for (const l of allLabels) {
           const r = l.frameResults?.[i];
           if (!r) continue;
-          // hasMask: artifact store may be empty post-restart even though
-          // the metadata says this frame had a mask. Probe the store.
-          const artifacts = maskArtifactStore.get(l.id);
-          const hasMask = !!artifacts?.frameResults?.[i]?.maskB64;
+          // hasMask: check whether the mask PNG exists on disk for this
+          // (label, frame) pair. Post-3b masks are disk-persisted so they
+          // survive restarts (unlike the old in-memory artifact store).
+          const runDir = labelDirMap.get(l.id);
+          const hasMask = !!runDir && fs.existsSync(path.join(runDir, `mask_${i}.png`));
           perFrame.push({
             labelId: l.id,
             name: l.target,
@@ -1265,11 +1359,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
    * GET /api/jobs/:jobId/masks/:labelId/:n.png
    *
    *   200: streams the binary mask PNG for the (label, frame) pair
-   *   404: labelId doesn't exist on this job (or job not found)
+   *   404: labelId doesn't exist on this job, or mask file missing
    *   410: { reason: "artifacts_lost_on_restart" } — the label exists in
-   *        job.aiLabels but the in-memory artifact store has no entry for
-   *        it. Happens after PM2 restart. Frontend uses this distinction
-   *        to display the "re-run inference" banner.
+   *        job.aiLabels but no AIRun owns it (shouldn't happen post-3b
+   *        but kept for backward compat with the frontend banner).
    */
   app.get("/api/jobs/:jobId/masks/:labelId/:n.png", async (req, res) => {
     try {
@@ -1285,21 +1378,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const label = allLabels.find(l => l.id === req.params.labelId);
       if (!label) return res.status(404).json({ error: "Label not found" });
 
-      const artifacts = maskArtifactStore.get(label.id);
-      if (!artifacts) {
+      // Resolve the mask PNG on disk via the AIRun that owns this label
+      const runs = await storage.listAiRuns(req.params.jobId);
+      const run = findRunByLabelId(runs, label.id);
+      if (!run) {
         return res.status(410).json({
           error: "Mask artifacts unavailable",
           reason: "artifacts_lost_on_restart",
         });
       }
-      const b64 = artifacts.frameResults?.[n]?.maskB64;
-      if (!b64) return res.status(404).json({ error: `mask for frame ${n} not found` });
+      const maskPath = path.join(run.outputDir, `mask_${n}.png`);
+      if (!fs.existsSync(maskPath)) {
+        return res.status(404).json({ error: `mask for frame ${n} not found` });
+      }
 
-      const buf = Buffer.from(b64, 'base64');
       res.setHeader('Cache-Control', 'private, max-age=3600');
       res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Content-Length', String(buf.length));
-      res.end(buf);
+      res.sendFile(path.resolve(maskPath));
     } catch (error) {
       console.error("GET mask error:", error);
       if (!res.headersSent) {
@@ -1329,21 +1424,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const label = allLabels.find(l => l.id === req.params.labelId);
       if (!label) return res.status(404).json({ error: "Label not found" });
 
-      const artifacts = maskArtifactStore.get(label.id);
-      if (!artifacts) {
+      // Resolve the overlay PNG on disk via the AIRun that owns this label
+      const runs = await storage.listAiRuns(req.params.jobId);
+      const run = findRunByLabelId(runs, label.id);
+      if (!run) {
         return res.status(410).json({
           error: "Overlay artifacts unavailable",
           reason: "artifacts_lost_on_restart",
         });
       }
-      const b64 = artifacts.frameResults?.[n]?.overlayB64;
-      if (!b64) return res.status(404).json({ error: `overlay for frame ${n} not found` });
+      const overlayPath = path.join(run.outputDir, `overlay_${n}.png`);
+      if (!fs.existsSync(overlayPath)) {
+        return res.status(404).json({ error: `overlay for frame ${n} not found` });
+      }
 
-      const buf = Buffer.from(b64, 'base64');
       res.setHeader('Cache-Control', 'private, max-age=3600');
       res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Content-Length', String(buf.length));
-      res.end(buf);
+      res.sendFile(path.resolve(overlayPath));
     } catch (error) {
       console.error("GET overlay error:", error);
       if (!res.headersSent) {

@@ -124,6 +124,9 @@ export class PgStorage implements IStorage {
   // Real Postgres-backed implementations will be added during the
   // Postgres migration, separate from this refactor.
 
+  async createJobV2(_job: Job): Promise<Job> {
+    throw new Error('PgStorage.createJobV2 not implemented — use MemStorage');
+  }
   async getJobV2(_jobId: string): Promise<Job | undefined> {
     throw new Error('PgStorage.getJobV2 not implemented — use MemStorage');
   }

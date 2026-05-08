@@ -31,6 +31,7 @@ export interface IStorage {
   // No callers yet — wired up in Phase 3.
 
   // Job V2 (hub-and-spoke shape)
+  createJobV2(job: Job): Promise<Job>;
   getJobV2(jobId: string): Promise<Job | undefined>;
 
   // PHI status
@@ -146,6 +147,11 @@ export class MemStorage implements IStorage {
   // ── Hub-and-spoke methods (Phase 2 plumbing) ──────────────────────────
   // No callers yet — wired up in Phase 3.
 
+  async createJobV2(job: Job): Promise<Job> {
+    this.jobsV2.set(job.id, job);
+    return job;
+  }
+
   async getJobV2(jobId: string): Promise<Job | undefined> {
     return this.jobsV2.get(jobId);
   }
@@ -216,6 +222,6 @@ export class MemStorage implements IStorage {
 
 // Always use in-memory storage. PgStorage import is intentionally omitted so
 // that `./db` (which throws if DATABASE_URL is unset) is never loaded and no
-// Neon client is ever initialized. AI label mask/overlay artifacts still live
-// in the separate maskArtifactStore (also in-memory).
+// Neon client is ever initialized. AI mask/overlay PNGs are persisted on disk
+// under spokes/ai/<jobId>/<runId>/ (Phase 3b).
 export const storage = new MemStorage();

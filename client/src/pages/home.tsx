@@ -158,7 +158,7 @@ export default function Home() {
   // handleRemoveLabel is left unchanged so any keyboard / programmatic
   // callers don't get a confirm injected, but every UI-driven delete now
   // gates on user intent because deletion is permanent and cascades into
-  // maskArtifactStore eviction on the server.
+  // AIRun + disk artifact deletion on the server.
   const handleDeleteLabelWithConfirm = (label: AiLabel) => {
     const ok = window.confirm(
       `Permanently delete label '${label.target}'? This cannot be undone.`
