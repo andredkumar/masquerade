@@ -154,4 +154,10 @@ export class PgStorage implements IStorage {
   async deleteAiRun(_jobId: string, _runId: string): Promise<boolean> {
     throw new Error('PgStorage.deleteAiRun not implemented — use MemStorage');
   }
+  async deleteVideoJob(_id: string): Promise<boolean> {
+    throw new Error('PgStorage.deleteVideoJob not implemented — use MemStorage');
+  }
+  async deleteJobV2(_jobId: string): Promise<boolean> {
+    throw new Error('PgStorage.deleteJobV2 not implemented — use MemStorage');
+  }
 }

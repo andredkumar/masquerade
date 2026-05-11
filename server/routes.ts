@@ -13,6 +13,7 @@ import {
   deleteUploadFile,
   sweepDirectory,
   safeDelete,
+  cleanupJobArtifacts,
   SWEEP_TARGETS,
   SPOKE_AI_DIR,
 } from "./services/cleanup";
@@ -29,6 +30,7 @@ import path from "path";
 import fs from "fs";
 import { promises as fsPromises } from "fs";
 import archiver from "archiver";
+import { applyTemplateMask } from "./handlers/templateMaskApply";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -374,7 +376,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Get job status and progress
-  app.get("/api/videos/:jobId", async (req, res) => {
+  const getJobHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const job = await storage.getVideoJob(req.params.jobId);
       if (!job) {
@@ -382,7 +384,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const progress = await storage.getProcessingProgress(req.params.jobId);
-      
+
       res.json({
         job,
         progress
@@ -390,11 +392,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     } catch (error) {
       console.error("Get job error:", error);
-      res.status(500).json({ 
-        error: error instanceof Error ? error.message : "Failed to get job" 
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Failed to get job"
       });
     }
-  });
+  };
+  app.get("/api/videos/:jobId", getJobHandler);  // legacy alias
+  app.get("/api/jobs/:jobId", getJobHandler);    // canonical
 
   // Start video processing with mask data
   app.post("/api/videos/:jobId/process", async (req, res) => {
@@ -491,7 +495,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Download processed ZIP — built lazily from spokes/template_mask/{jobId}/ on demand.
   // Optional query params: ?masks=true&overlays=true
-  app.get("/api/videos/:jobId/download", async (req, res) => {
+  const templateMaskDownloadHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const job = await storage.getVideoJob(req.params.jobId);
       if (!job) {
@@ -769,7 +773,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
     }
-  });
+  };
+  app.get("/api/videos/:jobId/download", templateMaskDownloadHandler);            // legacy alias
+  app.get("/api/jobs/:jobId/template-mask/download", templateMaskDownloadHandler); // canonical
 
   // ── AI: Parse natural language command into structured intent ──
   app.post("/api/ai/parse-intent", async (req, res) => {
@@ -793,9 +799,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ── AI: Run inference on a single frame ──────────────────────
-  app.post("/api/ai/infer", async (req, res) => {
+  const aiInferHandler: import('express').RequestHandler = async (req, res) => {
     try {
-      const { jobId, command, frameBase64, bbox, useAutoPrompt, modality } = req.body;
+      const jobId = req.params.jobId ?? req.body.jobId;
+      const { command, frameBase64, bbox, useAutoPrompt, modality } = req.body;
 
       if (!jobId || !command) {
         return res.status(400).json({
@@ -975,7 +982,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         error: error instanceof Error ? error.message : "AI inference failed",
       });
     }
-  });
+  };
+  app.post("/api/ai/infer", aiInferHandler);              // legacy alias
+  app.post("/api/jobs/:jobId/ai/runs", aiInferHandler);    // canonical
 
   // ── AI: Health check for the Python AI service ───────────────
   app.get("/api/ai/status", async (_req, res) => {
@@ -1023,14 +1032,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // PATCH toggle approved on a label
-  app.patch("/api/ai/labels/:jobId/:labelId", async (req, res) => {
+  const patchLabelHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const { approved } = req.body;
       if (typeof approved !== 'boolean') {
         return res.status(400).json({ error: "approved (boolean) is required" });
       }
 
-      const job = await storage.getVideoJob(req.params.jobId);
+      const jobId = req.params.jobId;
+      const job = await storage.getVideoJob(jobId);
       if (!job) {
         return res.status(404).json({ error: "Job not found" });
       }
@@ -1042,16 +1052,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       labels[idx].approved = approved;
-      await storage.updateVideoJob(req.params.jobId, { aiLabels: labels as any });
+      await storage.updateVideoJob(jobId, { aiLabels: labels as any });
 
       // Dual-write: also update in the AIRun's labels[]
-      const runs = await storage.listAiRuns(req.params.jobId);
-      const matchedRun = findRunByLabelId(runs, req.params.labelId);
+      const runs = await storage.listAiRuns(jobId);
+      const matchedRun = req.params.runId
+        ? runs.find(r => r.id === req.params.runId)
+        : findRunByLabelId(runs, req.params.labelId);
       if (matchedRun) {
         const updatedLabels = matchedRun.labels.map(l =>
           l.id === req.params.labelId ? { ...l, approved } : l
         );
-        await storage.updateAiRun(req.params.jobId, matchedRun.id, { labels: updatedLabels });
+        await storage.updateAiRun(jobId, matchedRun.id, { labels: updatedLabels });
       }
 
       res.json({ label: labels[idx] });
@@ -1059,12 +1071,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Patch label error:", error);
       res.status(500).json({ error: error instanceof Error ? error.message : "Failed to update label" });
     }
-  });
+  };
+  app.patch("/api/ai/labels/:jobId/:labelId", patchLabelHandler);                              // legacy alias
+  app.patch("/api/jobs/:jobId/ai/runs/:runId/labels/:labelId", patchLabelHandler);              // canonical
 
   // DELETE a label
-  app.delete("/api/ai/labels/:jobId/:labelId", async (req, res) => {
+  const deleteLabelHandler: import('express').RequestHandler = async (req, res) => {
     try {
-      const job = await storage.getVideoJob(req.params.jobId);
+      const jobId = req.params.jobId;
+      const job = await storage.getVideoJob(jobId);
       if (!job) {
         return res.status(404).json({ error: "Job not found" });
       }
@@ -1075,20 +1090,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Label not found" });
       }
 
-      await storage.updateVideoJob(req.params.jobId, { aiLabels: filtered as any });
+      await storage.updateVideoJob(jobId, { aiLabels: filtered as any });
 
       // Also remove from AIRun + delete the run's output directory.
       // In Phase 3b each run has exactly one label, so deleting the label
       // is equivalent to deleting the entire run.
-      const runs = await storage.listAiRuns(req.params.jobId);
-      const matchedRun = findRunByLabelId(runs, req.params.labelId);
+      const runs = await storage.listAiRuns(jobId);
+      const matchedRun = req.params.runId
+        ? runs.find(r => r.id === req.params.runId)
+        : findRunByLabelId(runs, req.params.labelId);
       if (matchedRun) {
         try {
           await safeDelete(matchedRun.outputDir, SPOKE_AI_DIR);
         } catch (err) {
           console.warn(`⚠️  Failed to delete run output dir: ${matchedRun.outputDir}`, err instanceof Error ? err.message : err);
         }
-        await storage.deleteAiRun(req.params.jobId, matchedRun.id);
+        await storage.deleteAiRun(jobId, matchedRun.id);
       }
 
       res.json({ success: true });
@@ -1096,7 +1113,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Delete label error:", error);
       res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete label" });
     }
-  });
+  };
+  app.delete("/api/ai/labels/:jobId/:labelId", deleteLabelHandler);                              // legacy alias
+  app.delete("/api/jobs/:jobId/ai/runs/:runId/labels/:labelId", deleteLabelHandler);              // canonical
 
   // WebSocket connection handling
   io.on('connection', (socket) => {
@@ -1356,15 +1375,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   /**
-   * GET /api/jobs/:jobId/masks/:labelId/:n.png
+   * GET /api/jobs/:jobId/masks/:labelId/:n.png                        (legacy alias)
+   * GET /api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png         (canonical)
    *
    *   200: streams the binary mask PNG for the (label, frame) pair
    *   404: labelId doesn't exist on this job, or mask file missing
-   *   410: { reason: "artifacts_lost_on_restart" } — the label exists in
-   *        job.aiLabels but no AIRun owns it (shouldn't happen post-3b
-   *        but kept for backward compat with the frontend banner).
+   *   410: { reason: "artifacts_lost_on_restart" } — no AIRun owns the label
    */
-  app.get("/api/jobs/:jobId/masks/:labelId/:n.png", async (req, res) => {
+  const getMaskHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const n = parseInt(req.params.n, 10);
       if (!Number.isInteger(n) || n < 0 || String(n) !== req.params.n) {
@@ -1380,7 +1398,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Resolve the mask PNG on disk via the AIRun that owns this label
       const runs = await storage.listAiRuns(req.params.jobId);
-      const run = findRunByLabelId(runs, label.id);
+      const run = req.params.runId
+        ? runs.find(r => r.id === req.params.runId)
+        : findRunByLabelId(runs, label.id);
       if (!run) {
         return res.status(410).json({
           error: "Mask artifacts unavailable",
@@ -1401,16 +1421,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
         res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load mask" });
       }
     }
-  });
+  };
+  app.get("/api/jobs/:jobId/masks/:labelId/:n.png", getMaskHandler);                             // legacy alias
+  app.get("/api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png", getMaskHandler);              // canonical
 
   /**
-   * GET /api/jobs/:jobId/overlays/:labelId/:n.png
+   * GET /api/jobs/:jobId/overlays/:labelId/:n.png                     (legacy alias)
+   * GET /api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png      (canonical)
    *
    * Same shape as the mask endpoint, but serves the GPU's pre-rendered
    * overlay PNG (original frame with green tint on the mask region).
    * Used by the viewer's "Overlay" mode.
    */
-  app.get("/api/jobs/:jobId/overlays/:labelId/:n.png", async (req, res) => {
+  const getOverlayHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const n = parseInt(req.params.n, 10);
       if (!Number.isInteger(n) || n < 0 || String(n) !== req.params.n) {
@@ -1426,7 +1449,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Resolve the overlay PNG on disk via the AIRun that owns this label
       const runs = await storage.listAiRuns(req.params.jobId);
-      const run = findRunByLabelId(runs, label.id);
+      const run = req.params.runId
+        ? runs.find(r => r.id === req.params.runId)
+        : findRunByLabelId(runs, label.id);
       if (!run) {
         return res.status(410).json({
           error: "Overlay artifacts unavailable",
@@ -1446,6 +1471,227 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!res.headersSent) {
         res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load overlay" });
       }
+    }
+  };
+  app.get("/api/jobs/:jobId/overlays/:labelId/:n.png", getOverlayHandler);                       // legacy alias
+  app.get("/api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png", getOverlayHandler);        // canonical
+
+  // ── Net-new CRUD endpoints (Phase 3c) ──────────────────────────────────
+
+  // POST /api/jobs/:jobId/template-mask/apply — canonical URL for template-mask
+  // processing. Shares handler logic with PATCH /internal/mask-processing/:jobId
+  // (registered early in index.ts to dodge Vite middleware) via the shared
+  // applyTemplateMask function in server/handlers/templateMaskApply.ts.
+  app.post("/api/jobs/:jobId/template-mask/apply", async (req, res) => {
+    try {
+      const { maskData, outputSettings, samplingFps } = req.body || {};
+      const result = await applyTemplateMask(
+        req.params.jobId, maskData, outputSettings, samplingFps, (global as any).socketIo,
+      );
+      if (!result.ok) {
+        return res.status(result.status).json({ success: false, error: result.error });
+      }
+      res.json({ success: true, message: 'Processing started', jobId: result.jobId });
+    } catch (error) {
+      console.error("template-mask/apply error:", error);
+      res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to start processing"
+      });
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/ai/runs — list all AI runs for a job.
+   */
+  app.get("/api/jobs/:jobId/ai/runs", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const runs = await storage.listAiRuns(req.params.jobId);
+      res.json({ runs });
+    } catch (error) {
+      console.error("List runs error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to list runs" });
+    }
+  });
+
+  /**
+   * PATCH /api/jobs/:jobId/ai/runs/:runId — update run metadata (name, approved).
+   */
+  app.patch("/api/jobs/:jobId/ai/runs/:runId", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const { name, approved } = req.body;
+      const updates: Partial<AIRun> = {};
+      if (typeof name === 'string') updates.name = name;
+      if (typeof approved === 'boolean') updates.approved = approved;
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: "At least one of name, approved is required" });
+      }
+
+      const updated = await storage.updateAiRun(req.params.jobId, req.params.runId, updates);
+      if (!updated) return res.status(404).json({ error: "Run not found" });
+
+      res.json({ run: updated });
+    } catch (error) {
+      console.error("Patch run error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to update run" });
+    }
+  });
+
+  /**
+   * DELETE /api/jobs/:jobId/ai/runs/:runId — delete a specific AI run.
+   * Removes all labels belonging to this run from job.aiLabels[], deletes
+   * the run's output directory, and removes the AIRun record.
+   */
+  app.delete("/api/jobs/:jobId/ai/runs/:runId", async (req, res) => {
+    try {
+      const jobId = req.params.jobId;
+      const job = await storage.getVideoJob(jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const run = await storage.getAiRun(jobId, req.params.runId);
+      if (!run) return res.status(404).json({ error: "Run not found" });
+
+      // Remove this run's labels from job.aiLabels[] (backward compat)
+      const runLabelIds = new Set(run.labels.map(l => l.id));
+      const labels = ((job as any).aiLabels || []) as AiLabel[];
+      const filtered = labels.filter(l => !runLabelIds.has(l.id));
+      if (filtered.length !== labels.length) {
+        await storage.updateVideoJob(jobId, { aiLabels: filtered as any });
+      }
+
+      // Delete run output directory from disk
+      try {
+        await safeDelete(run.outputDir, SPOKE_AI_DIR);
+      } catch (err) {
+        console.warn(`⚠️  Failed to delete run output dir: ${run.outputDir}`, err instanceof Error ? err.message : err);
+      }
+
+      // Remove the AIRun record
+      await storage.deleteAiRun(jobId, run.id);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete run error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete run" });
+    }
+  });
+
+  /**
+   * GET /api/jobs/:jobId/ai/runs/:runId/download — download a single AI run
+   * as a ZIP containing mask and overlay PNGs plus a manifest.
+   */
+  app.get("/api/jobs/:jobId/ai/runs/:runId/download", async (req, res) => {
+    try {
+      const job = await storage.getVideoJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      const run = await storage.getAiRun(req.params.jobId, req.params.runId);
+      if (!run) return res.status(404).json({ error: "Run not found" });
+
+      // Check the output directory exists and has files
+      if (!fs.existsSync(run.outputDir)) {
+        return res.status(404).json({ error: "Run output directory not found on disk" });
+      }
+
+      const allFiles = fs.readdirSync(run.outputDir).filter(f => /\.(png|jpe?g)$/i.test(f)).sort();
+      if (allFiles.length === 0) {
+        return res.status(404).json({ error: "No artifacts found for this run" });
+      }
+
+      const maskFiles = allFiles.filter(f => f.startsWith('mask_'));
+      const overlayFiles = allFiles.filter(f => f.startsWith('overlay_'));
+
+      // Build manifest for this run
+      const manifest = {
+        jobId: req.params.jobId,
+        runId: run.id,
+        runName: run.name,
+        target: run.target,
+        modality: run.modality || null,
+        inputSource: run.inputSource,
+        createdAt: run.createdAt,
+        labels: run.labels.map(l => ({
+          id: l.id,
+          target: l.target,
+          approved: l.approved,
+          confidence: l.confidence,
+          model: l.model,
+        })),
+        maskCount: maskFiles.length,
+        overlayCount: overlayFiles.length,
+      };
+
+      const zipFilename = `ai-run-${run.name.replace(/\s+/g, '-').toLowerCase()}-${job.filename || 'output'}.zip`;
+      res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+      res.setHeader('Content-Type', 'application/zip');
+
+      const archive = archiver('zip', { zlib: { level: 1 } });
+      archive.on('error', (err) => {
+        console.error('Archive error:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Archive creation failed' });
+        }
+      });
+      archive.pipe(res);
+
+      // Add mask PNGs
+      for (const f of maskFiles) {
+        archive.file(path.join(run.outputDir, f), { name: `masks/${f}` });
+      }
+
+      // Add overlay PNGs
+      for (const f of overlayFiles) {
+        archive.file(path.join(run.outputDir, f), { name: `overlays/${f}` });
+      }
+
+      // Add manifest
+      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+
+      await archive.finalize();
+      console.log(`✅ AI run ZIP streamed for job ${req.params.jobId}, run ${run.id}`);
+    } catch (error) {
+      console.error("AI run download error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error instanceof Error ? error.message : "AI run download failed" });
+      }
+    }
+  });
+
+  /**
+   * DELETE /api/jobs/:jobId — delete a job entirely. Removes all disk
+   * artifacts via cleanupJobArtifacts, then removes in-memory records.
+   */
+  app.delete("/api/jobs/:jobId", async (req, res) => {
+    try {
+      const jobId = req.params.jobId;
+      const job = await storage.getVideoJob(jobId);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      // Clean up all disk artifacts (temp_extracted, temp_processed,
+      // spoke dirs). Each target is individually try/wrapped inside
+      // cleanupJobArtifacts so one failure doesn't block the rest.
+      await cleanupJobArtifacts(jobId);
+
+      // Remove the upload file if it still exists
+      if (job.filePath) {
+        try { await deleteUploadFile(job.filePath); } catch { /* best-effort */ }
+      }
+
+      // Remove in-memory records
+      await storage.deleteVideoJob(jobId);
+      await storage.deleteJobV2(jobId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Delete job error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete job" });
     }
   });
 

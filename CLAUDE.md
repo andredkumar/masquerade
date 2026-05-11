@@ -1,5 +1,7 @@
 # Masquerade
 
+**Phase 3c landed (May 2026):** Endpoint URL hierarchy migrated. New `/api/jobs/:jobId/...` URLs added; old URLs preserved as aliases. Four net-new CRUD endpoints: `DELETE /api/jobs/:jobId`, `GET /api/jobs/:jobId/ai/runs`, `PATCH /api/jobs/:jobId/ai/runs/:runId`, `DELETE /api/jobs/:jobId/ai/runs/:runId`. Path C download: `GET /api/jobs/:jobId/ai/runs/:runId/download`. Template-mask apply alias: `POST /api/jobs/:jobId/template-mask/apply`. Frontend still uses old URLs; Phase 4 migrates.
+
 **Phase 3b landed (May 2026):** AI inference now persists mask/overlay PNGs to disk under `spokes/ai/<jobId>/<runId>/`. Each `/api/ai/infer` call creates an `AIRun` record. `maskArtifactStore.ts` deleted — all mask/overlay reads come from disk. Dual-write: every `AiLabel` goes to both `AIRun.labels[]` and `job.aiLabels[]` for backward compat. Zero endpoint URL changes, zero frontend changes.
 
 **Phase 3a landed (May 2026):** Processing writes migrated from `temp_processed/` to `spokes/template_mask/<jobId>/`. Two bypass callsites (download endpoint, AI inference endpoint) now use `frameAccess.ts` helpers. `temp_processed/` is no longer written to; retained as defensive sweep target.
@@ -26,6 +28,33 @@ the AI inference and label endpoints.
 
 The existing `VideoJob`, `MaskData`, `OutputSettings`, and `AiLabel` types
 remain the active runtime types until Phase 3 completes the migration.
+
+## URL hierarchy (Phase 3c)
+
+New canonical URLs follow a resource hierarchy. Old URLs are preserved as
+aliases (same handler, two registrations). Frontend still uses old URLs;
+Phase 4 migrates.
+
+| Legacy URL (alias) | Canonical URL | Method |
+|---|---|---|
+| `GET /api/videos/:jobId` | `GET /api/jobs/:jobId` | Job state |
+| `GET /api/videos/:jobId/download` | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
+| `PATCH /internal/mask-processing/:jobId` | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger |
+| `POST /api/ai/infer` | `POST /api/jobs/:jobId/ai/runs` | Create AI run |
+| `PATCH /api/ai/labels/:jobId/:labelId` | `PATCH /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Approve label |
+| `DELETE /api/ai/labels/:jobId/:labelId` | `DELETE /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Delete label |
+| `GET /api/jobs/:jobId/masks/:labelId/:n.png` | `GET /api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png` | Mask PNG |
+| `GET /api/jobs/:jobId/overlays/:labelId/:n.png` | `GET /api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png` | Overlay PNG |
+
+Net-new (no legacy alias):
+
+| URL | Method | Purpose |
+|---|---|---|
+| `GET /api/jobs/:jobId/ai/runs` | GET | List all AI runs |
+| `PATCH /api/jobs/:jobId/ai/runs/:runId` | PATCH | Rename/approve a run |
+| `DELETE /api/jobs/:jobId/ai/runs/:runId` | DELETE | Delete a run + artifacts |
+| `GET /api/jobs/:jobId/ai/runs/:runId/download` | GET | Download run as ZIP |
+| `DELETE /api/jobs/:jobId` | DELETE | Delete job + all artifacts |
 
 ## Disk lifecycle
 

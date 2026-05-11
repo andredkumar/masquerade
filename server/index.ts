@@ -2,6 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { checkFFmpegInstallation, displaySystemStatus } from "./utils/systemCheck";
+import { applyTemplateMask } from "./handlers/templateMaskApply";
 
 const app = express();
 
@@ -22,133 +23,24 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '50mb' })); // Increase limit to handle large canvas data
 app.use(express.urlencoded({ extended: false }));
 
-// Add our mask data endpoint with unique path to avoid Vite interference
+// Legacy mask-processing endpoint — registered before Vite middleware to avoid
+// interception (Phase 1 finding). Delegates to the shared applyTemplateMask
+// function so behaviour is identical to POST /api/jobs/:jobId/template-mask/apply.
 app.patch("/internal/mask-processing/:jobId", async (req, res) => {
   try {
-    console.log('\n🔧 WORKAROUND MASK ENDPOINT HIT!');
-    console.log('=================================');
-    console.log('JobID:', req.params.jobId);
-    console.log('Body keys:', Object.keys(req.body || {}));
-    
-    const { maskData, outputSettings, samplingFps: rawSamplingFps } = req.body || {};
-
-    if (!maskData || !outputSettings) {
-      console.log('❌ Missing required data');
-      return res.status(400).json({
-        success: false,
-        error: "maskData and outputSettings are required"
-      });
+    const { maskData, outputSettings, samplingFps } = req.body || {};
+    const result = await applyTemplateMask(
+      req.params.jobId, maskData, outputSettings, samplingFps, (global as any).socketIo,
+    );
+    if (!result.ok) {
+      return res.status(result.status).json({ success: false, error: result.error });
     }
-
-    // Sanitize samplingFps: null = native rate, positive number = -vf fps=N filter.
-    // Anything else (undefined / non-numeric / <= 0) collapses to null.
-    const samplingFps: number | null =
-      typeof rawSamplingFps === 'number' && isFinite(rawSamplingFps) && rawSamplingFps > 0
-        ? rawSamplingFps
-        : null;
-    console.log('✅ Frame sampling:', samplingFps == null ? 'native rate' : `${samplingFps}fps`);
-    
-    console.log('✅ Received mask data:', maskData.type);
-    console.log('✅ Coordinates:', maskData.coordinates);
-    console.log('✅ Canvas data length:', maskData.canvasDataUrl?.length || 0);
-    
-    // Import necessary modules for video processing
-    const { VideoProcessor } = await import('./services/videoProcessor');
-    const { storage } = await import('./storage');
-    
-    // Get existing job
-    const job = await storage.getVideoJob(req.params.jobId);
-    if (!job) {
-      return res.status(404).json({ 
-        success: false, 
-        error: "Job not found" 
-      });
-    }
-
-    // Allow processing regardless of job status to enable re-processing
-    console.log('✅ Found job:', {
-      id: job.id,
-      status: job.status,
-      filePath: job.filePath,
-      hasFilePath: !!job.filePath
-    });
-    
-    // Store mask data in the job
-    await storage.updateVideoJob(req.params.jobId, {
-      maskData,
-      outputSettings
-    });
-    
-    // Get the Socket.IO instance from global scope (set by registerRoutes)
-    const io = (global as any).socketIo;
-    if (!io) {
-      return res.status(500).json({
-        success: false,
-        error: "Socket.IO not available"
-      });
-    }
-    
-    // Create video processor and trigger processing
-    const videoProcessor = new VideoProcessor(io);
-    console.log('🚀 Starting processing with mask data...');
-    console.log('📋 Processing parameters:', {
-      jobId: req.params.jobId,
-      jobType: job.jobType,
-      filePath: job.filePath,
-      hasMaskData: !!maskData,
-      hasOutputSettings: !!outputSettings,
-      maskType: maskData?.type,
-      maskCoordinates: maskData?.coordinates
-    });
-    
-    // Check job type and process accordingly
-    if (job.jobType === 'images') {
-      // Process image batch
-      const fileList = job.fileList as any[];
-      if (!fileList || fileList.length === 0) {
-        return res.status(400).json({ 
-          success: false, 
-          error: "No image files found in job" 
-        });
-      }
-      
-      // Construct file paths for images
-      const imagePaths = fileList.map((file: any) => `uploads/${file.filename}`);
-      
-      // Start image processing asynchronously
-      videoProcessor.processImages(
-        req.params.jobId,
-        imagePaths,
-        maskData,
-        outputSettings
-      ).catch(error => {
-        console.error("❌ Image processing error:", error);
-      });
-    } else {
-      // Process video (default behavior)
-      videoProcessor.processVideo(
-        req.params.jobId,
-        job.filePath,
-        maskData,
-        outputSettings,
-        samplingFps,
-      ).catch(error => {
-        console.error("❌ Video processing error:", error);
-      });
-    }
-    
-    console.log('=================================\n');
-    res.json({ 
-      success: true, 
-      message: 'Processing started',
-      jobId: req.params.jobId 
-    });
-    
+    res.json({ success: true, message: 'Processing started', jobId: result.jobId });
   } catch (error) {
-    console.error("❌ Mask endpoint error:", error);
-    res.status(500).json({ 
-      success: false, 
-      error: error instanceof Error ? error.message : "Failed to store mask data" 
+    console.error("Mask endpoint error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Failed to store mask data"
     });
   }
 });

@@ -47,6 +47,10 @@ export interface IStorage {
   getAiRun(jobId: string, runId: string): Promise<AIRun | undefined>;
   listAiRuns(jobId: string): Promise<AIRun[]>;
   deleteAiRun(jobId: string, runId: string): Promise<boolean>;
+
+  // Deletion
+  deleteVideoJob(id: string): Promise<boolean>;
+  deleteJobV2(jobId: string): Promise<boolean>;
 }
 
 export class MemStorage implements IStorage {
@@ -217,6 +221,14 @@ export class MemStorage implements IStorage {
     if (job.ai.runs.length === before) return false;
     this.jobsV2.set(jobId, job);
     return true;
+  }
+
+  async deleteVideoJob(id: string): Promise<boolean> {
+    return this.videoJobs.delete(id);
+  }
+
+  async deleteJobV2(jobId: string): Promise<boolean> {
+    return this.jobsV2.delete(jobId);
   }
 }
 
