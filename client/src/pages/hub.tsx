@@ -36,7 +36,7 @@ export default function HubPage() {
         <div className="text-center space-y-3">
           <AlertCircle className="mx-auto text-destructive" size={32} />
           <p className="text-sm text-muted-foreground">{error ?? "Job not found"}</p>
-          <Button variant="outline" onClick={() => navigate("/upload")}>
+          <Button variant="outline" onClick={() => window.location.assign("/upload")}>
             Back to Upload
           </Button>
         </div>
@@ -167,7 +167,7 @@ export default function HubPage() {
             icon={<Layers size={24} />}
             status={templateMaskStatus}
             disabled={!isReady}
-            onClick={() => navigate(`/jobs/${job.id}/template-mask`)}
+            onClick={() => navigate("/template-mask")}
           />
 
           {/* Tile 2: Classify or Label — disabled */}
@@ -185,7 +185,7 @@ export default function HubPage() {
             icon={<Brain size={24} />}
             status={aiStatus}
             disabled={!isReady}
-            onClick={() => navigate(`/jobs/${job.id}/ai`)}
+            onClick={() => navigate("/ai")}
           />
         </div>
       </main>

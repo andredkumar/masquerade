@@ -139,7 +139,7 @@ export default function AiSpokePage() {
             variant="ghost"
             size="sm"
             className="gap-1"
-            onClick={() => navigate(`/jobs/${jobId}`)}
+            onClick={() => navigate("/")}
           >
             <ArrowLeft size={16} />
             Back to job
