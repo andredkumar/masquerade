@@ -43,32 +43,6 @@ function findRunByLabelId(runs: AIRun[], labelId: string): AIRun | undefined {
   return runs.find(r => r.labels.some(l => l.id === labelId));
 }
 
-/**
- * Ensure a Job exists in the hub-and-spoke store (jobsV2). Lazily creates
- * one from the legacy VideoJob on first AI run. Phase 3d will move this
- * to the upload handler.
- */
-async function ensureJobV2(jobId: string, videoJob: { filename: string; createdAt?: string | null; duration: number; width: number; height: number; frameRate: number; totalFrames: number; jobType?: string }): Promise<Job> {
-  const existing = await storage.getJobV2(jobId);
-  if (existing) return existing;
-  return storage.createJobV2({
-    id: jobId,
-    filename: videoJob.filename,
-    uploadedAt: videoJob.createdAt || new Date().toISOString(),
-    phiStatus: 'raw',
-    source: {
-      duration: videoJob.duration,
-      width: videoJob.width,
-      height: videoJob.height,
-      frameRate: videoJob.frameRate,
-      totalFrames: videoJob.totalFrames,
-      type: videoJob.jobType === 'images' ? 'image_batch' : 'video',
-    },
-    extractionRate: videoJob.frameRate,
-    status: 'ready',
-    errorMessage: null,
-  });
-}
 
 const upload = multer({
   dest: 'uploads/',
@@ -154,7 +128,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // This endpoint has been moved to server/index.ts to avoid Vite interception
 
   // Upload video file and create job
-  app.post("/api/videos/upload", upload.single('video'), async (req, res) => {
+  const videoUploadHandler: import('express').RequestHandler = async (req, res) => {
     // If the client disconnects after multer finished writing but before we
     // returned a response, the partial-but-valid file at uploads/<hash> would
     // otherwise leak. Delete it on abort. Idempotent — a successful response
@@ -167,18 +141,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "No video file uploaded" });
       }
 
+      // Phase 3d: read optional phiStatus / attestationRecord from body
+      const phiStatus: 'raw' | 'user_attested' = req.body.phiStatus === 'user_attested' ? 'user_attested' : 'raw';
+      const attestationRecord = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+
       // Check if this is a DICOM file for optimized workflow
       const isDicom = await frameExtractor.isDicomFile(req.file.path);
-      
+
       if (isDicom) {
         console.log('🏥 DICOM DETECTED: Starting optimized DICOM workflow');
-        
+
         // STEP 1: Extract first frame IMMEDIATELY (fast DICOM first frame)
         const firstFrameBuffer = await frameExtractor.extractFirstFrame(req.file.path);
-        
+
         // STEP 2: Extract only basic metadata quickly (no full analysis yet)
         const quickMetadata = await frameExtractor.extractVideoMetadata(req.file.path);
-        
+
         // Create video job with initial data
         const jobData = {
           filename: req.file.originalname,
@@ -196,7 +174,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
         };
 
         const job = await storage.createVideoJob(jobData);
-        
+
+        // Phase 3d: create hub-and-spoke Job record eagerly
+        const extractionRate = typeof req.body.samplingFps === 'number' && req.body.samplingFps > 0
+          ? req.body.samplingFps : quickMetadata.frameRate;
+        await storage.createJobV2({
+          id: job.id,
+          filename: req.file.originalname,
+          uploadedAt: new Date().toISOString(),
+          phiStatus,
+          ...(attestationRecord ? { attestationRecord } : {}),
+          source: {
+            duration: quickMetadata.duration,
+            width: quickMetadata.width,
+            height: quickMetadata.height,
+            frameRate: quickMetadata.frameRate,
+            totalFrames: quickMetadata.totalFrames,
+            type: 'video',
+          },
+          extractionRate,
+          status: 'extracting',
+          errorMessage: null,
+        });
+
         // STEP 3: Return first frame immediately to user for fast display
         res.json({
           jobId: job.id,
@@ -212,7 +212,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           },
           firstFrame: `data:image/png;base64,${firstFrameBuffer.toString('base64')}`
         });
-        
+
         // STEP 4: Continue background processing asynchronously (pause/resume concept)
         console.log('🚀 DICOM: First frame displayed, continuing background extraction');
         const dicomFilePath = req.file.path;
@@ -230,10 +230,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Standard video file workflow (MP4, MOV, AVI)
       console.log('🎬 STANDARD VIDEO: Starting regular video workflow');
-      
+
       // Extract basic metadata
       const metadata = await frameExtractor.extractVideoMetadata(req.file.path);
-      
+
       // Create video job
       const jobData = {
         filename: req.file.originalname,
@@ -252,9 +252,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const job = await storage.createVideoJob(jobData);
 
+      // Phase 3d: create hub-and-spoke Job record eagerly
+      const extractionRate = typeof req.body.samplingFps === 'number' && req.body.samplingFps > 0
+        ? req.body.samplingFps : metadata.frameRate;
+      await storage.createJobV2({
+        id: job.id,
+        filename: req.file.originalname,
+        uploadedAt: new Date().toISOString(),
+        phiStatus,
+        ...(attestationRecord ? { attestationRecord } : {}),
+        source: {
+          duration: metadata.duration,
+          width: metadata.width,
+          height: metadata.height,
+          frameRate: metadata.frameRate,
+          totalFrames: metadata.totalFrames,
+          type: 'video',
+        },
+        extractionRate,
+        status: 'extracting',
+        errorMessage: null,
+      });
+
       // Extract first frame for masking
       const firstFrameBuffer = await frameExtractor.extractFirstFrame(req.file.path);
-      
+
       // 🚀 START BACKGROUND EXTRACTION OF ALL FRAMES IMMEDIATELY
       console.log('🚀 STARTING BACKGROUND FRAME EXTRACTION FOR ALL', metadata.totalFrames, 'FRAMES');
       const stdFilePath = req.file.path;
@@ -266,7 +288,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             void deleteUploadFile(stdFilePath);
           });
       });
-      
+
       res.json({
         jobId: job.id,
         metadata: {
@@ -290,10 +312,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         error: error instanceof Error ? error.message : "Upload failed"
       });
     }
-  });
+  };
+  app.post("/api/videos/upload", upload.single('video'), videoUploadHandler);   // legacy
+  app.post("/api/uploads/video", upload.single('video'), videoUploadHandler);   // canonical
 
   // Upload multiple image files and create job
-  app.post("/api/images/upload", imageUpload.array('images'), async (req, res) => {
+  const imageUploadHandler: import('express').RequestHandler = async (req, res) => {
     // Snapshot the multer-written paths BEFORE any await so the abort listener
     // and the catch block both have access even if the body-handler short-circuits.
     const uploadedFiles = (req.files as Express.Multer.File[] | undefined) || [];
@@ -308,9 +332,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "No image files uploaded" });
       }
 
+      // Phase 3d: read optional phiStatus / attestationRecord from body
+      const phiStatus: 'raw' | 'user_attested' = req.body.phiStatus === 'user_attested' ? 'user_attested' : 'raw';
+      const attestationRecord = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+
       // Get dimensions of the first image to set as base dimensions
       const firstImageMetadata = await frameExtractor.getImageDimensions(files[0].path);
-      
+
       // Create file info array
       const fileList: FileInfo[] = [];
       for (const file of files) {
@@ -324,7 +352,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           height: imageMeta.height
         });
       }
-      
+
       // Create image batch job
       const jobData = {
         filename: `${files.length}_images_batch`,
@@ -346,9 +374,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const job = await storage.createVideoJob(jobData);
 
+      // Phase 3d: create hub-and-spoke Job record eagerly
+      await storage.createJobV2({
+        id: job.id,
+        filename: `${files.length}_images_batch`,
+        uploadedAt: new Date().toISOString(),
+        phiStatus,
+        ...(attestationRecord ? { attestationRecord } : {}),
+        source: {
+          duration: 0,
+          width: firstImageMetadata.width,
+          height: firstImageMetadata.height,
+          frameRate: 1,
+          totalFrames: files.length,
+          type: 'image_batch',
+        },
+        extractionRate: 1, // 1 "frame" per image — no sampling for image batches
+        status: 'ready',
+        errorMessage: null,
+      });
+
       // Convert first image to base64 for display
       const firstImageBuffer = await frameExtractor.getImageAsBuffer(files[0].path);
-      
+
       res.json({
         jobId: job.id,
         metadata: {
@@ -373,7 +421,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         error: error instanceof Error ? error.message : "Image upload failed"
       });
     }
-  });
+  };
+  app.post("/api/images/upload", imageUpload.array('images'), imageUploadHandler);   // legacy
+  app.post("/api/uploads/images", imageUpload.array('images'), imageUploadHandler);  // canonical
 
   // Get job status and progress
   const getJobHandler: import('express').RequestHandler = async (req, res) => {
@@ -858,7 +908,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const runOutputDir = path.join(SPOKE_AI_DIR, jobId, runId);
       await fsPromises.mkdir(runOutputDir, { recursive: true });
 
-      await ensureJobV2(jobId, job);
+      // Phase 3d: Job record must exist (created eagerly at upload time).
+      const jobV2 = await storage.getJobV2(jobId);
+      if (!jobV2) {
+        return res.status(400).json({ error: 'Job record not found — upload may have failed or server restarted since upload' });
+      }
       const existingRuns = await storage.listAiRuns(jobId);
       const newLabelId = randomUUID();
 

@@ -27,8 +27,7 @@ export interface IStorage {
   getProcessingProgress(jobId: string): Promise<ProcessingProgress | undefined>;
   updateProcessingProgress(jobId: string, progress: Partial<ProcessingProgress>): Promise<void>;
 
-  // ── Hub-and-spoke methods (Phase 2 plumbing) ──────────────────────────
-  // No callers yet — wired up in Phase 3.
+  // ── Hub-and-spoke methods ──────────────────────────────────────────────
 
   // Job V2 (hub-and-spoke shape)
   createJobV2(job: Job): Promise<Job>;

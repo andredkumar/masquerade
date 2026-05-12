@@ -1,5 +1,7 @@
 # Masquerade
 
+**Phase 3d landed (May 2026):** Upload handlers create `Job` records eagerly. New upload URLs added (`POST /api/uploads/video`, `POST /api/uploads/images`); legacy URLs preserved. `phiStatus` and `attestationRecord` plumbing added (defaults to `'raw'` when frontend doesn't send it). `ensureJobV2` bridge removed. `samplingFps` recorded as `Job.extractionRate`. This completes the backend refactor; Phase 4 is frontend migration.
+
 **Phase 3c landed (May 2026):** Endpoint URL hierarchy migrated. New `/api/jobs/:jobId/...` URLs added; old URLs preserved as aliases. Four net-new CRUD endpoints: `DELETE /api/jobs/:jobId`, `GET /api/jobs/:jobId/ai/runs`, `PATCH /api/jobs/:jobId/ai/runs/:runId`, `DELETE /api/jobs/:jobId/ai/runs/:runId`. Path C download: `GET /api/jobs/:jobId/ai/runs/:runId/download`. Template-mask apply alias: `POST /api/jobs/:jobId/template-mask/apply`. Frontend still uses old URLs; Phase 4 migrates.
 
 **Phase 3b landed (May 2026):** AI inference now persists mask/overlay PNGs to disk under `spokes/ai/<jobId>/<runId>/`. Each `/api/ai/infer` call creates an `AIRun` record. `maskArtifactStore.ts` deleted — all mask/overlay reads come from disk. Dual-write: every `AiLabel` goes to both `AIRun.labels[]` and `job.aiLabels[]` for backward compat. Zero endpoint URL changes, zero frontend changes.
@@ -22,14 +24,16 @@ types"):
 - `LabelingState` — Path B (placeholder, shape TBD)
 
 `MemStorage` in `server/storage.ts` has methods for these types (`getJobV2`,
-`setTemplateMaskState`, `addAiRun`, etc.). Phase 3b wired `createJobV2`,
-`addAiRun`, `updateAiRun`, `getAiRun`, `listAiRuns`, `deleteAiRun` into
-the AI inference and label endpoints.
+`setTemplateMaskState`, `addAiRun`, etc.). Phase 3b wired AI run methods
+into inference/label endpoints. Phase 3d wired `createJobV2` into upload
+handlers — every job now has a `Job` record from the moment it's uploaded.
+The `ensureJobV2` bridge is removed.
 
 The existing `VideoJob`, `MaskData`, `OutputSettings`, and `AiLabel` types
-remain the active runtime types until Phase 3 completes the migration.
+remain the active runtime types alongside `Job` until Phase 4 completes
+the frontend migration.
 
-## URL hierarchy (Phase 3c)
+## URL hierarchy (Phase 3c + 3d)
 
 New canonical URLs follow a resource hierarchy. Old URLs are preserved as
 aliases (same handler, two registrations). Frontend still uses old URLs;
@@ -37,6 +41,8 @@ Phase 4 migrates.
 
 | Legacy URL (alias) | Canonical URL | Method |
 |---|---|---|
+| `POST /api/videos/upload` | `POST /api/uploads/video` | Video upload |
+| `POST /api/images/upload` | `POST /api/uploads/images` | Image batch upload |
 | `GET /api/videos/:jobId` | `GET /api/jobs/:jobId` | Job state |
 | `GET /api/videos/:jobId/download` | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
 | `PATCH /internal/mask-processing/:jobId` | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger |
@@ -55,6 +61,19 @@ Net-new (no legacy alias):
 | `DELETE /api/jobs/:jobId/ai/runs/:runId` | DELETE | Delete a run + artifacts |
 | `GET /api/jobs/:jobId/ai/runs/:runId/download` | GET | Download run as ZIP |
 | `DELETE /api/jobs/:jobId` | DELETE | Delete job + all artifacts |
+
+## Upload body shape (Phase 3d)
+
+Both upload endpoints accept optional `phiStatus` and `attestationRecord`
+fields in the request body (multipart form data). The frontend does not
+send these yet — Phase 4 wires the attestation UI.
+
+- `phiStatus`: `'raw'` (default) or `'user_attested'`. Defaults to `'raw'`
+  when absent.
+- `attestationRecord`: `{ checked: boolean, timestamp: string, text: string }`.
+  Only meaningful when `phiStatus === 'user_attested'`.
+- `samplingFps`: Optional number. Recorded as `Job.extractionRate`. Defaults
+  to the video's native frame rate (or 1 for image batches).
 
 ## Disk lifecycle
 
