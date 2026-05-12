@@ -156,11 +156,10 @@ export interface AiLabel {
 // MemStorage; Drizzle table changes will be reconciled in the Postgres
 // migration (separate from this refactor).
 
-/** PHI attestation record, stored on the Job when user attests PHI is removed. */
+/** PHI attestation record, stored on the Job when user attests PHI status. */
 export interface AttestationRecord {
-  checked: boolean;
-  timestamp: string;
-  text: string; // verbatim attestation copy shown to user
+  attestedAt: string; // ISO 8601 timestamp
+  choice: 'contains_phi' | 'no_phi';
 }
 
 /** Source media metadata, set at upload time. */

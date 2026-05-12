@@ -1,6 +1,29 @@
 # Masquerade
 
+**Phase 4a landed (May 2026):** Routing scaffolding, upload page, hub page. New routes: `/upload`, `/jobs/:jobId`, `/jobs/:jobId/template-mask`, `/jobs/:jobId/ai`. `/` now redirects to `/upload`. New `GET /api/jobs/:jobId` endpoint returns the `Job` V2 record (hub-and-spoke shape) from `jobsV2` MemStorage — the legacy `GET /api/videos/:jobId` still returns `VideoJob`. `JobContext` provider wraps all `/jobs/:jobId/*` routes, fetching job data and refetching on Socket.IO progress events. Upload page includes PHI attestation (radio group: "No PHI" / "Contains PHI") and sends `phiStatus: 'user_attested'` + `attestationRecord: { attestedAt, choice }` on POST. Hub page shows status strip (filename, PHI badge, source metadata), initializing panel (during extraction), and three spoke tiles (Template Mask, Classify or Label — disabled/"Coming soon", Run AI Models). Spoke pages are hybrid wrappers: they render the existing legacy UI components (`MaskingCanvas`, `MaskingTools`, `ProcessingControls`, `CommandInput`, `TaskSelector`, `FrameViewer`) inside the new route structure. Legacy components continue to read from legacy URLs — canonical URL migration is 4b/4c work. `home.tsx` remains in the codebase, accessible at `/app`; deleted in 4d. `AttestationRecord` type updated to `{ attestedAt: string, choice: 'contains_phi' | 'no_phi' }`.
+
 **Phase 3d landed (May 2026):** Upload handlers create `Job` records eagerly. New upload URLs added (`POST /api/uploads/video`, `POST /api/uploads/images`); legacy URLs preserved. `phiStatus` and `attestationRecord` plumbing added (defaults to `'raw'` when frontend doesn't send it). `ensureJobV2` bridge removed. `samplingFps` recorded as `Job.extractionRate`. This completes the backend refactor; Phase 4 is frontend migration.
+
+## Post-refactor cleanup backlog
+
+Items deferred from Phases 1–3d. None are blocking Phase 4; all can be
+tackled independently in any order after Phase 4 frontend migration is
+verified.
+
+1. **Remove legacy URL aliases** — after Phase 4 frontend migration is verified, delete the old registrations: `POST /api/videos/upload`, `POST /api/images/upload`, `GET /api/videos/:jobId`, `GET /api/videos/:jobId/download`, `PATCH /internal/mask-processing/:jobId`, `POST /api/ai/infer`, `PATCH /api/ai/labels/:jobId/:labelId`, `DELETE /api/ai/labels/:jobId/:labelId`, `GET /api/jobs/:jobId/masks/:labelId/:n.png`, `GET /api/jobs/:jobId/overlays/:labelId/:n.png`.
+2. **Remove legacy thin-wrapper from `server/index.ts`** — the `PATCH /internal/mask-processing/:jobId` handler in `index.ts` delegates to the shared function in `server/handlers/templateMaskApply.ts`. After item 1, delete the wrapper from `index.ts`; keep the shared function and the canonical route in `routes.ts`.
+3. **Rename `tempFolderManager.ts`** — it manages `spokes/template_mask/`, not `temp_processed/`. Name no longer reflects purpose post-3a.
+4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days.
+5. **Fix path-traversal guard in `TempFolderManager`** — Phase 1 surprise. Security concern: the `resolve + startsWith` check may be bypassable. Audit and harden.
+6. **Fix global progress broadcast** — `videoProcessor.ts:999` broadcasts to all connected sockets instead of the job's room. Info leak / scalability issue (Phase 1 surprise).
+7. **Remove dead code at `routes.ts:361`** — Phase 1 surprise.
+8. **Remove debug endpoints** — `POST /api/test-post` and `POST /test-non-api` (Phase 1 surprise).
+9. **Update stale `videoProcessor.ts` comments** — lines 371 and 643 still mention `temp_processed/{jobId}/` (deferred from Phase 3a).
+10. **Add `deleteProcessingProgress(jobId)` cleanup on job delete** — `DELETE /api/jobs/:jobId` removes VideoJob and Job records but doesn't clear the processing progress map entry (deferred from Phase 3c).
+11. **`PgStorage` stub maintenance** — decide whether to keep throw-stubs vs. remove `PgStorage` entirely. All runtime storage is `MemStorage` (deferred since Phase 2).
+12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
+13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
+14. **Delete `home.tsx` and any other legacy step containers in 4d** — after 4b/4c migrate spoke contents to canonical URLs, `home.tsx` and the `/app` route can be removed.
 
 **Phase 3c landed (May 2026):** Endpoint URL hierarchy migrated. New `/api/jobs/:jobId/...` URLs added; old URLs preserved as aliases. Four net-new CRUD endpoints: `DELETE /api/jobs/:jobId`, `GET /api/jobs/:jobId/ai/runs`, `PATCH /api/jobs/:jobId/ai/runs/:runId`, `DELETE /api/jobs/:jobId/ai/runs/:runId`. Path C download: `GET /api/jobs/:jobId/ai/runs/:runId/download`. Template-mask apply alias: `POST /api/jobs/:jobId/template-mask/apply`. Frontend still uses old URLs; Phase 4 migrates.
 
@@ -39,11 +62,12 @@ New canonical URLs follow a resource hierarchy. Old URLs are preserved as
 aliases (same handler, two registrations). Frontend still uses old URLs;
 Phase 4 migrates.
 
-| Legacy URL (alias) | Canonical URL | Method |
-|---|---|---|
-| `POST /api/videos/upload` | `POST /api/uploads/video` | Video upload |
-| `POST /api/images/upload` | `POST /api/uploads/images` | Image batch upload |
-| `GET /api/videos/:jobId` | `GET /api/jobs/:jobId` | Job state |
+| Legacy URL (alias) | Canonical URL | Method | Notes |
+|---|---|---|---|
+| `POST /api/videos/upload` | `POST /api/uploads/video` | Video upload | |
+| `POST /api/images/upload` | `POST /api/uploads/images` | Image batch upload | |
+| `GET /api/videos/:jobId` | — | Legacy job state | Returns `VideoJob` + progress |
+| — | `GET /api/jobs/:jobId` | Job V2 state | Returns `Job` (hub-and-spoke shape). **Split from legacy in 4a** — these are now separate handlers. |
 | `GET /api/videos/:jobId/download` | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
 | `PATCH /internal/mask-processing/:jobId` | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger |
 | `POST /api/ai/infer` | `POST /api/jobs/:jobId/ai/runs` | Create AI run |
@@ -70,8 +94,8 @@ send these yet — Phase 4 wires the attestation UI.
 
 - `phiStatus`: `'raw'` (default) or `'user_attested'`. Defaults to `'raw'`
   when absent.
-- `attestationRecord`: `{ checked: boolean, timestamp: string, text: string }`.
-  Only meaningful when `phiStatus === 'user_attested'`.
+- `attestationRecord`: `{ attestedAt: string, choice: 'contains_phi' | 'no_phi' }`.
+  Only meaningful when `phiStatus === 'user_attested'`. Updated in Phase 4a.
 - `samplingFps`: Optional number. Recorded as `Job.extractionRate`. Defaults
   to the video's native frame rate (or 1 for image batches).
 

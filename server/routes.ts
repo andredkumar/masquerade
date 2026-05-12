@@ -143,7 +143,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Phase 3d: read optional phiStatus / attestationRecord from body
       const phiStatus: 'raw' | 'user_attested' = req.body.phiStatus === 'user_attested' ? 'user_attested' : 'raw';
-      const attestationRecord = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+      const rawAttestation = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+      const attestationRecord = typeof rawAttestation === 'string' ? JSON.parse(rawAttestation) : rawAttestation;
 
       // Check if this is a DICOM file for optimized workflow
       const isDicom = await frameExtractor.isDicomFile(req.file.path);
@@ -334,7 +335,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Phase 3d: read optional phiStatus / attestationRecord from body
       const phiStatus: 'raw' | 'user_attested' = req.body.phiStatus === 'user_attested' ? 'user_attested' : 'raw';
-      const attestationRecord = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+      const rawAttestation = phiStatus === 'user_attested' ? req.body.attestationRecord : undefined;
+      const attestationRecord = typeof rawAttestation === 'string' ? JSON.parse(rawAttestation) : rawAttestation;
 
       // Get dimensions of the first image to set as base dimensions
       const firstImageMetadata = await frameExtractor.getImageDimensions(files[0].path);
@@ -426,7 +428,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/uploads/images", imageUpload.array('images'), imageUploadHandler);  // canonical
 
   // Get job status and progress
-  const getJobHandler: import('express').RequestHandler = async (req, res) => {
+  // Legacy: returns VideoJob + progress (unchanged from Phase 1)
+  const getLegacyJobHandler: import('express').RequestHandler = async (req, res) => {
     try {
       const job = await storage.getVideoJob(req.params.jobId);
       if (!job) {
@@ -447,8 +450,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   };
-  app.get("/api/videos/:jobId", getJobHandler);  // legacy alias
-  app.get("/api/jobs/:jobId", getJobHandler);    // canonical
+  app.get("/api/videos/:jobId", getLegacyJobHandler);  // legacy alias
+
+  // Canonical: returns Job V2 (hub-and-spoke shape) from jobsV2 MemStorage
+  const getJobV2Handler: import('express').RequestHandler = async (req, res) => {
+    try {
+      const job = await storage.getJobV2(req.params.jobId);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      res.json(job);
+    } catch (error) {
+      console.error("Get job V2 error:", error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Failed to get job"
+      });
+    }
+  };
+  app.get("/api/jobs/:jobId", getJobV2Handler);  // canonical — returns Job V2
 
   // Start video processing with mask data
   app.post("/api/videos/:jobId/process", async (req, res) => {
