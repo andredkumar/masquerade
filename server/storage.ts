@@ -12,6 +12,29 @@ import {
 } from "@shared/schema";
 import { randomUUID } from "crypto";
 
+/**
+ * Maps legacy VideoJob.status values to the Job V2 status field.
+ * Returns undefined for unknown values (leave V2 unchanged).
+ */
+function mapVideoJobStatusToJobStatus(
+  videoJobStatus: string,
+): Job['status'] | undefined {
+  switch (videoJobStatus) {
+    case 'uploaded':
+    case 'extracting':
+      return 'extracting';
+    case 'ready':
+    case 'masking':
+    case 'processing':
+    case 'completed':
+      return 'ready';
+    case 'failed':
+      return 'failed';
+    default:
+      return undefined;
+  }
+}
+
 export interface IStorage {
   // Video Jobs
   createVideoJob(job: InsertVideoJob): Promise<VideoJob>;
@@ -95,9 +118,23 @@ export class MemStorage implements IStorage {
   async updateVideoJob(id: string, updates: Partial<VideoJob>): Promise<VideoJob | undefined> {
     const job = this.videoJobs.get(id);
     if (!job) return undefined;
-    
+
     const updatedJob = { ...job, ...updates };
     this.videoJobs.set(id, updatedJob);
+
+    // Phase 4a hotfix: mirror status changes to the Job V2 record so the
+    // hub page (which reads Job V2) sees extraction completion.
+    if (updates.status) {
+      const v2Status = mapVideoJobStatusToJobStatus(updates.status);
+      if (v2Status) {
+        const jobV2 = this.jobsV2.get(id);
+        if (jobV2) {
+          jobV2.status = v2Status;
+          this.jobsV2.set(id, jobV2);
+        }
+      }
+    }
+
     return updatedJob;
   }
 
