@@ -11,6 +11,7 @@
 
 import { storage } from '../storage';
 import { VideoProcessor } from '../services/videoProcessor';
+import { TempFolderManager } from '../services/tempFolderManager';
 
 export type TemplateMaskApplyResult =
   | { ok: true; jobId: string }
@@ -49,6 +50,20 @@ export async function applyTemplateMask(
 
   // Persist mask + output settings on the job
   await storage.updateVideoJob(jobId, { maskData, outputSettings });
+
+  // Write Job.templateMask state so the hub tile shows "applying" immediately.
+  // Wrapped in try/catch — must not block the existing flow.
+  try {
+    await storage.setTemplateMaskState(jobId, {
+      status: 'applying',
+      maskData,
+      outputSettings,
+      outputDir: TempFolderManager.getJobTempFolder(jobId),
+      completedAt: null,
+    });
+  } catch (err) {
+    console.error('Failed to set templateMask state to applying:', err);
+  }
 
   if (!io) {
     return { ok: false, status: 500, error: 'Socket.IO not available' };

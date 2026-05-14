@@ -7,16 +7,18 @@ import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, FileVideo } from "lucide-react";
+import { ArrowLeft, FileVideo, Loader2, AlertCircle } from "lucide-react";
 import type { MaskData, OutputSettings } from "@shared/schema";
-import { getCachedFirstFrame, getCachedMetadata } from "@/lib/frameCache";
+
+type FrameStatus = "loading" | "ready" | "extracting" | "not_found" | "gone" | "error";
 
 export default function TemplateMaskSpokePage() {
-  const { job } = useJob();
+  const { job, refetch } = useJob();
   const [, navigate] = useLocation();
 
-  // Local state — mirrors what home.tsx manages for Steps 2-3
+  // Local state
   const [firstFrame, setFirstFrame] = useState<string | null>(null);
+  const [frameStatus, setFrameStatus] = useState<FrameStatus>("loading");
   const [maskData, setMaskData] = useState<MaskData | null>(null);
   const [selectedTool, setSelectedTool] = useState<string>("rectangle");
   const [canvasZoom, setCanvasZoom] = useState(75);
@@ -25,7 +27,7 @@ export default function TemplateMaskSpokePage() {
 
   const jobId = job?.id ?? "";
 
-  // Build videoMetadata from Job V2 source or cached upload response
+  // Build videoMetadata from Job V2 source
   const videoMetadata = job
     ? {
         duration: job.source.duration,
@@ -35,14 +37,52 @@ export default function TemplateMaskSpokePage() {
         totalFrames: job.source.totalFrames,
         filename: job.filename,
       }
-    : getCachedMetadata(jobId) ?? null;
+    : null;
 
-  // Load first frame from sessionStorage cache
-  useEffect(() => {
+  // Fetch first frame from the frames endpoint (Phase 4b — replaces sessionStorage cache)
+  const fetchFirstFrame = useCallback(async () => {
     if (!jobId) return;
-    const cached = getCachedFirstFrame(jobId);
-    if (cached) setFirstFrame(cached);
+    setFrameStatus("loading");
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/frames/0`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        setFirstFrame(url);
+        setFrameStatus("ready");
+      } else if (res.status === 503) {
+        setFrameStatus("extracting");
+      } else if (res.status === 404) {
+        setFrameStatus("not_found");
+      } else if (res.status === 410) {
+        setFrameStatus("gone");
+      } else {
+        setFrameStatus("error");
+      }
+    } catch {
+      setFrameStatus("error");
+    }
   }, [jobId]);
+
+  useEffect(() => {
+    fetchFirstFrame();
+  }, [fetchFirstFrame]);
+
+  // When job status transitions to 'ready' and we were waiting on extraction, retry the frame fetch
+  useEffect(() => {
+    if (frameStatus === "extracting" && job?.status === "ready") {
+      fetchFirstFrame();
+    }
+  }, [job?.status, frameStatus, fetchFirstFrame]);
+
+  // Auto-retry while extracting (poll every 3 seconds)
+  useEffect(() => {
+    if (frameStatus !== "extracting") return;
+    const timer = setInterval(() => {
+      refetch();
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [frameStatus, refetch]);
 
   // Monitor legacy job status for processing state transitions
   const { data: legacyJobData } = useQuery({
@@ -65,9 +105,66 @@ export default function TemplateMaskSpokePage() {
     if (!jobId || !maskData) return;
     setIsProcessing(true);
     setLastProcessedSettings(outputSettings);
+    // Refetch Job V2 so the hub tile reflects "applying" status immediately
+    refetch();
   };
 
+  // Clean up blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (firstFrame && firstFrame.startsWith("blob:")) {
+        URL.revokeObjectURL(firstFrame);
+      }
+    };
+  }, [firstFrame]);
+
   if (!job) return null;
+
+  // Error state UIs per requirement #4
+  if (frameStatus === "not_found") {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <AlertCircle className="mx-auto text-destructive" size={32} />
+          <p className="text-sm text-muted-foreground">Job not found</p>
+          <Button variant="outline" onClick={() => window.location.assign("/upload")}>
+            Back to Upload
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (frameStatus === "gone") {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center space-y-3 max-w-sm">
+          <AlertCircle className="mx-auto text-destructive" size={32} />
+          <p className="text-sm font-medium">Frames are no longer available</p>
+          <p className="text-xs text-muted-foreground">
+            The server may have restarted. Please re-upload your file.
+          </p>
+          <Button variant="outline" onClick={() => window.location.assign("/upload")}>
+            Back to Upload
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (frameStatus === "extracting") {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <Loader2 className="mx-auto animate-spin text-primary" size={32} />
+          <p className="text-sm font-medium">Frame extraction still in progress</p>
+          <p className="text-xs text-muted-foreground">
+            This will refresh automatically when ready.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
@@ -135,14 +232,20 @@ export default function TemplateMaskSpokePage() {
         {/* Main canvas area */}
         <main className="flex-1 flex flex-col">
           <div className="flex-1 p-6 relative">
-            <MaskingCanvas
-              firstFrame={firstFrame}
-              selectedTool={selectedTool}
-              onMaskUpdate={handleMaskUpdate}
-              zoom={canvasZoom}
-              onZoomChange={setCanvasZoom}
-              maskData={maskData}
-            />
+            {frameStatus === "loading" ? (
+              <div className="flex items-center justify-center h-full">
+                <Loader2 className="animate-spin text-muted-foreground" size={32} />
+              </div>
+            ) : (
+              <MaskingCanvas
+                firstFrame={firstFrame}
+                selectedTool={selectedTool}
+                onMaskUpdate={handleMaskUpdate}
+                zoom={canvasZoom}
+                onZoomChange={setCanvasZoom}
+                maskData={maskData}
+              />
+            )}
 
             {isProcessing && (
               <div className="absolute top-8 right-8 bg-card border border-border rounded-lg shadow-lg p-4 z-10">

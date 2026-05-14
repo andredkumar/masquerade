@@ -5,8 +5,6 @@ import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/hooks/use-toast";
 import { CloudUpload, FileVideo, FileImage, Rocket } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { cacheUploadData } from "@/lib/frameCache";
-
 type PhiChoice = "contains_phi" | "no_phi" | null;
 
 export default function UploadPage() {
@@ -140,10 +138,7 @@ export default function UploadPage() {
         },
       );
 
-      // Cache firstFrame + metadata for spoke pages
-      cacheUploadData(result.jobId, result.firstFrame, result.metadata);
-
-      // Navigate to hub — do NOT read ffprobe metadata from upload response
+      // Navigate to hub — spoke pages fetch frames from the frames endpoint (Phase 4b)
       navigate(`/jobs/${result.jobId}`);
     } catch (err) {
       console.error("Upload error:", err);

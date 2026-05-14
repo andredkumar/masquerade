@@ -389,6 +389,21 @@ export class VideoProcessor {
         completedAt: new Date().toISOString(),
       });
 
+      // Write Job.templateMask completion state (Phase 4b).
+      // Wrapped in try/catch — must not block the existing completion flow.
+      try {
+        const completedAt = new Date().toISOString();
+        await storage.setTemplateMaskState(jobId, {
+          status: 'complete',
+          maskData,
+          outputSettings,
+          outputDir: TempFolderManager.getJobTempFolder(jobId),
+          completedAt,
+        });
+      } catch (tmErr) {
+        console.error('Failed to set templateMask state to complete:', tmErr);
+      }
+
       await this.updateProgress(jobId, {
         stage: 'completed',
         progress: 100
@@ -404,6 +419,20 @@ export class VideoProcessor {
         status: 'failed',
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
+
+      // Write Job.templateMask failure state (Phase 4b).
+      // Wrapped in try/catch — must not block the existing failure flow.
+      try {
+        await storage.setTemplateMaskState(jobId, {
+          status: 'failed',
+          maskData,
+          outputSettings,
+          outputDir: TempFolderManager.getJobTempFolder(jobId),
+          completedAt: null,
+        });
+      } catch (tmErr) {
+        console.error('Failed to set templateMask state to failed:', tmErr);
+      }
 
       await this.updateProgress(jobId, {
         stage: 'failed',
@@ -652,6 +681,20 @@ export class VideoProcessor {
         completedAt: new Date().toISOString(),
       });
 
+      // Write Job.templateMask completion state (Phase 4b).
+      try {
+        const completedAt = new Date().toISOString();
+        await storage.setTemplateMaskState(jobId, {
+          status: 'complete',
+          maskData,
+          outputSettings,
+          outputDir: TempFolderManager.getJobTempFolder(jobId),
+          completedAt,
+        });
+      } catch (tmErr) {
+        console.error('Failed to set templateMask state to complete (images):', tmErr);
+      }
+
       await this.updateProgress(jobId, {
         stage: 'completed',
         progress: 100
@@ -667,6 +710,19 @@ export class VideoProcessor {
         status: 'failed',
         errorMessage: error instanceof Error ? error.message : 'Unknown error'
       });
+
+      // Write Job.templateMask failure state (Phase 4b).
+      try {
+        await storage.setTemplateMaskState(jobId, {
+          status: 'failed',
+          maskData,
+          outputSettings,
+          outputDir: TempFolderManager.getJobTempFolder(jobId),
+          completedAt: null,
+        });
+      } catch (tmErr) {
+        console.error('Failed to set templateMask state to failed (images):', tmErr);
+      }
 
       await this.updateProgress(jobId, {
         stage: 'failed',

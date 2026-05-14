@@ -2,6 +2,31 @@
 
 **Phase 4a landed (May 2026):** Routing scaffolding, upload page, hub page. New routes: `/upload`, `/jobs/:jobId`, `/jobs/:jobId/template-mask`, `/jobs/:jobId/ai`. `/` now redirects to `/upload`. New `GET /api/jobs/:jobId` endpoint returns the `Job` V2 record (hub-and-spoke shape) from `jobsV2` MemStorage — the legacy `GET /api/videos/:jobId` still returns `VideoJob`. `JobContext` provider wraps all `/jobs/:jobId/*` routes, fetching job data and refetching on Socket.IO progress events. Upload page includes PHI attestation (radio group: "No PHI" / "Contains PHI") and sends `phiStatus: 'user_attested'` + `attestationRecord: { attestedAt, choice }` on POST. Hub page shows status strip (filename, PHI badge, source metadata), initializing panel (during extraction), and three spoke tiles (Template Mask, Classify or Label — disabled/"Coming soon", Run AI Models). Spoke pages are hybrid wrappers: they render the existing legacy UI components (`MaskingCanvas`, `MaskingTools`, `ProcessingControls`, `CommandInput`, `TaskSelector`, `FrameViewer`) inside the new route structure. Legacy components continue to read from legacy URLs — canonical URL migration is 4b/4c work. `home.tsx` remains in the codebase, accessible at `/app`; deleted in 4d. `AttestationRecord` type updated to `{ attestedAt: string, choice: 'contains_phi' | 'no_phi' }`.
 
+### Phase 4a landed (2026-05-12)
+
+- New wouter routes: `/upload`, `/jobs/:jobId`, `/jobs/:jobId/template-mask`, `/jobs/:jobId/ai`
+- `/` redirects to `/upload`. `/app` preserved as escape hatch to legacy `home.tsx`.
+- New `UploadPage` with PHI attestation (radio group: "Contains PHI" / "No PHI")
+- New `HubPage` with status strip, initializing panel, three spoke tiles
+- Spoke pages (`TemplateMaskSpokePage`, `AiSpokePage`) are hybrid wrappers around legacy components — to be replaced in 4b/4c
+- `JobContext` provider on `/jobs/:jobId/*` subtree, exposes `useJob()` hook
+- Backend: `GET /api/jobs/:jobId` returns `Job` V2 record (split from legacy `GET /api/videos/:jobId`)
+- `AttestationRecord` schema reshaped from `{ checked, timestamp, text }` to `{ attestedAt, choice }`
+- `JSON.parse(attestationRecord)` added to upload handlers (multer form-field gap fix from 3d)
+
+### Phase 4a hotfix 1 (2026-05-12)
+
+- `MemStorage.updateVideoJob` now mirrors `VideoJob.status` to `Job.status` via a new `mapVideoJobStatusToJobStatus` helper
+- Required because the new hub reads V2 status and tiles never unlocked otherwise
+- Status mapping: `uploaded/extracting → extracting`, `ready/masking/processing/completed → ready`, `failed → failed`
+- Fix lives entirely in `server/storage.ts`; `videoProcessor.ts` unchanged
+
+### Phase 4a hotfix 2 (2026-05-12)
+
+- Hub spoke-tile navigation switched from absolute paths (`/jobs/${jobId}/template-mask`) to relative paths (`/template-mask`)
+- Required because `HubPage` is rendered inside `<Route path="/jobs/:jobId" nest>`, and wouter prepends the nest base to absolute navigates, producing doubled URLs
+- Same fix may apply to any "Back to job" links in spoke wrappers; verify when migrating them
+
 **Phase 3d landed (May 2026):** Upload handlers create `Job` records eagerly. New upload URLs added (`POST /api/uploads/video`, `POST /api/uploads/images`); legacy URLs preserved. `phiStatus` and `attestationRecord` plumbing added (defaults to `'raw'` when frontend doesn't send it). `ensureJobV2` bridge removed. `samplingFps` recorded as `Job.extractionRate`. This completes the backend refactor; Phase 4 is frontend migration.
 
 ## Post-refactor cleanup backlog
@@ -24,6 +49,64 @@ verified.
 12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
 14. **Delete `home.tsx` and any other legacy step containers in 4d** — after 4b/4c migrate spoke contents to canonical URLs, `home.tsx` and the `/app` route can be removed.
+
+### Raw frames live in-memory, not on disk (`global.extractedFrames`)
+
+**Discovered:** Phase 4a deploy smoke testing, 2026-05-12.
+
+**State:** `processVideo` writes extracted frames as `Buffer`s into `global.extractedFrames: Map<jobId, Map<frameNumber, Buffer>>`. Nothing writes to `temp_extracted/<jobId>/` despite that directory existing, being defined as `TEMP_EXTRACTED_DIR` in the code, and being referenced in `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` as the raw-frame target. Several docs describe a disk-based raw-frame pipeline that doesn't exist in the actual code.
+
+**Volatility class:** Same as the pre-3b `maskArtifactStore`. PM2 restart wipes raw frames; jobs in `'ready'` state become un-maskable.
+
+**Fix candidates (future phase, not 4b):**
+- Move raw extraction to `temp_extracted/<jobId>/frame_<N>.png`
+- Add `GET /api/jobs/:jobId/frames/:n` reading from disk
+- Decommission `global.extractedFrames`
+
+**Implication for 4b:** The new frames endpoint in 4b reads from `global.extractedFrames` with an explicit comment marking the dependency. Don't add more in-memory caching.
+
+### `ANTHROPIC_API_KEY` invalid in production
+
+**Discovered:** Phase 4a deploy smoke testing, 2026-05-12.
+
+**State:** Server logs show repeated `401 invalid x-api-key` errors from `IntentParser.parseWithClaude`. NLP intent parser fallback non-functional in production. Keyword-rule path still works.
+
+**Fix:** Rotate the key in `~/.env` on `3.136.48.97`. Out of scope for Phase 4 refactor.
+
+### `temp_extracted/` documentation drift
+
+**Discovered:** Phase 4a deploy smoke testing, 2026-05-12.
+
+**State:** `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` claims raw frames extract to `temp_extracted/<jobId>/`. Code defines `TEMP_EXTRACTED_DIR`. Cleanup module includes `temp_extracted/` in `SWEEP_TARGETS`. None of these reflect reality: nothing writes to that directory. The directory exists but its mtime hasn't changed in days.
+
+**Risk:** Future agents read the doc, assume disk-based extraction, write code that reads from `temp_extracted/<jobId>/`, get empty results, waste time debugging. Exactly what happened in Phase 4a deploy.
+
+**Fix options:**
+1. Make docs match code: rewrite the upload doc, remove `temp_extracted/` from `SWEEP_TARGETS`, delete the unused directory.
+2. Make code match docs: implement actual disk extraction.
+
+**Recommendation:** Option 1 now (cheap), option 2 later as the "raw frames to disk" backlog item.
+
+### Hub job-level download action (deferred)
+
+**Discovered:** Phase 4a smoke testing surfaced that there's no download UI in the AI spoke (legacy `home.tsx` had download as a terminal step).
+
+**Decision:** Per-run downloads land in 4c (AI spoke). Hub job-level "Download all" deferred to 4d or post-Phase-4 cleanup; it's a design call (per-run vs per-job vs both) that doesn't block other work.
+
+### Three extraction paths exist
+
+**Discovered:** Phase 4b reconnaissance pass, 2026-05-12.
+
+**State:** The codebase has three independent frame-extraction implementations:
+1. `extractFirstFrame` — pulls just frame 0 at upload time for the response preview
+2. `startBackgroundFrameExtraction` → `global.extractedFrames` — batch-based, in-memory, populates after upload response
+3. `processVideo` → its own sequential disk staging directory — runs at template-mask apply time, independent of `global.extractedFrames`
+
+**Implication:** The masking canvas (after 4b) reads frame 0 from path #2. The actual mask application uses path #3. These are independent re-extractions of the same source video. ffmpeg is *usually* deterministic on frame 0 across these paths, but edge cases (encoder quirks, GOP boundaries, seek inaccuracy) could produce different bytes. A user could draw a mask aligned to one frame and have it applied to a subtly different one.
+
+**Severity:** Theoretical for typical ultrasound content. The three paths should be consolidated whenever the "raw frames to disk" backlog item is tackled — single extraction, single source of truth, consumed by everything downstream.
+
+**Future UX consideration:** A planned UX direction is showing the first frame on the upload page immediately while the rest of the video uploads/extracts in the background. Consolidating to a single extraction path supports this cleanly.
 
 **Phase 3c landed (May 2026):** Endpoint URL hierarchy migrated. New `/api/jobs/:jobId/...` URLs added; old URLs preserved as aliases. Four net-new CRUD endpoints: `DELETE /api/jobs/:jobId`, `GET /api/jobs/:jobId/ai/runs`, `PATCH /api/jobs/:jobId/ai/runs/:runId`, `DELETE /api/jobs/:jobId/ai/runs/:runId`. Path C download: `GET /api/jobs/:jobId/ai/runs/:runId/download`. Template-mask apply alias: `POST /api/jobs/:jobId/template-mask/apply`. Frontend still uses old URLs; Phase 4 migrates.
 

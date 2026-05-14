@@ -1550,6 +1550,55 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/jobs/:jobId/overlays/:labelId/:n.png", getOverlayHandler);                       // legacy alias
   app.get("/api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png", getOverlayHandler);        // canonical
 
+  // ── Frames endpoint (Phase 4b) ──────────────────────────────────────────
+
+  /**
+   * GET /api/jobs/:jobId/frames/:n — serve raw extracted frame as PNG.
+   *
+   * Reads from global.extractedFrames (in-memory Map populated by
+   * startBackgroundFrameExtraction). This is a volatile store — PM2 restart
+   * wipes it. See CLAUDE.md backlog: "Raw frames live in-memory".
+   */
+  app.get("/api/jobs/:jobId/frames/:n", async (req, res) => {
+    try {
+      const { jobId, n } = req.params;
+      const frameNumber = parseInt(n, 10);
+      if (isNaN(frameNumber) || frameNumber < 0) {
+        return res.status(400).json({ error: "Invalid frame number" });
+      }
+
+      const jobV2 = await storage.getJobV2(jobId);
+      if (!jobV2) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      if (jobV2.status === 'extracting') {
+        return res.status(503).json({ error: "Extraction in progress" });
+      }
+
+      // Read from the in-memory frame store (volatile — lost on restart)
+      const allFrames = (global as any).extractedFrames as Map<string, Map<number, Buffer>> | undefined;
+      const jobFrames = allFrames?.get(jobId);
+      if (!jobFrames) {
+        return res.status(410).json({
+          error: "Frames are no longer available. The server may have restarted.",
+        });
+      }
+
+      const buffer = jobFrames.get(frameNumber);
+      if (!buffer) {
+        return res.status(404).json({ error: "Frame not found" });
+      }
+
+      res.set("Content-Type", "image/png");
+      res.set("Cache-Control", "private, max-age=3600");
+      res.send(buffer);
+    } catch (error) {
+      console.error("frames/:n error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to serve frame" });
+    }
+  });
+
   // ── Net-new CRUD endpoints (Phase 3c) ──────────────────────────────────
 
   // POST /api/jobs/:jobId/template-mask/apply — canonical URL for template-mask

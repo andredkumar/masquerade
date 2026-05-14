@@ -81,9 +81,8 @@ export default function ProcessingControls({
         throw new Error('Missing job ID or mask data');
       }
 
-      // WORKAROUND: Use non-API route to completely bypass Vite
-      console.log('🔧 WORKAROUND: Using non-API route to completely bypass Vite...');
-      const response = await apiRequest('PATCH', `/internal/mask-processing/${jobId}`, {
+      // Phase 4b: canonical URL for template-mask apply
+      const response = await apiRequest('POST', `/api/jobs/${jobId}/template-mask/apply`, {
         maskData,
         outputSettings: settings,
         samplingFps,
