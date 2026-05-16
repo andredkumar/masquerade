@@ -9,7 +9,7 @@ import MaskingCanvas from "@/components/MaskingCanvas";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, FileVideo, Check, X, Trash2 } from "lucide-react";
 import type { MaskData, AiLabel } from "@shared/schema";
-import { getCachedFirstFrame, getCachedMetadata } from "@/lib/frameCache";
+import { getCachedMetadata } from "@/lib/frameCache";
 import { colorForLabelId } from "@/lib/labelColor";
 
 export default function AiSpokePage() {
@@ -39,11 +39,31 @@ export default function AiSpokePage() {
       }
     : getCachedMetadata(jobId) ?? null;
 
-  // Load first frame from sessionStorage cache
+  // Fetch first frame from frames endpoint (hotfix 3 — replaces sessionStorage cache)
   useEffect(() => {
     if (!jobId) return;
-    const cached = getCachedFirstFrame(jobId);
-    if (cached) setFirstFrame(cached);
+    let revoked = false;
+    let blobUrl: string | null = null;
+
+    fetch(`/api/jobs/${jobId}/frames/0`)
+      .then((res) => {
+        if (!res.ok || revoked) return null;
+        return res.blob();
+      })
+      .then((blob) => {
+        if (!blob || revoked) return;
+        blobUrl = URL.createObjectURL(blob);
+        setFirstFrame(blobUrl);
+      })
+      .catch(() => {
+        // On any error, firstFrame stays null (blank canvas). Full error
+        // state UX is 4c scope; this hotfix just restores the data source.
+      });
+
+    return () => {
+      revoked = true;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
   }, [jobId]);
 
   // Check legacy job status to determine if Step 4 is unlocked
