@@ -49,6 +49,7 @@ verified.
 12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
 14. **Delete `home.tsx` and any other legacy step containers in 4d** — after 4b/4c migrate spoke contents to canonical URLs, `home.tsx` and the `/app` route can be removed.
+15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX.
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`)
 

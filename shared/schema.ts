@@ -225,7 +225,7 @@ export interface AIState {
 export interface AIRun {
   id: string; // UUID
   name: string; // user-supplied or auto-generated
-  inputSource: 'extracted' | 'template_mask'; // which frames it ran against
+  inputSource: 'extracted' | 'template_mask' | 'raw'; // which frames it ran against
   modality: Modality | null;
   bbox: { x1: number; y1: number; x2: number; y2: number } | null;
   target: string; // user's prompt label

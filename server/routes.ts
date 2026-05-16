@@ -16,6 +16,7 @@ import {
   cleanupJobArtifacts,
   SWEEP_TARGETS,
   SPOKE_AI_DIR,
+  SPOKE_TEMPLATE_MASK_DIR,
 } from "./services/cleanup";
 import {
   resolveFramePath,
@@ -902,17 +903,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Collect all frames from spokes/template_mask/{jobId}/ — inference runs on ALL of them.
-      //    Dedupe (by filename) and sort, then use each file's POSITION in this list as
-      //    its canonical frame number for the rest of the pipeline. We deliberately do
-      //    NOT parse the integer out of the filename, because upstream ffmpeg vfr/batch
-      //    extraction can leave holes or duplicates in the filename-embedded numbers,
-      //    which would surface as "repeated confidence values" in the manifest.
+      // 3. Collect frames for inference. Try template-masked frames first (on disk),
+      //    then fall back to raw frames from global.extractedFrames (in-memory).
+      //    Hotfix 4: spoke independence — AI can run without a template mask applied.
       const { dir: tempDir, files: frameFileNames } = await listFrameFiles(jobId);
 
-      // Fall back to request-body frame if temp folder is empty (single-frame path)
-      const singleFrameFallback = !frameFileNames.length && frameBase64;
-      if (!frameFileNames.length && !singleFrameFallback) {
+      // Check if raw frames are available as a fallback
+      const allExtractedFrames = (global as any).extractedFrames as Map<string, Map<number, Buffer>> | undefined;
+      const rawFrameMap = allExtractedFrames?.get(jobId);
+      const useRawFrames = !frameFileNames.length && rawFrameMap && rawFrameMap.size > 0;
+
+      // Fall back to request-body frame if neither disk nor memory frames exist
+      const singleFrameFallback = !frameFileNames.length && !useRawFrames && frameBase64;
+      if (!frameFileNames.length && !useRawFrames && !singleFrameFallback) {
         return res.status(400).json({
           error: "No frames available — upload and process a video first, or send frameBase64",
         });
@@ -939,7 +942,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const run: AIRun = {
         id: runId,
         name: `Run ${existingRuns.length + 1}`,
-        inputSource: 'template_mask',
+        inputSource: useRawFrames ? 'raw' : 'template_mask',
         modality: resolvedModality,
         bbox: bbox && typeof bbox.x1 === 'number' ? { x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2 } : null,
         target: parsedIntent.target || 'unknown',
@@ -957,7 +960,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const metaFrameResults: Record<number, { confidence: number }> = {};
       let firstResult: { maskBase64: string; overlayBase64?: string; confidence: number; modelUsed: string; inferenceMs: number } | null = null;
-      const totalFrames = frameFileNames.length || 1;
+      const rawFrameKeys = useRawFrames ? Array.from(rawFrameMap!.keys()).sort((a, b) => a - b) : [];
+      const totalFrames = frameFileNames.length || rawFrameKeys.length || 1;
 
       if (singleFrameFallback) {
         // Single-frame path (no temp folder yet)
@@ -978,7 +982,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
         await Promise.all(writes);
         metaFrameResults[0] = { confidence: r.confidence };
         firstResult = r;
+      } else if (useRawFrames) {
+        // Raw frames path (in-memory, no template mask applied). Hotfix 4.
+        for (let i = 0; i < rawFrameKeys.length; i++) {
+          const frameKey = rawFrameKeys[i];
+
+          io?.to(jobId).emit('inference-progress', { jobId, current: i + 1, total: totalFrames });
+
+          const b64 = rawFrameMap!.get(frameKey)!.toString('base64');
+
+          const r = await aiClient.infer({
+            modelConfig,
+            imageBase64: b64,
+            intent: parsedIntent,
+            jobId,
+            bbox: bbox || null,
+            useAutoPrompt: typeof useAutoPrompt === 'boolean' ? useAutoPrompt : (bbox == null),
+            modality: resolvedModality,
+          });
+
+          // Write mask/overlay to disk per-frame, discard base64 immediately
+          const writes: Promise<void>[] = [];
+          writes.push(fsPromises.writeFile(path.join(runOutputDir, `mask_${i}.png`), Buffer.from(r.maskBase64, 'base64')));
+          if (r.overlayBase64) writes.push(fsPromises.writeFile(path.join(runOutputDir, `overlay_${i}.png`), Buffer.from(r.overlayBase64, 'base64')));
+          await Promise.all(writes);
+
+          metaFrameResults[i] = { confidence: r.confidence };
+          if (i === 0) firstResult = r;
+        }
       } else {
+        // Masked frames path (on disk in spokes/template_mask/)
         for (let i = 0; i < frameFileNames.length; i++) {
           const filename = frameFileNames[i];
 
@@ -1553,15 +1586,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ── Frames endpoint (Phase 4b) ──────────────────────────────────────────
 
   /**
-   * GET /api/jobs/:jobId/frames/:n — serve raw extracted frame as PNG.
+   * GET /api/jobs/:jobId/frames/:n — serve a frame as PNG.
    *
-   * Reads from global.extractedFrames (in-memory Map populated by
-   * startBackgroundFrameExtraction). This is a volatile store — PM2 restart
-   * wipes it. See CLAUDE.md backlog: "Raw frames live in-memory".
+   * By default reads from global.extractedFrames (in-memory raw frames).
+   * With ?source=template_mask, reads from spokes/template_mask/<jobId>/
+   * (masked frames on disk). Hotfix 4 added the source param so the AI
+   * spoke canvas can show the masked frame when a template mask exists.
    */
   app.get("/api/jobs/:jobId/frames/:n", async (req, res) => {
     try {
       const { jobId, n } = req.params;
+      const source = req.query.source as string | undefined;
       const frameNumber = parseInt(n, 10);
       if (isNaN(frameNumber) || frameNumber < 0) {
         return res.status(400).json({ error: "Invalid frame number" });
@@ -1572,6 +1607,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Job not found" });
       }
 
+      // ── Template-mask source (on-disk masked frames) ──────────────
+      if (source === 'template_mask') {
+        const { dir: tempDir, files: frameFiles } = await listFrameFiles(jobId, SPOKE_TEMPLATE_MASK_DIR);
+        if (!frameFiles.length || frameNumber >= frameFiles.length) {
+          return res.status(404).json({ error: "Masked frame not found" });
+        }
+        const framePath = path.join(tempDir, frameFiles[frameNumber]);
+        const buffer = await fsPromises.readFile(framePath);
+        res.set("Content-Type", "image/png");
+        res.set("Cache-Control", "private, max-age=3600");
+        return res.send(buffer);
+      }
+
+      // ── Raw source (in-memory extracted frames) ───────────────────
       if (jobV2.status === 'extracting') {
         return res.status(503).json({ error: "Extraction in progress" });
       }

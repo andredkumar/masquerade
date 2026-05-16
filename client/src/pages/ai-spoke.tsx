@@ -39,26 +39,30 @@ export default function AiSpokePage() {
       }
     : getCachedMetadata(jobId) ?? null;
 
-  // Fetch first frame from frames endpoint (hotfix 3 — replaces sessionStorage cache)
+  // Fetch first frame: try masked (template_mask) first, fall back to raw.
+  // This ensures the canvas shows the same image that AI inference will process.
   useEffect(() => {
     if (!jobId) return;
     let revoked = false;
     let blobUrl: string | null = null;
 
-    fetch(`/api/jobs/${jobId}/frames/0`)
-      .then((res) => {
-        if (!res.ok || revoked) return null;
-        return res.blob();
-      })
-      .then((blob) => {
-        if (!blob || revoked) return;
+    (async () => {
+      try {
+        // Try masked frame first
+        let res = await fetch(`/api/jobs/${jobId}/frames/0?source=template_mask`);
+        // If masked frame not available (404), fall back to raw
+        if (res.status === 404) {
+          res = await fetch(`/api/jobs/${jobId}/frames/0`);
+        }
+        if (!res.ok || revoked) return;
+        const blob = await res.blob();
+        if (revoked) return;
         blobUrl = URL.createObjectURL(blob);
         setFirstFrame(blobUrl);
-      })
-      .catch(() => {
-        // On any error, firstFrame stays null (blank canvas). Full error
-        // state UX is 4c scope; this hotfix just restores the data source.
-      });
+      } catch {
+        // firstFrame stays null (blank canvas)
+      }
+    })();
 
     return () => {
       revoked = true;
