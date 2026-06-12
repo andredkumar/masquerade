@@ -13,7 +13,7 @@
 
 import path from 'path';
 import { promises as fs } from 'fs';
-import { SPOKE_TEMPLATE_MASK_DIR, TEMP_EXTRACTED_DIR } from './cleanup';
+import { SPOKE_TEMPLATE_MASK_DIR } from './cleanup';
 
 /**
  * Resolve the absolute path of a single processed frame and validate it sits
@@ -138,29 +138,6 @@ export async function listFrameFiles(
   } catch {
     return { dir: jobDir, files: [] };
   }
-}
-
-/**
- * List the raw extracted frames for a job, sorted and deduped.
- *
- * Raw frames are written to `temp_extracted/<jobId>/frame_NNNNNN.png` by
- * `startBackgroundFrameExtraction` (Phase 4b-0 — replaces the volatile
- * `global.extractedFrames` in-memory store). This is a thin wrapper over
- * `listFrameFiles` that pins the base directory to `TEMP_EXTRACTED_DIR`, so
- * callers don't have to thread the raw-frame root through every read site.
- *
- * The same bounded `resolve + startsWith` guard applies. Returns
- * `{ dir, files: [] }` when the directory doesn't exist (frames swept or never
- * written) — callers should check `files.length`.
- *
- * NOTE: `processVideo`'s apply-time staging lives in the `_apply/` subdirectory
- * of the same job dir; the `.png` filter here ignores that subdirectory, so
- * this never returns transient apply-time frames.
- */
-export async function listRawFrameFiles(
-  jobId: string,
-): Promise<{ dir: string; files: string[] }> {
-  return listFrameFiles(jobId, TEMP_EXTRACTED_DIR);
 }
 
 /**
