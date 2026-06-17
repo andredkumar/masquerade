@@ -29,6 +29,13 @@ npm run pm2:start    # Start with PM2
 
 ### Updating Existing Deployment
 ```bash
+# Step 0 — deploy-hygiene pre-flight (REQUIRED before any build).
+# A deployed build must always correspond to a known commit. Refuse to build
+# if the tree is dirty or HEAD is unknown.
+git rev-parse --short HEAD          # record the commit you are about to ship
+git status --porcelain              # MUST print nothing (clean working tree)
+# If `git status --porcelain` prints anything, STOP — commit or stash first.
+
 # Safe update (stops existing processes first)
 npm run update
 
@@ -38,6 +45,37 @@ npm install          # Update dependencies
 npm run build        # Rebuild application
 npm run pm2:restart  # Restart process
 ```
+
+### Post-deploy verification — REQUIRED (Phase 4b-0 re-entrancy gate)
+
+The Phase 4b-0 `processVideo` re-entrancy fix **cannot be reproduced from current
+source** (the original `<jobId>/<jobId>` nesting / frame-deletion symptoms belong
+to a replaced code variant). The **live redo loop, run twice on the real server,
+is therefore the required verification** that the fix holds against whatever was
+actually deployed. Run this immediately after `pm2:restart`, before declaring the
+deploy good:
+
+```bash
+# 1. Upload a short test video; wait for status → ready.
+# 2. Apply a template mask (redo loop run #1) → confirm it completes and the
+#    output frames are correct.
+# 3. WITHOUT re-uploading, re-mask and apply AGAIN for the SAME jobId
+#    (redo loop run #2). This is the re-entrant path the fix targets.
+# 4. Confirm run #2 also completes correctly AND the server log shows the
+#    tripwire mkdir lines with NO doubled segment, e.g.:
+pm2 logs --lines 200 | grep '🗂️'
+#    Expect resolved paths like:
+#      🗂️  [raw-frames]    mkdir .../temp_extracted/<jobId>
+#      🗂️  [apply-staging] mkdir .../temp_extracted/<jobId>/_apply
+#      🗂️  [ai-run]        mkdir .../spokes/ai/<jobId>/<runId>
+#    A path-doubling tripwire error (process crash with "path-doubling tripwire")
+#    or a <jobId>/<jobId> segment means the deploy is BAD — roll back.
+# 5. Confirm the persistent raw frames under temp_extracted/<jobId>/ survived
+#    both applies (re-mask still works without re-upload).
+```
+
+If run #2 fails, frames are missing, or any doubled-segment path appears, the
+deploy does not pass the gate.
 
 ### Manual Setup
 1. **Install FFmpeg (CRITICAL for .mp4/.mov/.avi)**

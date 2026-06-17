@@ -6,7 +6,8 @@ import path from 'path';
 import fs from 'fs/promises';
 import Sharp from 'sharp';
 import { TempFolderManager } from './tempFolderManager';
-import { deleteUploadFile, safeDelete, TEMP_EXTRACTED_DIR } from './cleanup';
+import { deleteUploadFile } from './cleanup';
+import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplyStaging, assertNoSegmentDoubling } from './applyPaths';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -284,13 +285,21 @@ export class VideoProcessor {
     outputSettings: OutputSettings,
     samplingFps: number | null = null
   ) {
-    // Single staging-dir path used by both the success branch and the finally block.
-    const extractedFramesDir = path.join(TEMP_EXTRACTED_DIR, jobId);
-    // We delete the upload + staging dir in `finally` whenever the job reached
-    // a terminal status — i.e. processing actually started (success path) OR
-    // an exception was raised (failed path). Job that crashed before this
-    // method was even called won't reach `finally`, but the upload-handler's
-    // setImmediate `.catch` already covers that case.
+    // Apply-time staging dir, used by both the success branch and the finally
+    // block. This is an ISOLATED subdir (`_apply`) of the job's temp_extracted
+    // tree — deliberately NOT the persistent raw-frame dir (Phase 4b-0). The
+    // background extractor writes the persistent raw frames to
+    // temp_extracted/<jobId>/frame_NNNNNN.png; re-extracting at apply time into
+    // the same dir would collide with those frames (extractAllFramesSequential
+    // reads back every frame_*.png to size the frame set), so apply-time
+    // extraction is sandboxed here and the persistent raw frames are left intact.
+    const extractedFramesDir = applyStagingDir(jobId);
+    // We delete the apply-time staging subdir in `finally` whenever the job
+    // reached a terminal status — i.e. processing actually started (success
+    // path) OR an exception was raised (failed path). The persistent raw frames
+    // and the original upload are intentionally NOT deleted here so a full redo
+    // loop (re-draw → re-apply → re-run AI) works within their retention windows;
+    // the hourly sweep / SIGTERM / cleanupJobArtifacts reclaim them instead.
     let reachedTerminal = false;
 
     try {
@@ -309,6 +318,14 @@ export class VideoProcessor {
       // ALL frames in one ffmpeg pass at a duration-based fps, write them
       // to a staging directory, and feed the resulting buffers into the
       // existing parallel batch pipeline. ffmpeg is invoked exactly once.
+      //
+      // Re-entrancy: clear `_apply` to an EMPTY dir before re-extracting. A run
+      // interrupted before its finally cleanup (SIGTERM/OOM) can leave stale
+      // frames here; extractAllFramesSequential reads back every frame_*.png to
+      // size the frame set, so any residue would inflate/corrupt the frame
+      // count. prepareCleanApplyStaging makes the apply idempotent across
+      // re-invocation and returns the same temp_extracted/<jobId>/_apply path.
+      await prepareCleanApplyStaging(jobId);
       const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
         videoPath,
         extractedFramesDir,
@@ -443,20 +460,29 @@ export class VideoProcessor {
       reachedTerminal = true;
       throw error;
     } finally {
-      // Reclaim disk regardless of whether we succeeded or failed:
-      //   1. The staging dir holds intermediate raw frames we no longer need.
-      //   2. The original upload contains PHI and is never needed again once
-      //      the job has completed or definitively failed.
-      // Both deletes are bounded to their allowed roots by the cleanup module,
-      // and both swallow their own errors so cleanup can never re-throw out
-      // of `finally` and mask the original error or crash a background task.
+      // Reclaim ONLY the apply-time staging subdir (`_apply`). It holds the
+      // transient re-extracted frames this run produced and must be cleared so
+      // a subsequent apply at a different samplingFps can't read back stale
+      // higher-numbered frames.
+      //
+      // Phase 4b-0: we intentionally do NOT delete the persistent raw-frame dir
+      // (temp_extracted/<jobId>/frame_*.png) or the original upload here. Both
+      // must survive so the user can re-draw and re-apply the mask (the upload
+      // is what we re-extract from). They are reclaimed by the hourly sweep,
+      // the SIGTERM purge, and cleanupJobArtifacts(jobId) within their existing
+      // retention windows (uploads/ 2h, temp_extracted/ 6h).
+      //
+      // The delete goes through cleanupApplyStaging, which asserts the resolved
+      // target ends with `${sep}_apply` and bounds it to the job's own
+      // raw-frame dir, so it is provably unable to touch the persistent frames.
+      // It swallows its own error so cleanup can never re-throw out of `finally`
+      // and mask the original error or crash a background task.
       if (reachedTerminal) {
         try {
-          await safeDelete(extractedFramesDir, TEMP_EXTRACTED_DIR);
+          await cleanupApplyStaging(jobId);
         } catch (cleanupErr) {
-          console.warn(`⚠️  Failed to clean up staging dir ${extractedFramesDir}:`, cleanupErr);
+          console.warn(`⚠️  Failed to clean up apply staging dir ${extractedFramesDir}:`, cleanupErr);
         }
-        await deleteUploadFile(videoPath);
       }
     }
   }
@@ -1088,26 +1114,45 @@ export class VideoProcessor {
       }
       
       console.log(`📋 Created ${batches.length} batches of ~${batchSize} frames each`);
-      
+
+      // Raw frames are written to disk under temp_extracted/<jobId>/ (Phase 4b-0).
+      // This replaces the volatile global.extractedFrames in-memory map: frames
+      // now survive a PM2 restart and are read back by the frames endpoint and
+      // the AI raw-frame fallback via listRawFrameFiles. Naming matches
+      // extractAllFramesSequential's ffmpeg convention (1-indexed frame_%06d.png)
+      // so the persistent store stays consistent with the apply pipeline.
+      const rawDir = rawFramesDir(jobId);
+      // Tripwire: crash loudly if a regression ever re-suffixes the jobId into a
+      // nested temp_extracted/<jobId>/<jobId>/ path (the Phase 4b-0 symptom).
+      assertNoSegmentDoubling(rawDir);
+      // Tripwire (kickoff §149): log the literal resolved mkdir path.
+      console.log(`🗂️  [raw-frames] mkdir ${path.resolve(rawDir)}`);
+      await fs.mkdir(rawDir, { recursive: true });
+
       // Extract all frames in parallel batches
       let extractedFrames = 0;
-      const frameStore = new Map<number, Buffer>(); // Store extracted frames
-      
+
       for (const batch of batches) {
         try {
           console.log(`🗢️ Extracting batch: frames ${batch.start}-${batch.end}`);
           const batchFrames = await this.frameExtractor.extractFrameBatch(
-            videoPath, 
-            batch.start, 
+            videoPath,
+            batch.start,
             batch.end
           );
-          
-          // Store frames with their frame numbers
-          batchFrames.forEach((frameBuffer, index) => {
-            const frameNumber = batch.start + index;
-            frameStore.set(frameNumber, frameBuffer);
-          });
-          
+
+          // Persist each frame to disk. Frame numbering is 1-indexed to match
+          // ffmpeg's %06d output, so background-extracted frame 0 → frame_000001.png.
+          // jobId is a server-generated UUID (not user input); the read helpers
+          // additionally bound every path against TEMP_EXTRACTED_DIR.
+          await Promise.all(
+            batchFrames.map((frameBuffer, index) => {
+              const frameNumber = batch.start + index;
+              const padded = String(frameNumber + 1).padStart(6, '0');
+              return fs.writeFile(path.join(rawDir, `frame_${padded}.png`), frameBuffer);
+            }),
+          );
+
           extractedFrames += batchFrames.length;
           const progress = (extractedFrames / totalFrames) * 100;
           
@@ -1128,11 +1173,7 @@ export class VideoProcessor {
         }
       }
       
-      // Store extracted frames for later use (avoid re-extraction)
-      (global as any).extractedFrames = (global as any).extractedFrames || new Map();
-      (global as any).extractedFrames.set(jobId, frameStore);
-      
-      console.log(`🎉 BACKGROUND EXTRACTION COMPLETE: ${extractedFrames} frames extracted and stored`);
+      console.log(`🎉 BACKGROUND EXTRACTION COMPLETE: ${extractedFrames} frames written to ${rawDir}`);
       
       // Update job status to ready for masking
       await storage.updateVideoJob(jobId, { status: 'ready' });

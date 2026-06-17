@@ -23,8 +23,10 @@ import {
   tempDirExists,
   countFrames,
   listFrameFiles,
+  listRawFrameFiles,
   colorForLabelId,
 } from "./services/frameAccess";
+import { aiRunDir } from "./services/applyPaths";
 import Sharp from "sharp";
 import { randomUUID } from "crypto";
 import path from "path";
@@ -222,7 +224,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
           videoProcessor.startBackgroundFrameExtraction(job.id, dicomFilePath, quickMetadata.totalFrames)
             .catch(error => {
               console.error('❌ DICOM background extraction failed:', error);
-              // Background task may never reach processVideo's finally — reclaim the upload now.
+              // Extraction failed → job never becomes applyable, so no redo loop
+              // depends on this upload. Reclaim it now (processVideo's finally no
+              // longer deletes the upload as of Phase 4b-0).
               void deleteUploadFile(dicomFilePath);
             });
         });
@@ -286,7 +290,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         videoProcessor.startBackgroundFrameExtraction(job.id, stdFilePath, metadata.totalFrames)
           .catch(error => {
             console.error('❌ Background extraction failed:', error);
-            // Background task may never reach processVideo's finally — reclaim the upload now.
+            // Extraction failed → job never becomes applyable, so no redo loop
+            // depends on this upload. Reclaim it now (processVideo's finally no
+            // longer deletes the upload as of Phase 4b-0).
             void deleteUploadFile(stdFilePath);
           });
       });
@@ -903,17 +909,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ parsedIntent, maskBase64: null, confidence: 0, modelUsed: null, inferenceMs: 0 });
       }
 
-      // 3. Collect frames for inference. Try template-masked frames first (on disk),
-      //    then fall back to raw frames from global.extractedFrames (in-memory).
-      //    Hotfix 4: spoke independence — AI can run without a template mask applied.
+      // 3. Collect frames for inference. Try template-masked frames first
+      //    (spokes/template_mask/<jobId>/), then fall back to raw frames on disk
+      //    (temp_extracted/<jobId>/, Phase 4b-0 — replaces the in-memory
+      //    global.extractedFrames fallback). Hotfix 4: spoke independence — AI
+      //    can run without a template mask applied.
       const { dir: tempDir, files: frameFileNames } = await listFrameFiles(jobId);
 
-      // Check if raw frames are available as a fallback
-      const allExtractedFrames = (global as any).extractedFrames as Map<string, Map<number, Buffer>> | undefined;
-      const rawFrameMap = allExtractedFrames?.get(jobId);
-      const useRawFrames = !frameFileNames.length && rawFrameMap && rawFrameMap.size > 0;
+      // Check if raw frames are available as a fallback (on disk).
+      const { dir: rawFrameDir, files: rawFrameFileNames } = await listRawFrameFiles(jobId);
+      const useRawFrames = !frameFileNames.length && rawFrameFileNames.length > 0;
 
-      // Fall back to request-body frame if neither disk nor memory frames exist
+      // Fall back to request-body frame if neither masked nor raw frames exist
       const singleFrameFallback = !frameFileNames.length && !useRawFrames && frameBase64;
       if (!frameFileNames.length && !useRawFrames && !singleFrameFallback) {
         return res.status(400).json({
@@ -928,7 +935,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // 5. Create an AIRun record and output directory.
       const runId = randomUUID();
-      const runOutputDir = path.join(SPOKE_AI_DIR, jobId, runId);
+      // aiRunDir builds spokes/ai/<jobId>/<runId> and trips the doubling guard.
+      // HYGIENE ONLY — the <jobId>/<runId> layout was always correct (runId is a
+      // distinct UUID, not a doubled jobId).
+      const runOutputDir = aiRunDir(jobId, runId);
+      // Tripwire (kickoff §149): log the literal resolved mkdir path.
+      console.log(`🗂️  [ai-run] mkdir ${path.resolve(runOutputDir)}`);
       await fsPromises.mkdir(runOutputDir, { recursive: true });
 
       // Phase 3d: Job record must exist (created eagerly at upload time).
@@ -960,8 +972,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const metaFrameResults: Record<number, { confidence: number }> = {};
       let firstResult: { maskBase64: string; overlayBase64?: string; confidence: number; modelUsed: string; inferenceMs: number } | null = null;
-      const rawFrameKeys = useRawFrames ? Array.from(rawFrameMap!.keys()).sort((a, b) => a - b) : [];
-      const totalFrames = frameFileNames.length || rawFrameKeys.length || 1;
+      const totalFrames = frameFileNames.length || rawFrameFileNames.length || 1;
 
       if (singleFrameFallback) {
         // Single-frame path (no temp folder yet)
@@ -983,13 +994,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         metaFrameResults[0] = { confidence: r.confidence };
         firstResult = r;
       } else if (useRawFrames) {
-        // Raw frames path (in-memory, no template mask applied). Hotfix 4.
-        for (let i = 0; i < rawFrameKeys.length; i++) {
-          const frameKey = rawFrameKeys[i];
-
+        // Raw frames path (on disk in temp_extracted/<jobId>/, no template mask
+        // applied). Phase 4b-0 — reads from disk instead of the in-memory
+        // global.extractedFrames store. Hotfix 4.
+        for (let i = 0; i < rawFrameFileNames.length; i++) {
           io?.to(jobId).emit('inference-progress', { jobId, current: i + 1, total: totalFrames });
 
-          const b64 = rawFrameMap!.get(frameKey)!.toString('base64');
+          const b64 = (await fsPromises.readFile(path.join(rawFrameDir, rawFrameFileNames[i]))).toString('base64');
 
           const r = await aiClient.infer({
             modelConfig,
@@ -1588,7 +1599,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   /**
    * GET /api/jobs/:jobId/frames/:n — serve a frame as PNG.
    *
-   * By default reads from global.extractedFrames (in-memory raw frames).
+   * By default reads raw frames from temp_extracted/<jobId>/ on disk
+   * (Phase 4b-0 — replaces the volatile global.extractedFrames map).
    * With ?source=template_mask, reads from spokes/template_mask/<jobId>/
    * (masked frames on disk). Hotfix 4 added the source param so the AI
    * spoke canvas can show the masked frame when a template mask exists.
@@ -1620,25 +1632,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.send(buffer);
       }
 
-      // ── Raw source (in-memory extracted frames) ───────────────────
+      // ── Raw source (on-disk extracted frames, Phase 4b-0) ─────────
+      // Raw frames live at temp_extracted/<jobId>/frame_NNNNNN.png, written by
+      // startBackgroundFrameExtraction. listRawFrameFiles handles
+      // path-traversal validation, dedup, and sorting; frames are addressed by
+      // sorted position (index 0 = first frame), matching the template_mask
+      // branch above.
       if (jobV2.status === 'extracting') {
         return res.status(503).json({ error: "Extraction in progress" });
       }
 
-      // Read from the in-memory frame store (volatile — lost on restart)
-      const allFrames = (global as any).extractedFrames as Map<string, Map<number, Buffer>> | undefined;
-      const jobFrames = allFrames?.get(jobId);
-      if (!jobFrames) {
+      const { dir: rawDir, files: rawFiles } = await listRawFrameFiles(jobId);
+      if (!rawFiles.length) {
+        // Directory absent or empty: frames were swept (6h retention) or the
+        // server restarted before extraction completed.
         return res.status(410).json({
           error: "Frames are no longer available. The server may have restarted.",
         });
       }
-
-      const buffer = jobFrames.get(frameNumber);
-      if (!buffer) {
+      if (frameNumber >= rawFiles.length) {
         return res.status(404).json({ error: "Frame not found" });
       }
 
+      const buffer = await fsPromises.readFile(path.join(rawDir, rawFiles[frameNumber]));
       res.set("Content-Type", "image/png");
       res.set("Cache-Control", "private, max-age=3600");
       res.send(buffer);

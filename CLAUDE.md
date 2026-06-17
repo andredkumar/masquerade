@@ -51,20 +51,58 @@ verified.
 14. **Delete `home.tsx` and any other legacy step containers in 4d** — after 4b/4c migrate spoke contents to canonical URLs, `home.tsx` and the `/app` route can be removed.
 15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX.
 
-### Raw frames live in-memory, not on disk (`global.extractedFrames`)
+### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
 
 **Discovered:** Phase 4a deploy smoke testing, 2026-05-12.
 
-**State:** `processVideo` writes extracted frames as `Buffer`s into `global.extractedFrames: Map<jobId, Map<frameNumber, Buffer>>`. Nothing writes to `temp_extracted/<jobId>/` despite that directory existing, being defined as `TEMP_EXTRACTED_DIR` in the code, and being referenced in `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` as the raw-frame target. Several docs describe a disk-based raw-frame pipeline that doesn't exist in the actual code.
+**Original state:** `startBackgroundFrameExtraction` wrote extracted frames as `Buffer`s into `global.extractedFrames: Map<jobId, Map<frameNumber, Buffer>>`. Nothing wrote to `temp_extracted/<jobId>/` despite that directory existing, being defined as `TEMP_EXTRACTED_DIR` in the code, and being referenced in `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` as the raw-frame target.
 
-**Volatility class:** Same as the pre-3b `maskArtifactStore`. PM2 restart wipes raw frames; jobs in `'ready'` state become un-maskable.
+**Volatility class (historical):** Same as the pre-3b `maskArtifactStore`. PM2 restart wiped raw frames; jobs in `'ready'` state became un-maskable.
 
-**Fix candidates (future phase, not 4b):**
-- Move raw extraction to `temp_extracted/<jobId>/frame_<N>.png`
-- Add `GET /api/jobs/:jobId/frames/:n` reading from disk
-- Decommission `global.extractedFrames`
+**Resolution (Phase 4b-0, 2026-06-12):**
+- `startBackgroundFrameExtraction` now writes raw frames to `temp_extracted/<jobId>/frame_NNNNNN.png` (1-indexed, matching `extractAllFramesSequential`'s naming).
+- `GET /api/jobs/:jobId/frames/:n` reads raw frames from disk (positional index into the sorted file list); returns 410 if the directory was swept.
+- The AI inference raw-frame fallback reads from disk via `listRawFrameFiles`.
+- `global.extractedFrames` and its in-memory `frameStore` Map are removed from live code. The remaining references are historical comments only.
+- `processVideo`'s apply-time re-extraction is isolated into `temp_extracted/<jobId>/_apply/` so it never collides with the persistent raw frames (see Phase 4b-0 report for the collision-hazard analysis).
 
-**Implication for 4b:** The new frames endpoint in 4b reads from `global.extractedFrames` with an explicit comment marking the dependency. Don't add more in-memory caching.
+### Phase 4b-0 FIX V2 — `processVideo` re-entrancy post-mortem (2026-06-17)
+
+**Re-entrancy lesson.** `processVideo` was implicitly single-shot: a prior run's
+`finally` deleted the upload, so a second run for the same `jobId` crashed at
+ffprobe before exercising directory logic. Moving raw frames to disk and
+(correctly) preserving the upload for re-apply *unmasked* a latent re-entrancy
+bug — the second run re-derived `temp_extracted/<jobId>/_apply/` and then
+`readdir`'d it to size the frame set, reading back any frames a prior run had
+left there. Lesson: any per-job stage that re-derives a working directory and
+then `readdir`s it must **clear that dir first** (or use a per-run unique dir);
+never let the cleanup that protects re-entrancy be *conditional* on a flag a
+killed process can skip. Tests for re-entrancy MUST leave first-run residue
+present before the second run — a test that cleans state between runs proves
+nothing.
+
+**Fix.** `prepareCleanApplyStaging(jobId)` (`applyPaths.ts`) runs
+`cleanupApplyStaging` (clear `_apply`) then recreates it empty, called
+immediately before `extractAllFramesSequential`. This makes `_apply` clean
+**unconditionally**, not contingent on the gated `finally`. Persistent raw frames
+in the parent dir are never touched (the delete is `_apply`-bounded).
+
+**Tripwire.** Every mkdir site that joins a `jobId`/`runId`
+(`videoProcessor` raw + `_apply`, `routes.ts` AI run dir) calls
+`assertNoSegmentDoubling()` (throws on equal-adjacent path segments — the
+`<jobId>/<jobId>` corruption class) AND logs the literal `path.resolve(...)`
+mkdir path. Both the stale-readback fix and the tripwire itself are covered by
+red-green tests in `server/services/__tests__/applyPaths.test.ts` (run:
+`npx tsx server/services/__tests__/applyPaths.test.ts`).
+
+**Scope caveat (honest).** The current `_apply`-isolated source does not produce
+`<jobId>/<jobId>` nesting or persistent-frame deletion from any run-2 op — those
+symptoms were the pre-`_apply` whole-dir variant, already replaced. The only
+remaining in-code defect was stale-readback count inflation, and only when run 1
+is **interrupted** before its `finally`. Because the original symptoms can't be
+reproduced from current source, the **live redo loop run twice** is the required
+post-deploy verification (see the deploy runbook), and the tripwire is the
+standing safety net for the nesting class.
 
 ### `ANTHROPIC_API_KEY` invalid in production
 
@@ -74,19 +112,13 @@ verified.
 
 **Fix:** Rotate the key in `~/.env` on `3.136.48.97`. Out of scope for Phase 4 refactor.
 
-### `temp_extracted/` documentation drift
+### `temp_extracted/` documentation drift — RESOLVED in Phase 4b-0
 
 **Discovered:** Phase 4a deploy smoke testing, 2026-05-12.
 
-**State:** `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` claims raw frames extract to `temp_extracted/<jobId>/`. Code defines `TEMP_EXTRACTED_DIR`. Cleanup module includes `temp_extracted/` in `SWEEP_TARGETS`. None of these reflect reality: nothing writes to that directory. The directory exists but its mtime hasn't changed in days.
+**Original state:** `UPLOAD_PROCESS_BEFORE_AND_AFTER.md` claimed raw frames extract to `temp_extracted/<jobId>/`. Code defined `TEMP_EXTRACTED_DIR` and the cleanup module included `temp_extracted/` in `SWEEP_TARGETS`, but nothing actually wrote to that directory — the docs described a disk pipeline that didn't exist.
 
-**Risk:** Future agents read the doc, assume disk-based extraction, write code that reads from `temp_extracted/<jobId>/`, get empty results, waste time debugging. Exactly what happened in Phase 4a deploy.
-
-**Fix options:**
-1. Make docs match code: rewrite the upload doc, remove `temp_extracted/` from `SWEEP_TARGETS`, delete the unused directory.
-2. Make code match docs: implement actual disk extraction.
-
-**Recommendation:** Option 1 now (cheap), option 2 later as the "raw frames to disk" backlog item.
+**Resolution (Phase 4b-0):** Took option 2 (make code match docs). `startBackgroundFrameExtraction` now writes raw frames to `temp_extracted/<jobId>/`, so the directory, the `TEMP_EXTRACTED_DIR` constant, and its `SWEEP_TARGETS` membership all reflect reality. The 6-hour retention window for `temp_extracted/` is now load-bearing.
 
 ### Hub job-level download action (deferred)
 
@@ -100,12 +132,12 @@ verified.
 
 **State:** The codebase has three independent frame-extraction implementations:
 1. `extractFirstFrame` — pulls just frame 0 at upload time for the response preview
-2. `startBackgroundFrameExtraction` → `global.extractedFrames` — batch-based, in-memory, populates after upload response
-3. `processVideo` → its own sequential disk staging directory — runs at template-mask apply time, independent of `global.extractedFrames`
+2. `startBackgroundFrameExtraction` → `temp_extracted/<jobId>/frame_NNNNNN.png` — batch-based, on disk (Phase 4b-0; was in-memory `global.extractedFrames`), populates after upload response
+3. `processVideo` → `temp_extracted/<jobId>/_apply/` — runs at template-mask apply time, re-extracts from the upload, isolated in the `_apply` subdir so it never collides with path #2's persistent frames
 
 **Implication:** The masking canvas (after 4b) reads frame 0 from path #2. The actual mask application uses path #3. These are independent re-extractions of the same source video. ffmpeg is *usually* deterministic on frame 0 across these paths, but edge cases (encoder quirks, GOP boundaries, seek inaccuracy) could produce different bytes. A user could draw a mask aligned to one frame and have it applied to a subtly different one.
 
-**Severity:** Theoretical for typical ultrasound content. The three paths should be consolidated whenever the "raw frames to disk" backlog item is tackled — single extraction, single source of truth, consumed by everything downstream.
+**Severity:** Theoretical for typical ultrasound content. Paths #2 and #3 now share the `temp_extracted/<jobId>/` tree (persistent frames vs `_apply/` staging) but remain independent re-extractions. Full consolidation (single extraction, single source of truth) is still a backlog item — Phase 4b-0 only relocated path #2's storage from memory to disk.
 
 **Future UX consideration:** A planned UX direction is showing the first frame on the upload page immediately while the rest of the video uploads/extracts in the background. Consolidating to a single extraction path supports this cleanly.
 
@@ -229,13 +261,19 @@ to 24h. The hourly retention sweep is the only path that reclaims this dir.
 - **Eager deletes** along the request lifecycle:
   - The video upload handler (`POST /api/videos/upload`) deletes the
     multer file on `req.on('aborted')` and on the catch path.
-  - `videoProcessor.processVideo` and `processImages` use a
-    `try/catch/finally` where `finally` calls `deleteUploadFile(...)` and
-    `safeDelete` on `temp_extracted/<jobId>/` once a terminal status is
+  - `videoProcessor.processImages` uses a `try/catch/finally` where
+    `finally` calls `deleteUploadFile(...)` once a terminal status is
     reached (success **or** failure).
-  - The setImmediate fire-and-forget background tasks have a `.catch`
-    that also calls `deleteUploadFile(...)` so a crash before
-    `processVideo`'s `finally` is reached doesn't leak the upload.
+  - `videoProcessor.processVideo` uses a `try/catch/finally` where
+    `finally` calls `safeDelete` on its apply-time staging dir
+    `temp_extracted/<jobId>/_apply/` only. **Phase 4b-0:** it no longer
+    deletes `deleteUploadFile(...)` nor the persistent raw frames at
+    `temp_extracted/<jobId>/` — the upload and raw frames must survive so
+    the user can redo (re-mask → re-apply) within the `uploads/` 2h window.
+  - The setImmediate background **extraction** tasks (`startBackgroundFrameExtraction`)
+    have a `.catch` that calls `deleteUploadFile(...)` on failure. An
+    extraction failure means the job never becomes applyable, so reclaiming
+    the upload there is safe and loses no redo loop.
   - **No post-download hook for `temp_processed/<jobId>/`**: the download
     endpoint deliberately does not delete the masked-frame folder when the
     response finishes. The frame viewer needs it readable after download
