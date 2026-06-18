@@ -104,6 +104,64 @@ reproduced from current source, the **live redo loop run twice** is the required
 post-deploy verification (see the deploy runbook), and the tripwire is the
 standing safety net for the nesting class.
 
+**Post-mortem lessons (carry forward).**
+- Re-entrancy is invisible to static analysis; when removing a guard, test the
+  newly-reachable second-entry path with first-run residue present.
+- Every destructive fs op must log its `path.resolve(...)` target.
+- Test persistence in isolation (write → restart/sweep → read) rather than
+  inferring it from happy-path runs.
+- Don't bake a hypothesis into a diagnostic command (the frame-delete "watch"
+  presupposed an immediate delete that never existed).
+
+### Phase 4b-0 landed + deploy-verified on main @ b734e6d (2026-06-17)
+
+The Phase 4b-0 disk-frame relocation and the FIX V2 re-entrancy fix are landed
+and verified on main at commit `b734e6d`.
+
+### Phase 4b-i landed — template-mask spoke on canonical URLs (2026-06-17)
+
+The template-mask spoke apply trigger + frame preview are migrated to canonical
+URLs: `ProcessingControls.tsx` POSTs `POST /api/jobs/:jobId/template-mask/apply`
+and `template-mask-spoke.tsx` reads `GET /api/jobs/:jobId/frames/0`.
+
+### Phase 4b-ii landed — AI-spoke canonical URLs + masked-frame staleness (2026-06-18)
+
+- AI spoke (`ai-spoke.tsx`) migrated off legacy flat label URLs to the canonical
+  runs hierarchy:
+  - Label SOURCE: `GET /api/ai/labels/:jobId` → `GET /api/jobs/:jobId/ai/runs`.
+    Labels are flattened from `runs[*].labels[]` with each carrying its
+    `runId` (Phase 3b 1:1 run↔label invariant makes this exact).
+  - Approve/Delete: `PATCH|DELETE /api/ai/labels/:jobId/:labelId` →
+    `PATCH|DELETE /api/jobs/:jobId/ai/runs/:runId/labels/:labelId`. runId comes
+    from the runs-based source above (NOT derivable from the flat source — this
+    is why source migration came first).
+  - Status gate switched from the legacy 2s poll on `GET /api/videos/:jobId`
+    (which gated on **mask completion** — a bug vs. optional-masking) to
+    `useJob().job.status === 'ready'` (upload/extraction complete). Template
+    masking is optional: AI runs on masked frames if a mask exists, else on raw
+    frames via the inference handler's raw fallback (`routes.ts:920`).
+- Masked-frame staleness fixed: the masked-frame canvas served a stale cached PNG
+  after re-applying a new template mask. Root cause was twofold — the fetch
+  effect depended only on `[jobId]` (no re-run on re-apply) and the masked URL
+  was byte-identical under `Cache-Control: private, max-age=3600`. Fix appends a
+  `&v=<templateMask.completedAt>` version param to the **masked source only** and
+  adds it to the effect deps. Raw-frame caching is unchanged; the frames endpoint
+  ignores the extra param (reads only `?source`). No backend change.
+- Legacy URLs remain registered (removal is 4d). `CommandInput.tsx`'s
+  `POST /api/ai/infer` is still legacy — it's a shared component also used by
+  `home.tsx`; its migration is deferred to 4c/4d (out of 4b-ii scope).
+
+### Frame-deletion "bug" was a PHANTOM (2026-06-18)
+
+The "raw frames auto-deleted ~1s after upload" report was never reproduced under
+controlled observation, and a full source/git/dist audit (see
+`PHASE_4B0_FRAMEDELETE_PROPOSAL.md`) found **no current-source line** that deletes
+`temp_extracted/<jobId>/` post-extraction. The post-download `cleanupJobArtifacts`
+hook that once existed (commit f74692c) was removed (commit 36f684e) and is not
+in HEAD (b734e6d). Do NOT chase this further. The `🗑️ template_mask cleanup on
+AI-run delete` is **correct, intended** behavior (deleting a run removes its
+`spokes/ai/<jobId>/<runId>/` artifacts) — not the phantom.
+
 ### `ANTHROPIC_API_KEY` invalid in production
 
 **Discovered:** Phase 4a deploy smoke testing, 2026-05-12.

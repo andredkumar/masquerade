@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
 import { useLocation } from "wouter";
-import { useQuery } from "@tanstack/react-query";
 import { useJob } from "@/contexts/JobContext";
 import CommandInput, { type Modality } from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
@@ -8,9 +7,14 @@ import FrameViewer from "@/components/FrameViewer";
 import MaskingCanvas from "@/components/MaskingCanvas";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, FileVideo, Check, X, Trash2 } from "lucide-react";
-import type { MaskData, AiLabel } from "@shared/schema";
+import type { MaskData, AiLabel, AIRun } from "@shared/schema";
 import { getCachedMetadata } from "@/lib/frameCache";
 import { colorForLabelId } from "@/lib/labelColor";
+
+// Label augmented with its owning AI run id. The canonical mutation URLs
+// (PATCH/DELETE /api/jobs/:jobId/ai/runs/:runId/labels/:labelId) require runId
+// in the path, which the runs-based label source supplies per label.
+type AiLabelWithRun = AiLabel & { runId: string };
 
 export default function AiSpokePage() {
   const { job } = useJob();
@@ -25,7 +29,7 @@ export default function AiSpokePage() {
   const [selectedTask, setSelectedTask] = useState("segment");
   const [modality, setModality] = useState<Modality | null>(null);
   const [viewerActive, setViewerActive] = useState(false);
-  const [aiLabels, setAiLabels] = useState<AiLabel[]>([]);
+  const [aiLabels, setAiLabels] = useState<AiLabelWithRun[]>([]);
 
   // Build videoMetadata from Job V2 source or cached upload response
   const videoMetadata = job
@@ -39,6 +43,14 @@ export default function AiSpokePage() {
       }
     : getCachedMetadata(jobId) ?? null;
 
+  // Masked-frame staleness fix (Part B): the masked source is served with a
+  // long-lived Cache-Control at a stable URL, so re-applying a new template
+  // mask would otherwise render the OLD masked frame. Version the masked URL
+  // with the mask's completedAt so a re-apply busts the browser cache. The
+  // frames endpoint reads only ?source, so the extra &v param is ignored
+  // server-side — no backend change. Raw fallback stays unversioned.
+  const maskVersion = job?.templateMask?.completedAt ?? "";
+
   // Fetch first frame: try masked (template_mask) first, fall back to raw.
   // This ensures the canvas shows the same image that AI inference will process.
   useEffect(() => {
@@ -48,9 +60,10 @@ export default function AiSpokePage() {
 
     (async () => {
       try {
-        // Try masked frame first
-        let res = await fetch(`/api/jobs/${jobId}/frames/0?source=template_mask`);
-        // If masked frame not available (404), fall back to raw
+        // Try masked frame first (versioned by completedAt to bust stale cache)
+        const v = maskVersion ? `&v=${encodeURIComponent(maskVersion)}` : "";
+        let res = await fetch(`/api/jobs/${jobId}/frames/0?source=template_mask${v}`);
+        // If masked frame not available (404), fall back to raw (unversioned)
         if (res.status === 404) {
           res = await fetch(`/api/jobs/${jobId}/frames/0`);
         }
@@ -68,25 +81,31 @@ export default function AiSpokePage() {
       revoked = true;
       if (blobUrl) URL.revokeObjectURL(blobUrl);
     };
-  }, [jobId]);
+  }, [jobId, maskVersion]);
 
-  // Check legacy job status to determine if Step 4 is unlocked
-  const { data: legacyJobData } = useQuery({
-    queryKey: ["/api/videos", jobId],
-    refetchInterval: 2000,
-    enabled: !!jobId,
-  });
-  const legacyJob = (legacyJobData as any)?.job;
-  const jobCompleted = legacyJob?.status === "completed";
+  // AI availability gate (Amendment Change 1): template masking is OPTIONAL
+  // preprocessing, so AI must NOT require a completed mask. Gate on V2
+  // extraction completion (job.status === "ready") instead. job.status is kept
+  // live by JobContext (refetches on Socket.IO progress events), so no separate
+  // poll is needed. If a mask was applied → masked frames; if not → raw fallback.
+  const jobReady = job?.status === "ready";
 
-  // Fetch AI labels
+  // Fetch AI labels from the canonical runs-based source. Each label is
+  // augmented with its owning run id so the canonical mutation URLs
+  // (PATCH/DELETE .../ai/runs/:runId/labels/:labelId) can be constructed.
+  // Defensive flatten ((r.labels ?? [])) guards runs with zero/undefined labels
+  // — the 1:1 run↔label relationship is a current-impl property, not an invariant.
   const fetchLabels = useCallback(async () => {
     if (!jobId) return;
     try {
-      const res = await fetch(`/api/ai/labels/${jobId}`);
+      const res = await fetch(`/api/jobs/${jobId}/ai/runs`);
       if (res.ok) {
         const data = await res.json();
-        setAiLabels(data.labels || []);
+        const runs: AIRun[] = data.runs || [];
+        const flattened: AiLabelWithRun[] = runs.flatMap((r) =>
+          (r.labels ?? []).map((l) => ({ ...l, runId: r.id })),
+        );
+        setAiLabels(flattened);
       }
     } catch (err) {
       console.error("Failed to fetch labels:", err);
@@ -94,8 +113,8 @@ export default function AiSpokePage() {
   }, [jobId]);
 
   useEffect(() => {
-    if (jobCompleted) fetchLabels();
-  }, [jobCompleted, fetchLabels]);
+    if (jobReady) fetchLabels();
+  }, [jobReady, fetchLabels]);
 
   const handleAiMaskGenerated = (
     maskBase64: string,
@@ -111,10 +130,10 @@ export default function AiSpokePage() {
     setMaskData(aiMask);
   };
 
-  const handleToggleLabel = async (labelId: string, approved: boolean) => {
+  const handleToggleLabel = async (label: AiLabelWithRun, approved: boolean) => {
     if (!jobId) return;
     try {
-      await fetch(`/api/ai/labels/${jobId}/${labelId}`, {
+      await fetch(`/api/jobs/${jobId}/ai/runs/${label.runId}/labels/${label.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ approved }),
@@ -125,22 +144,24 @@ export default function AiSpokePage() {
     }
   };
 
-  const handleRemoveLabel = async (labelId: string) => {
+  const handleRemoveLabel = async (label: AiLabelWithRun) => {
     if (!jobId) return;
     try {
-      await fetch(`/api/ai/labels/${jobId}/${labelId}`, { method: "DELETE" });
+      await fetch(`/api/jobs/${jobId}/ai/runs/${label.runId}/labels/${label.id}`, {
+        method: "DELETE",
+      });
       await fetchLabels();
     } catch (err) {
       console.error("Failed to remove label:", err);
     }
   };
 
-  const handleDeleteLabelWithConfirm = (label: AiLabel) => {
+  const handleDeleteLabelWithConfirm = (label: AiLabelWithRun) => {
     const ok = window.confirm(
       `Permanently delete label '${label.target}'? This cannot be undone.`,
     );
     if (!ok) return;
-    void handleRemoveLabel(label.id);
+    void handleRemoveLabel(label);
   };
 
   if (!job) return null;
@@ -178,7 +199,7 @@ export default function AiSpokePage() {
             <h2 className="text-lg font-semibold">AI Analysis</h2>
           </div>
 
-          {jobCompleted ? (
+          {jobReady ? (
             <>
               <TaskSelector selectedTask={selectedTask} onTaskChange={setSelectedTask} />
               <CommandInput
@@ -247,7 +268,7 @@ export default function AiSpokePage() {
                         </div>
                         <button
                           type="button"
-                          onClick={() => handleToggleLabel(label.id, !label.approved)}
+                          onClick={() => handleToggleLabel(label, !label.approved)}
                           title={
                             label.approved
                               ? "Approved (click to un-approve)"
@@ -284,7 +305,7 @@ export default function AiSpokePage() {
               )}
 
               {/* Frame viewer toggle */}
-              {jobCompleted && (
+              {jobReady && (
                 <div className="px-4 py-3 border-t border-border">
                   <Button
                     size="sm"
@@ -299,14 +320,14 @@ export default function AiSpokePage() {
             </>
           ) : (
             <div className="px-4 py-3 text-xs text-muted-foreground">
-              Template mask processing must complete before AI analysis is available.
+              Upload processing must finish before AI analysis is available.
             </div>
           )}
         </aside>
 
         {/* Main canvas area */}
         <main className="flex-1 flex flex-col">
-          {viewerActive && jobId && jobCompleted ? (
+          {viewerActive && jobId && jobReady ? (
             <FrameViewer
               jobId={jobId}
               onContinueToDownload={() => setViewerActive(false)}
