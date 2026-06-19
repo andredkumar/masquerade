@@ -151,6 +151,58 @@ and `template-mask-spoke.tsx` reads `GET /api/jobs/:jobId/frames/0`.
   `POST /api/ai/infer` is still legacy — it's a shared component also used by
   `home.tsx`; its migration is deferred to 4c/4d (out of 4b-ii scope).
 
+### Phase 4d-1 landed — straggler migration + exhaustive audit (2026-06-18)
+
+Reversible prep for the one-way 4d-2 teardown. **Removed nothing.** Three
+remaining canonical-app callsites migrated off legacy URLs, plus one surgical
+backend payload addition.
+
+- **CommandInput infer:** `POST /api/ai/infer` → `POST /api/jobs/:jobId/ai/runs`
+  (`CommandInput.tsx:480`). Same shared `aiInferHandler`; body unchanged (handler
+  reads `jobId` from path-or-body). This removed the **last** `/api/ai/infer`
+  constructor in `client/` (grep: 0 hits).
+- **ProcessingStatus download:** `GET /api/videos/:jobId/download` →
+  `GET /api/jobs/:jobId/template-mask/download` (`ProcessingStatus.tsx:88`).
+  home.tsx's own copy (`home.tsx:175`, with the output-settings query string) is
+  intentionally **left** — home.tsx dies in 4d-2.
+- **FrameViewer overlay — backend runId-in-payload (per 4d-1 amendment Change 1),
+  no frontend fallback:** the canonical overlay URL is runId-scoped
+  (`/api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png`) but FrameViewer's
+  payloads carried no runId. Rather than a frontend `labelId→runId` fetch+map
+  with a legacy fallback (a silent dependency that would 404 in 4d-2), `runId` was
+  added to the `inference.json` per-frame label objects, sourced from the owning
+  `AIRun.id`. **Backend change is surgical:** in the `inference.json` handler
+  (`routes.ts`), a `labelRunIdMap` is built in the existing `labelDirMap` loop
+  (the run↔label association was already there) and `runId` is emitted on each
+  per-frame object. FrameViewer builds the canonical overlay URL directly from
+  the payload (`FrameViewer.tsx:230–233`, render `:390`, prefetch `:278`).
+  **Zero** legacy labelId-only overlay constructors remain in `client/` (grep on
+  `overlays/` → only the canonical runId-scoped form at `FrameViewer.tsx:232`).
+- **Exhaustive audit (the 4d-2 gate):** see `PHASE_4D1_REPORT.md`. Result:
+  `/api/ai/infer`, labelId-only `overlays/`, labelId-only `masks/`,
+  `/internal/mask-processing/:jobId`, and bare `GET /api/videos/:jobId` have
+  **zero** `client/` constructors → safe for 4d-2. The legacy upload URLs,
+  `/api/videos/:jobId/download`, and `/api/ai/labels/*` survive **only** in the
+  dying `home.tsx`/`FileUpload.tsx` (deleted in 4d-2) → safe. `upload.tsx` is
+  confirmed canonical (`/api/uploads/video|images`).
+- tsc stays at **17** (10 `frameExtractor.ts` + 7 `maskWorker.ts`). Nothing
+  removed; all legacy routes still registered.
+
+### Post-4d AI-spoke canvas polish — FLAGGED, NOT fixed (2026-06-18)
+
+Two AI-spoke canvas issues observed during 4d work. Diagnosis only — they belong
+to the post-refactor canvas-polish backlog, **not** to phase 4.
+
+1. **Template-mask rectangle drawing leaks into the AI spoke.** The shared
+   `MaskingCanvas` exposes template-mask rectangle-drawing inside the AI spoke,
+   where the interaction should be **bbox-only**. Likely needs a mode/context
+   prop so the canvas scopes its drawing behavior per spoke (template vs. AI).
+2. **AI bbox renders small and offset to the side.** Likely a coordinate-space /
+   scaling mismatch between the displayed canvas dimensions and the native frame
+   dimensions (the drawn box isn't mapped into source-video pixel space the way
+   the FrameViewer SVG viewBox is). Needs the canvas draw coords scaled to the
+   frame's natural dimensions.
+
 ### Frame-deletion "bug" was a PHANTOM (2026-06-18)
 
 The "raw frames auto-deleted ~1s after upload" report was never reproduced under

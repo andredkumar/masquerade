@@ -477,7 +477,7 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
       const displayBB = shape && shape.completed ? shapeBbox(shape) : null;
       const pixelBox = displayBB ? toImagePixelBox(displayBB) : null;
 
-      const inferRes = await fetch('/api/ai/infer', {
+      const inferRes = await fetch(`/api/jobs/${jobId}/ai/runs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

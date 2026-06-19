@@ -31,6 +31,10 @@ interface ViewerInfo {
 
 interface PerFrameLabel {
   labelId: string;
+  // 4d-1: the owning AIRun id, supplied by inference.json so the overlay URL
+  // can be built in the canonical runId-scoped form. Null only when no run owns
+  // the label (never when hasMask is true — see the overlay render filter).
+  runId: string | null;
   name: string;
   modality: string | null;
   confidence: number;
@@ -221,8 +225,11 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
     (n: number) => `/api/jobs/${jobId}/frames/${n}.png`,
     [jobId]
   );
+  // 4d-1: canonical runId-scoped overlay URL only. The legacy labelId-only alias
+  // is never constructed here — runId comes from the per-frame label payload.
   const overlayUrl = useCallback(
-    (labelId: string, n: number) => `/api/jobs/${jobId}/overlays/${labelId}/${n}.png`,
+    (runId: string, labelId: string, n: number) =>
+      `/api/jobs/${jobId}/ai/runs/${runId}/overlays/${labelId}/${n}.png`,
     [jobId]
   );
 
@@ -272,10 +279,12 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
         const n = currentFrame + d;
         if (n < 0 || n >= total) continue;
         for (const lid of visibleArr) {
-          // Only prefetch if this frame actually has a mask for this label
+          // Only prefetch if this frame actually has a mask for this label.
+          // Use the per-frame label's runId for the canonical overlay URL.
           const frameLabels = inferenceData?.frames[String(n)] || [];
-          if (!frameLabels.some(l => l.labelId === lid && l.hasMask)) continue;
-          urls.push(overlayUrl(lid, n));
+          const match = frameLabels.find(l => l.labelId === lid && l.hasMask && l.runId);
+          if (!match || !match.runId) continue;
+          urls.push(overlayUrl(match.runId, lid, n));
           if (urls.length >= PREFETCH_HARD_CAP) break;
         }
         if (urls.length >= PREFETCH_HARD_CAP) break;
@@ -383,11 +392,11 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
 
           {/* Overlay PNGs stacked with mix-blend-mode (only in 'overlay' mode) */}
           {mode === 'overlay' && viewerInfo.hasArtifacts && visiblePerFrameLabels
-            .filter(l => l.hasMask)
+            .filter(l => l.hasMask && l.runId)
             .map(l => (
               <img
                 key={l.labelId}
-                src={overlayUrl(l.labelId, currentFrame)}
+                src={overlayUrl(l.runId as string, l.labelId, currentFrame)}
                 alt=""
                 aria-hidden
                 className="absolute inset-0 w-full h-full object-contain select-none pointer-events-none"

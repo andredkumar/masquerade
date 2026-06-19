@@ -1443,11 +1443,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
         };
       });
 
-      // Build label→run output dir map for disk-based hasMask checks
+      // Build label→run output dir map for disk-based hasMask checks.
+      // Also build label→runId map (4d-1): FrameViewer needs the owning runId
+      // to construct the canonical runId-scoped overlay URL directly, with no
+      // fallback to the legacy labelId-only alias. Sourced from AIRun.id, the
+      // run that owns the label — same source the 4b-ii AI-spoke migration used.
       const inferRuns = await storage.listAiRuns(req.params.jobId);
       const labelDirMap = new Map<string, string>();
+      const labelRunIdMap = new Map<string, string>();
       for (const r of inferRuns) {
-        for (const rl of r.labels) labelDirMap.set(rl.id, r.outputDir);
+        for (const rl of r.labels) {
+          labelDirMap.set(rl.id, r.outputDir);
+          labelRunIdMap.set(rl.id, r.id);
+        }
       }
 
       // Frame-indexed pivot. Each frame lists the labels that have a
@@ -1466,6 +1474,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const hasMask = !!runDir && fs.existsSync(path.join(runDir, `mask_${i}.png`));
           perFrame.push({
             labelId: l.id,
+            runId: labelRunIdMap.get(l.id) ?? null,
             name: l.target,
             modality: l.modality || null,
             confidence: r.confidence,

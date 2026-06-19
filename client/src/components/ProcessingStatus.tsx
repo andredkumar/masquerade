@@ -85,7 +85,7 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
   };
 
   const handleDownload = () => {
-    window.open(`/api/videos/${jobId}/download`, '_blank');
+    window.open(`/api/jobs/${jobId}/template-mask/download`, '_blank');
     
     posthog.capture('frames_downloaded', {
       job_id: jobId
