@@ -187,6 +187,54 @@ backend payload addition.
   confirmed canonical (`/api/uploads/video|images`).
 - tsc stays at **17** (10 `frameExtractor.ts` + 7 `maskWorker.ts`). Nothing
   removed; all legacy routes still registered.
+- ⚠️ **Superseded by 4d-1b:** the audit bullet above claimed bare
+  `GET /api/videos/:jobId` had **zero** `client/` constructors. That was WRONG —
+  it missed two react-query **queryKey-array** polls (see 4d-1b below). The static
+  grep used the literal-slash pattern `/api/videos/`; the live constructors are
+  `['/api/videos', jobId]` arrays, slash-joined at runtime. A live `pm2 logs` check
+  on a fresh job caught them firing every 2s. Lesson recorded below.
+
+### Phase 4d-1b landed — migrate two queryKey-array status polls the 4d-1 audit missed (2026-06-19)
+
+The 4d-1 static audit's literal-slash grep (`/api/videos/`) missed two **canonical-app**
+components that build `GET /api/videos/:jobId` from a react-query queryKey **array**
+(`['/api/videos', jobId]`), joined at runtime. A live `pm2 logs masquerade | grep "/api/videos/"`
+on a fresh job caught the poll firing every 2s — a real 4d-2 blocker (every job-status poll would
+404 once the alias is removed). Migrated both to the canonical V2 Job endpoint. **Removed nothing
+on the backend.**
+
+- **ProcessingStatus.tsx:24** — `queryKey: ['/api/videos', jobId]` →
+  `queryKey: ['/api/jobs', jobId]` (`GET /api/jobs/:jobId`, V2 `Job` direct, no
+  `{job,progress}` wrapper). Reads remapped to the **templateMask spoke**:
+  `job.status==='completed'` → `tm.status==='complete'`; `job.completedAt` →
+  `tm.completedAt`; status display → `tm.status`. `useJob()` was **rejected** here:
+  ProcessingStatus is also rendered by `home.tsx:651`, which has **no** `<JobProvider>`,
+  so `useJob()` would throw and break the legacy page before 4d-2 deletes it. The
+  component keeps its own 2s `refetchInterval` (no Socket-driven Job refetch of its own).
+- **template-mask-spoke.tsx:89** — the separate 2s poll was **fully removed**. It only
+  cleared the local `isProcessing` banner; `JobContext` already refetches the V2 Job on
+  the WebSocket `'progress'` event that fires at apply completion/failure
+  (`videoProcessor.ts:403–458,1081`), so the banner now keys off
+  `useJob().job.templateMask.status` (`complete`/`failed`). Unused `useQuery` import dropped.
+- **FLAG (cosmetic, future polish — not a blocker):** ProcessingStatus lost its
+  pre-first-WS-event **progress fallback** — the V2 `Job` record carries no granular
+  `progress` (stage/currentFrame/%); that data is WebSocket-only. First paint may show 0%
+  for a beat before the first `'progress'` event. If undesired later, add a **canonical
+  progress source** on the `Job`/spoke; none exists today.
+- **Re-audit (non-slash-aware, the gap-closing method):** `grep "queryKey:\s*\["` →
+  only 3 `/api/videos` arrays existed (the two above + `home.tsx:57`, home-only/4d-2,
+  left). No queryKey-array constructor exists for any **other** legacy URL. Non-slash
+  greps for `api/ai/infer` (0), `api/ai/labels` (home-only), `/overlays/` (only the
+  canonical `FrameViewer.tsx:232` runId form), `/masks/` (0) all re-confirmed clean.
+  `/api/videos/upload` (`FileUpload.tsx:35`) is the upload endpoint, not the status poll —
+  tracked separately. See `PHASE_4D1B_REPORT.md`.
+- tsc stays at **17**. Frontend-only; backend untouched.
+- **LESSON (binding for every future "is this URL still used" audit):** a literal-string
+  grep for a URL **misses dynamically-constructed URLs** — react-query queryKey arrays
+  (`['/api/videos', jobId]`), base-path concatenation, segment joins. Audits MUST grep the
+  non-slash/array/concat forms too, AND be confirmed by a **live log / Network check on a
+  fresh session** before any irreversible removal. The static audit is necessary but **not
+  sufficient** for a one-way door; the live check is the authoritative gate for 4d-2.
 
 ### Post-4d AI-spoke canvas polish — FLAGGED, NOT fixed (2026-06-18)
 
@@ -292,7 +340,7 @@ Phase 4 migrates.
 |---|---|---|---|
 | `POST /api/videos/upload` | `POST /api/uploads/video` | Video upload | |
 | `POST /api/images/upload` | `POST /api/uploads/images` | Image batch upload | |
-| `GET /api/videos/:jobId` | — | Legacy job state | Returns `VideoJob` + progress |
+| `GET /api/videos/:jobId` | `GET /api/jobs/:jobId` | Legacy job state | Returns `VideoJob` + progress. **4d-1b:** zero canonical-app constructors (incl. queryKey-array form); only `home.tsx:57` remains (home-only, dies in 4d-2). Live-log re-check is the 4d-2 gate. |
 | — | `GET /api/jobs/:jobId` | Job V2 state | Returns `Job` (hub-and-spoke shape). **Split from legacy in 4a** — these are now separate handlers. |
 | `GET /api/videos/:jobId/download` | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
 | `PATCH /internal/mask-processing/:jobId` | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger |

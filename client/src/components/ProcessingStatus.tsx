@@ -6,7 +6,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Download, Pause, Square, AlertTriangle, Upload } from "lucide-react";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import type { ProcessingProgress } from "@shared/schema";
+import type { ProcessingProgress, Job } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
 
 interface ProcessingStatusProps {
@@ -19,9 +19,10 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
   // WebSocket connection for real-time updates
   const { socket, isConnected } = useWebSocket();
 
-  // Poll for job status
-  const { data: jobData } = useQuery({
-    queryKey: ['/api/videos', jobId],
+  // Poll for job status (Phase 4d-1b: canonical V2 endpoint GET /api/jobs/:jobId,
+  // returns the Job record directly — no { job, progress } wrapper)
+  const { data: jobData } = useQuery<Job>({
+    queryKey: ['/api/jobs', jobId],
     refetchInterval: 2000,
     enabled: !!jobId
   });
@@ -45,8 +46,12 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
     };
   }, [socket, jobId]);
 
-  const currentProgress = progress || (jobData as any)?.progress;
-  const job = (jobData as any)?.job;
+  // Granular progress is WebSocket-only on the V2 Job (no `progress` field on the record).
+  // 4d-1b FLAG: this drops the pre-first-WS-event poll fallback (cosmetic first-paint).
+  const currentProgress = progress;
+  const job = jobData;
+  const tm = job?.templateMask;
+  const completedAt = tm?.completedAt;
 
   if (!currentProgress && !job) {
     return (
@@ -185,11 +190,11 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
             </div>
 
             <div className="text-xs text-muted-foreground space-y-1">
-              <div>Status: <span className="font-mono text-foreground">{job?.status || 'unknown'}</span></div>
+              <div>Status: <span className="font-mono text-foreground">{tm?.status ?? 'unknown'}</span></div>
               <div>Progress: <span className="font-mono text-foreground">{(currentProgress?.progress || 0).toFixed(1)}%</span></div>
-              {job?.completedAt && (
+              {completedAt && (
                 <div>Completed: <span className="font-mono text-foreground">
-                  {new Date(job.completedAt).toLocaleTimeString()}
+                  {new Date(completedAt).toLocaleTimeString()}
                 </span></div>
               )}
             </div>
@@ -210,14 +215,14 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
       {/* Controls */}
       <div className="mt-6 flex items-center justify-between">
         <div className="text-sm text-muted-foreground">
-          {job?.status === 'completed' ? (
+          {tm?.status === 'complete' ? (
             <span>Processing completed successfully</span>
           ) : (
             <span>Processing in progress...</span>
           )}
         </div>
         <div className="flex space-x-3">
-          {job?.status === 'completed' ? (
+          {tm?.status === 'complete' ? (
             <>
               <Button onClick={handleDownload} data-testid="download-button">
                 <Download size={16} className="mr-2" />

@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
 import { useLocation } from "wouter";
-import { useQuery } from "@tanstack/react-query";
 import { useJob } from "@/contexts/JobContext";
 import MaskingCanvas from "@/components/MaskingCanvas";
 import MaskingTools from "@/components/MaskingTools";
@@ -84,20 +83,15 @@ export default function TemplateMaskSpokePage() {
     return () => clearInterval(timer);
   }, [frameStatus, refetch]);
 
-  // Monitor legacy job status for processing state transitions
-  const { data: legacyJobData } = useQuery({
-    queryKey: ["/api/videos", jobId],
-    refetchInterval: 2000,
-    enabled: !!jobId,
-  });
-
-  const legacyJob = (legacyJobData as any)?.job;
-
+  // Phase 4d-1b: the separate 2s GET /api/videos/:jobId poll was redundant — JobContext already
+  // refetches the V2 Job on the WebSocket 'progress' event that fires at apply completion/failure
+  // (videoProcessor.ts:403-458,1081). Drive the banner off the canonical templateMask spoke status.
   useEffect(() => {
-    if (legacyJob && isProcessing && (legacyJob.status === "completed" || legacyJob.status === "failed")) {
+    const tmStatus = job?.templateMask?.status;
+    if (isProcessing && (tmStatus === "complete" || tmStatus === "failed")) {
       setIsProcessing(false);
     }
-  }, [legacyJob, isProcessing]);
+  }, [job?.templateMask?.status, isProcessing]);
 
   const handleMaskUpdate = (newMaskData: MaskData) => setMaskData(newMaskData);
 
