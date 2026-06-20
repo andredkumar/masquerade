@@ -1,9 +1,11 @@
 /**
  * Shared handler logic for template-mask/apply.
  *
- * Called from two registration sites:
- *   1. PATCH /internal/mask-processing/:jobId  (index.ts — registered early to dodge Vite)
- *   2. POST  /api/jobs/:jobId/template-mask/apply  (routes.ts — canonical URL)
+ * Called from the canonical registration site:
+ *   POST /api/jobs/:jobId/template-mask/apply  (routes.ts — canonical URL)
+ *
+ * (The legacy PATCH /internal/mask-processing/:jobId thin wrapper in index.ts
+ *  that also delegated here was removed in Phase 4d-2.)
  *
  * This module is deliberately free of req/res — callers extract params from
  * the request and translate the result into an HTTP response.

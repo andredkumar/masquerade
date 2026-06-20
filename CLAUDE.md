@@ -35,8 +35,8 @@ Items deferred from Phases 1–3d. None are blocking Phase 4; all can be
 tackled independently in any order after Phase 4 frontend migration is
 verified.
 
-1. **Remove legacy URL aliases** — after Phase 4 frontend migration is verified, delete the old registrations: `POST /api/videos/upload`, `POST /api/images/upload`, `GET /api/videos/:jobId`, `GET /api/videos/:jobId/download`, `PATCH /internal/mask-processing/:jobId`, `POST /api/ai/infer`, `PATCH /api/ai/labels/:jobId/:labelId`, `DELETE /api/ai/labels/:jobId/:labelId`, `GET /api/jobs/:jobId/masks/:labelId/:n.png`, `GET /api/jobs/:jobId/overlays/:labelId/:n.png`.
-2. **Remove legacy thin-wrapper from `server/index.ts`** — the `PATCH /internal/mask-processing/:jobId` handler in `index.ts` delegates to the shared function in `server/handlers/templateMaskApply.ts`. After item 1, delete the wrapper from `index.ts`; keep the shared function and the canonical route in `routes.ts`.
+1. ~~**Remove legacy URL aliases**~~ — **DONE in Phase 4d-2 (2026-06-20).** All 11 legacy alias registrations deleted from `routes.ts`; `getLegacyJobHandler`'s definition deleted too (legacy-exclusive dead code). Only canonical URLs registered.
+2. ~~**Remove legacy thin-wrapper from `server/index.ts`**~~ — **DONE in Phase 4d-2 (2026-06-20).** `PATCH /internal/mask-processing/:jobId` wrapper + the dead `applyTemplateMask` import removed from `index.ts`; shared function and canonical route kept.
 3. **Rename `tempFolderManager.ts`** — it manages `spokes/template_mask/`, not `temp_processed/`. Name no longer reflects purpose post-3a.
 4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days.
 5. **Fix path-traversal guard in `TempFolderManager`** — Phase 1 surprise. Security concern: the `resolve + startsWith` check may be bypassable. Audit and harden.
@@ -48,7 +48,8 @@ verified.
 11. **`PgStorage` stub maintenance** — decide whether to keep throw-stubs vs. remove `PgStorage` entirely. All runtime storage is `MemStorage` (deferred since Phase 2).
 12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
-14. **Delete `home.tsx` and any other legacy step containers in 4d** — after 4b/4c migrate spoke contents to canonical URLs, `home.tsx` and the `/app` route can be removed.
+14. ~~**Delete `home.tsx` and any other legacy step containers in 4d**~~ — **DONE in Phase 4d-2 (2026-06-20).** `home.tsx` + `FileUpload.tsx` (home-only) deleted; `/app` route + `Home` import removed from `App.tsx`; `landing.tsx` CTA `/app`→`/upload`.
+16. **Remove dead `POST /api/videos/:jobId/process`** — examined during Phase 4d-2: zero client callers (no constructor in `client/src`; the canonical processing path used by all spokes is `POST /api/jobs/:jobId/template-mask/apply`). It matches `/api/videos/`, so the empty live legacy sweep confirms no caller. Left in 4d-2 (not on the alias removal list) but it is dead legacy and can be deleted.
 15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX.
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
@@ -236,6 +237,44 @@ on the backend.**
   fresh session** before any irreversible removal. The static audit is necessary but **not
   sufficient** for a one-way door; the live check is the authoritative gate for 4d-2.
 
+### Phase 4d-2 landed — one-way legacy teardown; Phase 4 frontend migration COMPLETE (2026-06-20)
+
+The final, irreversible step. After the 4d-1b live-log gate confirmed zero canonical-app
+callers on any legacy URL, the legacy surface was removed. **`/app` now 404s by design.**
+
+- **Backend — 11 legacy alias registrations deleted from `routes.ts`** (canonical URLs +
+  shared handlers kept; only the legacy `app.<method>` line removed per alias):
+  `POST /api/videos/upload`, `POST /api/images/upload`, `GET /api/videos/:jobId`,
+  `GET /api/videos/:jobId/download`, `POST /api/ai/infer`,
+  `PATCH /api/ai/labels/:jobId/:labelId`, `DELETE /api/ai/labels/:jobId/:labelId`,
+  `GET /api/ai/labels/:jobId` (inline handler, not an alias — removed whole),
+  `GET /api/jobs/:jobId/masks/:labelId/:n.png` (labelId-only),
+  `GET /api/jobs/:jobId/overlays/:labelId/:n.png` (labelId-only). Every named handler
+  (`videoUploadHandler`, `imageUploadHandler`, `templateMaskDownloadHandler`,
+  `aiInferHandler`, `patchLabelHandler`, `deleteLabelHandler`, `getMaskHandler`,
+  `getOverlayHandler`) still has its canonical registration → zero dangling refs.
+- **`getLegacyJobHandler` definition deleted too** (not just its registration). Grep
+  confirmed line 460 was its only code reference (the rest were docs); legacy-exclusive,
+  so it became pure dead code once `GET /api/videos/:jobId` was removed. `getJobV2Handler`
+  + `GET /api/jobs/:jobId` untouched.
+- **`index.ts` wrapper removed** — `PATCH /internal/mask-processing/:jobId` thin wrapper +
+  the now-dead `import { applyTemplateMask }`. The shared `templateMaskApply.ts` function +
+  canonical `POST /api/jobs/:jobId/template-mask/apply` stay. Stale header comment in
+  `templateMaskApply.ts` (which listed the removed wrapper as a second call site) corrected.
+- **Frontend — two files deleted, import-graph verified:** `pages/home.tsx` (legacy SPA
+  monolith) and `components/FileUpload.tsx` (home-only — imported solely at `home.tsx:3`).
+  All of home's other imports (incl. `ProcessingStatus`) are shared with canonical spokes
+  and stay. `App.tsx`: removed `import Home` + `<Route path="/app">`. `landing.tsx`: CTA
+  `<Link href="/app">` → `href="/upload"`.
+- **`/api/videos/:jobId/process` examined, left, flagged** — dead legacy (zero client
+  callers; canonical processing is `template-mask/apply`). Not on the alias list; added to
+  the cleanup backlog (item 16) as a removal candidate. No unexamined legacy survivor.
+- **Verification:** post-removal route grep shows zero legacy alias registrations (only the
+  flagged `/process` + two doc comments); masks/overlays greps show only canonical
+  runId-scoped registrations; client dangling-import grep (`home`/`FileUpload`/`/app`) empty;
+  `npx tsc --noEmit` = **17** (10 `frameExtractor.ts` + 7 `maskWorker.ts`), unchanged from
+  baseline — the deleted files carried none of the 17. See `PHASE_4D2_REPORT.md`.
+
 ### Post-4d AI-spoke canvas polish — FLAGGED, NOT fixed (2026-06-18)
 
 Two AI-spoke canvas issues observed during 4d work. Diagnosis only — they belong
@@ -332,23 +371,26 @@ the frontend migration.
 
 ## URL hierarchy (Phase 3c + 3d)
 
-New canonical URLs follow a resource hierarchy. Old URLs are preserved as
-aliases (same handler, two registrations). Frontend still uses old URLs;
-Phase 4 migrates.
+New canonical URLs follow a resource hierarchy. Old URLs were preserved as
+aliases (same handler, two registrations) through Phase 4. **Phase 4d-2
+(2026-06-20) deleted every legacy alias below — only the canonical URLs are
+registered now.** The "Legacy URL (alias)" column is retained for historical
+reference; those routes 404 today.
 
-| Legacy URL (alias) | Canonical URL | Method | Notes |
+| Legacy URL (alias) — **REMOVED 4d-2** | Canonical URL | Method | Notes |
 |---|---|---|---|
-| `POST /api/videos/upload` | `POST /api/uploads/video` | Video upload | |
-| `POST /api/images/upload` | `POST /api/uploads/images` | Image batch upload | |
-| `GET /api/videos/:jobId` | `GET /api/jobs/:jobId` | Legacy job state | Returns `VideoJob` + progress. **4d-1b:** zero canonical-app constructors (incl. queryKey-array form); only `home.tsx:57` remains (home-only, dies in 4d-2). Live-log re-check is the 4d-2 gate. |
-| — | `GET /api/jobs/:jobId` | Job V2 state | Returns `Job` (hub-and-spoke shape). **Split from legacy in 4a** — these are now separate handlers. |
-| `GET /api/videos/:jobId/download` | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
-| `PATCH /internal/mask-processing/:jobId` | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger |
-| `POST /api/ai/infer` | `POST /api/jobs/:jobId/ai/runs` | Create AI run |
-| `PATCH /api/ai/labels/:jobId/:labelId` | `PATCH /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Approve label |
-| `DELETE /api/ai/labels/:jobId/:labelId` | `DELETE /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Delete label |
-| `GET /api/jobs/:jobId/masks/:labelId/:n.png` | `GET /api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png` | Mask PNG |
-| `GET /api/jobs/:jobId/overlays/:labelId/:n.png` | `GET /api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png` | Overlay PNG |
+| ~~`POST /api/videos/upload`~~ | `POST /api/uploads/video` | Video upload | |
+| ~~`POST /api/images/upload`~~ | `POST /api/uploads/images` | Image batch upload | |
+| ~~`GET /api/videos/:jobId`~~ | `GET /api/jobs/:jobId` | Legacy job state | Returned `VideoJob` + progress via `getLegacyJobHandler`. **4d-2:** alias + the `getLegacyJobHandler` definition deleted (legacy-exclusive dead code). |
+| — | `GET /api/jobs/:jobId` | Job V2 state | Returns `Job` (hub-and-spoke shape). **Split from legacy in 4a** — separate handler (`getJobV2Handler`), unaffected by 4d-2. |
+| ~~`GET /api/videos/:jobId/download`~~ | `GET /api/jobs/:jobId/template-mask/download` | Path A ZIP |
+| ~~`PATCH /internal/mask-processing/:jobId`~~ | `POST /api/jobs/:jobId/template-mask/apply` | Path A trigger | Wrapper removed from `index.ts`; shared `applyTemplateMask` kept. |
+| ~~`POST /api/ai/infer`~~ | `POST /api/jobs/:jobId/ai/runs` | Create AI run |
+| ~~`PATCH /api/ai/labels/:jobId/:labelId`~~ | `PATCH /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Approve label |
+| ~~`DELETE /api/ai/labels/:jobId/:labelId`~~ | `DELETE /api/jobs/:jobId/ai/runs/:runId/labels/:labelId` | Delete label |
+| ~~`GET /api/ai/labels/:jobId`~~ | `GET /api/jobs/:jobId/ai/runs` (run-scoped list) | List labels | Inline handler removed whole in 4d-2 (not a paired alias). |
+| ~~`GET /api/jobs/:jobId/masks/:labelId/:n.png`~~ | `GET /api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png` | Mask PNG |
+| ~~`GET /api/jobs/:jobId/overlays/:labelId/:n.png`~~ | `GET /api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png` | Overlay PNG |
 
 Net-new (no legacy alias):
 

@@ -41,7 +41,7 @@ export default function Landing() {
                     Get Beta Access
                   </Button>
                 </a>
-                <Link href="/app">
+                <Link href="/upload">
                   <Button size="lg" variant="outline" className="text-lg px-8 py-6 w-full sm:w-auto" data-testid="button-start-app">
                     Already Signed Up? Start Here
                     <ArrowRight className="ml-2" size={20} />

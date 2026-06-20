@@ -4,7 +4,6 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import Landing from "@/pages/landing";
-import Home from "@/pages/home";
 import UploadPage from "@/pages/upload";
 import HubPage from "@/pages/hub";
 import TemplateMaskSpokePage from "@/pages/template-mask-spoke";
@@ -50,8 +49,6 @@ function Router() {
       <Route path="/jobs/:jobId" nest>
         {() => <JobRoutes />}
       </Route>
-      {/* Legacy routes preserved */}
-      <Route path="/app" component={Home} />
       <Route path="/terms" component={Terms} />
       <Route path="/privacy" component={Privacy} />
       <Route component={NotFound} />

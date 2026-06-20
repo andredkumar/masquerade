@@ -321,7 +321,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   };
-  app.post("/api/videos/upload", upload.single('video'), videoUploadHandler);   // legacy
   app.post("/api/uploads/video", upload.single('video'), videoUploadHandler);   // canonical
 
   // Upload multiple image files and create job
@@ -431,35 +430,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   };
-  app.post("/api/images/upload", imageUpload.array('images'), imageUploadHandler);   // legacy
   app.post("/api/uploads/images", imageUpload.array('images'), imageUploadHandler);  // canonical
 
-  // Get job status and progress
-  // Legacy: returns VideoJob + progress (unchanged from Phase 1)
-  const getLegacyJobHandler: import('express').RequestHandler = async (req, res) => {
-    try {
-      const job = await storage.getVideoJob(req.params.jobId);
-      if (!job) {
-        return res.status(404).json({ error: "Job not found" });
-      }
-
-      const progress = await storage.getProcessingProgress(req.params.jobId);
-
-      res.json({
-        job,
-        progress
-      });
-
-    } catch (error) {
-      console.error("Get job error:", error);
-      res.status(500).json({
-        error: error instanceof Error ? error.message : "Failed to get job"
-      });
-    }
-  };
-  app.get("/api/videos/:jobId", getLegacyJobHandler);  // legacy alias
-
-  // Canonical: returns Job V2 (hub-and-spoke shape) from jobsV2 MemStorage
+  // Get job status (Job V2, hub-and-spoke shape) from jobsV2 MemStorage
   const getJobV2Handler: import('express').RequestHandler = async (req, res) => {
     try {
       const job = await storage.getJobV2(req.params.jobId);
@@ -851,7 +824,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     }
   };
-  app.get("/api/videos/:jobId/download", templateMaskDownloadHandler);            // legacy alias
   app.get("/api/jobs/:jobId/template-mask/download", templateMaskDownloadHandler); // canonical
 
   // ── AI: Parse natural language command into structured intent ──
@@ -1101,7 +1073,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   };
-  app.post("/api/ai/infer", aiInferHandler);              // legacy alias
   app.post("/api/jobs/:jobId/ai/runs", aiInferHandler);    // canonical
 
   // ── AI: Health check for the Python AI service ───────────────
@@ -1134,20 +1105,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ── AI Labels: CRUD for session-based labels ─────────────────
-
-  // GET all labels for a job
-  app.get("/api/ai/labels/:jobId", async (req, res) => {
-    try {
-      const job = await storage.getVideoJob(req.params.jobId);
-      if (!job) {
-        return res.status(404).json({ error: "Job not found" });
-      }
-      res.json({ labels: ((job as any).aiLabels || []) as AiLabel[] });
-    } catch (error) {
-      console.error("Get labels error:", error);
-      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to get labels" });
-    }
-  });
+  // (legacy GET /api/ai/labels/:jobId removed in Phase 4d-2 — canonical list is the
+  //  run-scoped GET /api/jobs/:jobId/ai/runs)
 
   // PATCH toggle approved on a label
   const patchLabelHandler: import('express').RequestHandler = async (req, res) => {
@@ -1190,7 +1149,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.status(500).json({ error: error instanceof Error ? error.message : "Failed to update label" });
     }
   };
-  app.patch("/api/ai/labels/:jobId/:labelId", patchLabelHandler);                              // legacy alias
   app.patch("/api/jobs/:jobId/ai/runs/:runId/labels/:labelId", patchLabelHandler);              // canonical
 
   // DELETE a label
@@ -1232,7 +1190,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete label" });
     }
   };
-  app.delete("/api/ai/labels/:jobId/:labelId", deleteLabelHandler);                              // legacy alias
   app.delete("/api/jobs/:jobId/ai/runs/:runId/labels/:labelId", deleteLabelHandler);              // canonical
 
   // WebSocket connection handling
@@ -1502,8 +1459,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   /**
-   * GET /api/jobs/:jobId/masks/:labelId/:n.png                        (legacy alias)
    * GET /api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png         (canonical)
+   *   (legacy alias GET /api/jobs/:jobId/masks/:labelId/:n.png removed in Phase 4d-2)
    *
    *   200: streams the binary mask PNG for the (label, frame) pair
    *   404: labelId doesn't exist on this job, or mask file missing
@@ -1549,12 +1506,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     }
   };
-  app.get("/api/jobs/:jobId/masks/:labelId/:n.png", getMaskHandler);                             // legacy alias
   app.get("/api/jobs/:jobId/ai/runs/:runId/masks/:labelId/:n.png", getMaskHandler);              // canonical
 
   /**
-   * GET /api/jobs/:jobId/overlays/:labelId/:n.png                     (legacy alias)
    * GET /api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png      (canonical)
+   *   (legacy alias GET /api/jobs/:jobId/overlays/:labelId/:n.png removed in Phase 4d-2)
    *
    * Same shape as the mask endpoint, but serves the GPU's pre-rendered
    * overlay PNG (original frame with green tint on the mask region).
@@ -1600,7 +1556,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     }
   };
-  app.get("/api/jobs/:jobId/overlays/:labelId/:n.png", getOverlayHandler);                       // legacy alias
   app.get("/api/jobs/:jobId/ai/runs/:runId/overlays/:labelId/:n.png", getOverlayHandler);        // canonical
 
   // ── Frames endpoint (Phase 4b) ──────────────────────────────────────────
@@ -1676,9 +1631,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ── Net-new CRUD endpoints (Phase 3c) ──────────────────────────────────
 
   // POST /api/jobs/:jobId/template-mask/apply — canonical URL for template-mask
-  // processing. Shares handler logic with PATCH /internal/mask-processing/:jobId
-  // (registered early in index.ts to dodge Vite middleware) via the shared
-  // applyTemplateMask function in server/handlers/templateMaskApply.ts.
+  // processing, via the shared applyTemplateMask function in
+  // server/handlers/templateMaskApply.ts. (The legacy PATCH /internal/mask-processing/:jobId
+  // thin wrapper that also delegated here was removed in Phase 4d-2.)
   app.post("/api/jobs/:jobId/template-mask/apply", async (req, res) => {
     try {
       const { maskData, outputSettings, samplingFps } = req.body || {};

@@ -2,7 +2,6 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { checkFFmpegInstallation, displaySystemStatus } from "./utils/systemCheck";
-import { applyTemplateMask } from "./handlers/templateMaskApply";
 
 const app = express();
 
@@ -22,28 +21,6 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '50mb' })); // Increase limit to handle large canvas data
 app.use(express.urlencoded({ extended: false }));
-
-// Legacy mask-processing endpoint — registered before Vite middleware to avoid
-// interception (Phase 1 finding). Delegates to the shared applyTemplateMask
-// function so behaviour is identical to POST /api/jobs/:jobId/template-mask/apply.
-app.patch("/internal/mask-processing/:jobId", async (req, res) => {
-  try {
-    const { maskData, outputSettings, samplingFps } = req.body || {};
-    const result = await applyTemplateMask(
-      req.params.jobId, maskData, outputSettings, samplingFps, (global as any).socketIo,
-    );
-    if (!result.ok) {
-      return res.status(result.status).json({ success: false, error: result.error });
-    }
-    res.json({ success: true, message: 'Processing started', jobId: result.jobId });
-  } catch (error) {
-    console.error("Mask endpoint error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Failed to store mask data"
-    });
-  }
-});
 
 app.use((req, res, next) => {
   const start = Date.now();
