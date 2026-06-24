@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -25,6 +26,9 @@ interface CommandInputProps {
   onMaskGenerated: (maskBase64: string, aiLabel?: { intent: string; target: string; confidence: number | null; model: string }) => void;
   onLabelAdded?: () => void;
   selectedTask?: string;
+  // 5A relocation: when provided, the bbox drawing surface is portaled into
+  // this host (the main canvas area) instead of rendering inline in the sidebar.
+  canvasContainer?: HTMLElement | null;
 }
 
 const MODALITY_OPTIONS: Array<{ id: Modality; emoji: string; label: string }> = [
@@ -95,7 +99,7 @@ const CYAN_FILL = 'rgba(34, 211, 238, 0.20)';
 const CYAN_STROKE = 'rgba(34, 211, 238, 0.95)';
 const CYAN_DASH = 'rgba(34, 211, 238, 0.85)';
 
-export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, modality, onModalityChange, onMaskGenerated, onLabelAdded, selectedTask = 'segment' }: CommandInputProps) {
+export default function CommandInput({ jobId, currentFrame, firstFrameBase64, videoMetadata, modality, onModalityChange, onMaskGenerated, onLabelAdded, selectedTask = 'segment', canvasContainer }: CommandInputProps) {
   const [command, setCommand] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMessage, setStatusMessage] = useState('');
@@ -243,8 +247,22 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
   useEffect(() => {
     syncCanvasSize();
     window.addEventListener('resize', syncCanvasSize);
-    return () => window.removeEventListener('resize', syncCanvasSize);
-  }, [syncCanvasSize]);
+    // 5A relocation (Bug 2): the surface now renders in the larger main canvas
+    // area via a portal. A single onLoad/window-resize measure can latch a
+    // stale getBoundingClientRect() while the bigger container is still laying
+    // out, mis-scaling the prompt. Observe the frame element directly so
+    // displaySize always tracks the actual rendered box at the new size.
+    let ro: ResizeObserver | null = null;
+    const img = imgRef.current;
+    if (img && typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => syncCanvasSize());
+      ro.observe(img);
+    }
+    return () => {
+      window.removeEventListener('resize', syncCanvasSize);
+      if (ro) ro.disconnect();
+    };
+  }, [syncCanvasSize, canvasContainer, firstFrameBase64]);
 
   useEffect(() => {
     redraw(shape, polygonHover, displaySize.w, displaySize.h);
@@ -559,7 +577,105 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
     </button>
   );
 
+  // 5A relocation: the bbox drawing surface is carried over verbatim from the
+  // sidebar (same toolbar, same img/canvas, same pointer handlers, same
+  // syncCanvasSize/displaySize/toImagePixelBox path) and only its render
+  // location + size change. The <canvas> overlays the frame <img> element
+  // itself (absolute inset-0 over the <img>, img kept `block w-full h-auto`),
+  // so displaySize is measured from the exact element the canvas covers — the
+  // toImagePixelBox transform stays correct at the larger size with no math
+  // change. When canvasContainer is provided this is portaled into the main
+  // canvas area; otherwise it falls back to rendering inline.
+  const drawingSurface = firstFrameBase64 ? (
+    <div className="w-full max-w-3xl space-y-2">
+      <p className="text-[11px] text-muted-foreground leading-tight">
+        Draw around the structure you want to segment, then type what it is in the sidebar and click Run AI.
+        {mode === 'polygon' && ' Click to add points, double-click to close.'}
+      </p>
+
+      {/* Compact toolbar — icons only.
+          Mode buttons | divider | Undo | Clear-all */}
+      <div className="flex items-center gap-1">
+        {modeBtn('rect', IconSquare, 'Rectangle')}
+        {modeBtn('circle', IconCircle, 'Circle')}
+        {modeBtn('polygon', IconHexagon, 'Polygon')}
+        {modeBtn('brush', IconBrush, 'Brush')}
+        <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+        <button
+          type="button"
+          onClick={handleUndo}
+          disabled={!canUndo}
+          title={canUndo
+            ? (shape?.type === 'polygon' && !shape.completed
+              ? 'Undo last vertex (⌘Z / Ctrl+Z)'
+              : 'Undo last bbox (⌘Z / Ctrl+Z)')
+            : 'Nothing to undo'}
+          aria-label="Undo last"
+          className={`p-1.5 rounded ${
+            canUndo
+              ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
+              : 'text-muted-foreground/40 cursor-not-allowed'
+          }`}
+          data-testid="bbox-undo"
+        >
+          <IconUndo size={14} />
+        </button>
+        <button
+          type="button"
+          onClick={handleClearAll}
+          disabled={!shape}
+          title={shape ? 'Clear all' : 'Nothing to clear'}
+          aria-label="Clear all"
+          className={`p-1.5 rounded ${
+            shape
+              ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
+              : 'text-muted-foreground/40 cursor-not-allowed'
+          }`}
+          data-testid="bbox-clear-all"
+        >
+          <IconClearAll size={14} />
+        </button>
+      </div>
+
+      <div className="relative inline-block w-full rounded-md overflow-hidden border border-border bg-black">
+        <img
+          ref={imgRef}
+          src={previewSrc || undefined}
+          alt="Frame preview"
+          className="block w-full h-auto select-none"
+          draggable={false}
+          onLoad={syncCanvasSize}
+          data-testid="command-frame-preview"
+        />
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full"
+          style={{ cursor }}
+          onMouseDown={onMouseDown}
+          onMouseMove={onMouseMove}
+          onMouseUp={onMouseUp}
+          onMouseLeave={onMouseUp}
+          onClick={onClickCanvas}
+          onDoubleClick={onDoubleClickCanvas}
+          data-testid="command-bbox-canvas"
+        />
+        {shape && (
+          <button
+            type="button"
+            onClick={clearShape}
+            className="absolute top-1 right-1 flex items-center gap-1 rounded bg-background/90 text-foreground border border-border px-1.5 py-0.5 text-[10px] shadow-sm hover:bg-muted"
+            data-testid="command-clear-box"
+          >
+            <X size={10} />
+            Clear box
+          </button>
+        )}
+      </div>
+    </div>
+  ) : null;
+
   return (
+    <>
     <div className="px-4 py-3 space-y-3">
       {/* Modality selector — must be chosen before Run AI is enabled */}
       <div className="space-y-1.5">
@@ -588,94 +704,9 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
         </div>
       </div>
 
-      {/* Frame preview with bbox drawing canvas (in-sidebar) */}
-      {firstFrameBase64 && (
-        <div className="space-y-1.5">
-          <p className="text-[11px] text-muted-foreground leading-tight">
-            Draw around the structure you want to segment, then type what it is and click Run.
-            {mode === 'polygon' && ' Click to add points, double-click to close.'}
-          </p>
-
-          {/* Compact toolbar — icons only.
-              Mode buttons | divider | Undo | Clear-all */}
-          <div className="flex items-center gap-1">
-            {modeBtn('rect', IconSquare, 'Rectangle')}
-            {modeBtn('circle', IconCircle, 'Circle')}
-            {modeBtn('polygon', IconHexagon, 'Polygon')}
-            {modeBtn('brush', IconBrush, 'Brush')}
-            <span className="mx-1 h-4 w-px bg-border" aria-hidden />
-            <button
-              type="button"
-              onClick={handleUndo}
-              disabled={!canUndo}
-              title={canUndo
-                ? (shape?.type === 'polygon' && !shape.completed
-                  ? 'Undo last vertex (⌘Z / Ctrl+Z)'
-                  : 'Undo last bbox (⌘Z / Ctrl+Z)')
-                : 'Nothing to undo'}
-              aria-label="Undo last"
-              className={`p-1.5 rounded ${
-                canUndo
-                  ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                  : 'text-muted-foreground/40 cursor-not-allowed'
-              }`}
-              data-testid="bbox-undo"
-            >
-              <IconUndo size={14} />
-            </button>
-            <button
-              type="button"
-              onClick={handleClearAll}
-              disabled={!shape}
-              title={shape ? 'Clear all' : 'Nothing to clear'}
-              aria-label="Clear all"
-              className={`p-1.5 rounded ${
-                shape
-                  ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                  : 'text-muted-foreground/40 cursor-not-allowed'
-              }`}
-              data-testid="bbox-clear-all"
-            >
-              <IconClearAll size={14} />
-            </button>
-          </div>
-
-          <div className="relative inline-block w-full rounded-md overflow-hidden border border-border bg-black">
-            <img
-              ref={imgRef}
-              src={previewSrc || undefined}
-              alt="Frame preview"
-              className="block w-full h-auto select-none"
-              draggable={false}
-              onLoad={syncCanvasSize}
-              data-testid="command-frame-preview"
-            />
-            <canvas
-              ref={canvasRef}
-              className="absolute inset-0 w-full h-full"
-              style={{ cursor }}
-              onMouseDown={onMouseDown}
-              onMouseMove={onMouseMove}
-              onMouseUp={onMouseUp}
-              onMouseLeave={onMouseUp}
-              onClick={onClickCanvas}
-              onDoubleClick={onDoubleClickCanvas}
-              data-testid="command-bbox-canvas"
-            />
-            {shape && (
-              <button
-                type="button"
-                onClick={clearShape}
-                className="absolute top-1 right-1 flex items-center gap-1 rounded bg-background/90 text-foreground border border-border px-1.5 py-0.5 text-[10px] shadow-sm hover:bg-muted"
-                data-testid="command-clear-box"
-              >
-                <X size={10} />
-                Clear box
-              </button>
-            )}
-          </div>
-        </div>
-      )}
+      {/* 5A relocation: the bbox drawing surface moved to the main canvas area.
+          When no host is available it renders inline below as a fallback. */}
+      {!canvasContainer && drawingSurface}
 
       <div className="flex gap-2">
         <Input
@@ -746,5 +777,9 @@ export default function CommandInput({ jobId, currentFrame, firstFrameBase64, vi
         </div>
       )}
     </div>
+    {canvasContainer && drawingSurface
+      ? createPortal(drawingSurface, canvasContainer)
+      : null}
+    </>
   );
 }

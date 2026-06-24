@@ -293,6 +293,32 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
     return urls;
   }, [viewerInfo, inferenceData, currentFrame, mode, visibleLabels, frameUrl, overlayUrl]);
 
+  // ── Continue-to-download (Bug 3) ────────────────────────────────────
+  // The per-frame label payload already carries the owning AIRun id (4d-1).
+  // Collect the distinct runIds across all frames so the canonical run-scoped
+  // download endpoint (GET /api/jobs/:jobId/ai/runs/:runId/download) can be hit
+  // directly — the same window.open pattern as the working template-mask
+  // download in ProcessingStatus.tsx. 5A contract is one shape per Run, so the
+  // normal case is a single run; if more than one is somehow present we fall
+  // back to N sequential single-run downloads (no multi-run UI).
+  const distinctRunIds = useMemo(() => {
+    if (!inferenceData) return [];
+    const ids = new Set<string>();
+    for (const labels of Object.values(inferenceData.frames)) {
+      for (const l of labels) {
+        if (l.runId) ids.add(l.runId);
+      }
+    }
+    return Array.from(ids);
+  }, [inferenceData]);
+
+  const handleContinueToDownload = useCallback(() => {
+    for (const runId of distinctRunIds) {
+      window.open(`/api/jobs/${jobId}/ai/runs/${runId}/download`, '_blank');
+    }
+    onContinueToDownload();
+  }, [distinctRunIds, jobId, onContinueToDownload]);
+
   // ── Render ──────────────────────────────────────────────────────────
 
   if (loading) {
@@ -613,7 +639,7 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
             Back to AI Analysis
           </Button>
         ) : <span />}
-        <Button size="sm" onClick={onContinueToDownload} data-testid="viewer-continue">
+        <Button size="sm" onClick={handleContinueToDownload} data-testid="viewer-continue">
           Continue to Download
           <ArrowRight size={14} className="ml-1" />
         </Button>

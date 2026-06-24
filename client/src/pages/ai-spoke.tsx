@@ -4,10 +4,9 @@ import { useJob } from "@/contexts/JobContext";
 import CommandInput, { type Modality } from "@/components/CommandInput";
 import TaskSelector from "@/components/TaskSelector";
 import FrameViewer from "@/components/FrameViewer";
-import MaskingCanvas from "@/components/MaskingCanvas";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, FileVideo, Check, X, Trash2 } from "lucide-react";
-import type { MaskData, AiLabel, AIRun } from "@shared/schema";
+import type { AiLabel, AIRun } from "@shared/schema";
 import { getCachedMetadata } from "@/lib/frameCache";
 import { colorForLabelId } from "@/lib/labelColor";
 
@@ -24,12 +23,15 @@ export default function AiSpokePage() {
 
   // Local state — mirrors home.tsx Step 4
   const [firstFrame, setFirstFrame] = useState<string | null>(null);
-  const [maskData, setMaskData] = useState<MaskData | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [selectedTask, setSelectedTask] = useState("segment");
   const [modality, setModality] = useState<Modality | null>(null);
   const [viewerActive, setViewerActive] = useState(false);
   const [aiLabels, setAiLabels] = useState<AiLabelWithRun[]>([]);
+  // 5A relocation: host element in the main canvas area that CommandInput
+  // portals its bbox drawing surface into. Callback ref so a re-render is
+  // triggered once the host mounts and the portal target becomes available.
+  const [canvasHost, setCanvasHost] = useState<HTMLDivElement | null>(null);
 
   // Build videoMetadata from Job V2 source or cached upload response
   const videoMetadata = job
@@ -116,20 +118,6 @@ export default function AiSpokePage() {
     if (jobReady) fetchLabels();
   }, [jobReady, fetchLabels]);
 
-  const handleAiMaskGenerated = (
-    maskBase64: string,
-    aiLabel?: { intent: string; target: string; confidence: number | null; model: string },
-  ) => {
-    const aiMask: MaskData = {
-      type: "freeform",
-      coordinates: { x: 0, y: 0, width: 0, height: 0 },
-      opacity: 75,
-      canvasDataUrl: `data:image/png;base64,${maskBase64}`,
-      aiLabel,
-    };
-    setMaskData(aiMask);
-  };
-
   const handleToggleLabel = async (label: AiLabelWithRun, approved: boolean) => {
     if (!jobId) return;
     try {
@@ -209,9 +197,10 @@ export default function AiSpokePage() {
                 videoMetadata={videoMetadata}
                 modality={modality}
                 onModalityChange={setModality}
-                onMaskGenerated={handleAiMaskGenerated}
+                onMaskGenerated={() => {}}
                 onLabelAdded={fetchLabels}
                 selectedTask={selectedTask}
+                canvasContainer={canvasHost}
               />
 
               {/* AI Label list */}
@@ -334,16 +323,15 @@ export default function AiSpokePage() {
               onBackToInference={() => setViewerActive(false)}
             />
           ) : (
-            <div className="flex-1 p-6 relative">
-              <MaskingCanvas
-                firstFrame={firstFrame}
-                selectedTool="rectangle"
-                onMaskUpdate={() => {}}
-                zoom={75}
-                onZoomChange={() => {}}
-                maskData={maskData}
-              />
-            </div>
+            // 5A relocation (Bug 1): the dead, wrong-mode MaskingCanvas instance
+            // (selectedTool="rectangle", onMaskUpdate no-op, hardcoded zoom) is
+            // removed. This host is the portal target for CommandInput's real
+            // bbox drawing surface, which overlays the masked frame as backdrop.
+            <div
+              ref={setCanvasHost}
+              className="flex-1 min-h-0 overflow-auto p-6 flex items-start justify-center"
+              data-testid="ai-canvas-host"
+            />
           )}
         </main>
       </div>

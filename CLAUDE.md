@@ -1,5 +1,97 @@
 # Masquerade
 
+## Status — Phase 4 COMPLETE (verified 2026-06-20)
+
+Phase 4 (frontend hub-and-spoke migration) is **fully deployed and live-verified.**
+The app now runs entirely on canonical `/api/jobs/:jobId/...` URLs; the legacy
+`VideoJob` dual-record and legacy URL surface are gone from the active path.
+`tsc` baseline unchanged at **17** (10 `frameExtractor.ts` + 7 `maskWorker.ts`).
+
+Sub-phases — all landed + verified:
+- **4a** — routing scaffolding + hub page + both spoke pages (went beyond original scope).
+- **4b-0** — raw frames moved to disk; `processVideo` made re-entrant (commit `b734e6d`);
+  a tripwire test guards the directory-nesting class.
+- **4b-i** — template-mask spoke on canonical URLs.
+- **4b-ii** — AI spoke on canonical URLs; AI gate changed to `job.status==='ready'`
+  (template masking is **OPTIONAL** — AI runs on raw frames via masked-first/raw-fallback);
+  masked-frame staleness fixed with `&v=completedAt` cache-bust.
+- **4d-1** — straggler migration (CommandInput infer, ProcessingStatus download,
+  FrameViewer overlay) + surgical backend `runId` added to `inference.json` payload + exhaustive audit.
+- **4d-1b** — migrated two queryKey-array status polls the 4d-1 literal-grep audit missed
+  (ProcessingStatus + template-mask-spoke, `['/api/videos', jobId]` → `['/api/jobs', jobId]`/`useJob()`).
+- **4d-2** — one-way teardown: removed 11 legacy URL aliases, the `/internal/mask-processing`
+  wrapper, `getLegacyJobHandler`, `home.tsx`, `FileUpload.tsx`, and the `/app` route. App runs
+  entirely on canonical URLs. Live-verified: zero 404s, zero legacy hits across every workflow;
+  `/app` 404s by design; raw-frame durability intact.
+
+### Phase 4 lessons (binding for future work)
+
+- **Re-entrancy bugs are invisible to static path analysis** — test functions for safe
+  re-invocation with first-run residue present (the 4b-0 saga).
+- **Static URL audits miss dynamically-constructed URLs** — react-query queryKey arrays
+  (`['/api/videos', jobId]`), base-path concatenation, segment joins. A literal-string grep is
+  necessary but **NOT sufficient**; confirm with a **live log / Network check on a fresh session**
+  before any irreversible removal. (The 4d-1b catch: a queryKey-array poll a literal grep missed,
+  caught only by the live sweep before 4d-2 would have 404'd it.)
+- **Split irreversible steps from reversible prep** — 4d-1/4d-1b (migrate + audit, reversible)
+  then 4d-2 (one-way removal). This caught a real production-breaking dependency before removal.
+- **Many "bugs" were observation artifacts, not real bugs** — phantom frame deletion
+  (timing/stale-tab), "old code running" (server on wrong SHA / cached bundle), 0-frame reads
+  (wrong working directory). Verify actual state before acting; don't fix non-bugs.
+
+### Deploy-hygiene checklist
+
+- Confirm the server's `git log --oneline -1` matches the pushed SHA **before** building.
+- Run `npm`/build from **inside** `~/template-masking-app`, not `~`.
+- Hard-reload the browser after frontend deploys; confirm the `index-*.js` bundle hash changed.
+- Shell variables + multi-step disk checks: **one command per line** (mashing
+  `JOB_ID=... ls ... pm2 ...` onto one line silently fails).
+- EBS snapshot before every deploy; smoke-test every workflow on destructive phases.
+
+## Phase 5 — Post-refactor (priorities)
+
+Phase 5 likely **starts with 5A** (small, self-contained, user-visible frontend wins) while
+**5C** is scoped separately as the larger infra track. **5B** items are mostly independent small PRs.
+*(Suggested sequencing — not a decision.)*
+
+### 5A. AI-spoke canvas polish (frontend; flagged during Phase 4 — diagnosis recorded, not yet fixed)
+
+1. Shared `MaskingCanvas` exposes the template-mask rectangle-drawing affordance inside the AI
+   spoke; it should be **bbox-only** there. Likely needs a mode/context prop to scope drawing
+   behavior per spoke.
+2. The AI bbox renders **small and offset to the side** — likely a coordinate-space/scaling
+   mismatch between the displayed canvas and the native frame dimensions.
+3. The **"continue to download" button in the frame viewer renders but does nothing on click** —
+   the AI image/bbox bundle won't download (manifest/metadata export works fine). Likely a
+   runId-less or unwired handler on the single-run AI download path. *(To diagnose: open DevTools
+   Console, click the button; a thrown error names the cause — runId undefined / failed fetch /
+   404 — vs. silent = unwired handler.)*
+
+### 5B. Backend/infra cleanup backlog (carried from Phase 4)
+
+- Remove `/api/videos/:jobId/process` (confirmed dead legacy, no caller; flagged in 4d-2).
+- Rename `tempFolderManager.ts` (it manages `spokes/template_mask`, not `temp_processed`).
+- Remove `temp_processed/` from `SWEEP_TARGETS` + drop `purgeTempProcessedOnStartup` once confirmed quiet.
+- Add a **canonical progress source** so `ProcessingStatus` doesn't show 0% for a beat before the
+  first WebSocket progress event (the cosmetic first-paint flicker logged in 4d-1b).
+- Phase 1 security items: path-traversal guard in `TempFolderManager`; room-scope the global
+  Socket.IO progress broadcast (`videoProcessor.ts:~999/1081`); remove dead code; remove debug
+  endpoints (`/api/test-post`, `/test-non-api`) and any request-dump debug logging.
+- Resolve the invalid `ANTHROPIC_API_KEY` on prod (NLP intent parser currently falls back to the
+  keyword path).
+- `PgStorage` decision (keep stubs or remove).
+- Address or `@ts-expect-error` the 17 pre-existing `tsc` errors (`frameExtractor.ts` 10, `maskWorker.ts` 7).
+- Vite chunk-size warning (code splitting).
+- `attached_assets/` not in git (populated server-side) — commit or migrate to S3-served URLs.
+
+### 5C. Durability (the big infra item)
+
+- Replace `MemStorage` with Postgres-backed storage to end job-record volatility (jobs currently
+  wiped on PM2 restart; disk artifacts survive but `Job` records don't). Precondition for any
+  feature that needs jobs to persist across restarts; pairs with the eventual login/commercial tier.
+
+---
+
 **Phase 4a landed (May 2026):** Routing scaffolding, upload page, hub page. New routes: `/upload`, `/jobs/:jobId`, `/jobs/:jobId/template-mask`, `/jobs/:jobId/ai`. `/` now redirects to `/upload`. New `GET /api/jobs/:jobId` endpoint returns the `Job` V2 record (hub-and-spoke shape) from `jobsV2` MemStorage — the legacy `GET /api/videos/:jobId` still returns `VideoJob`. `JobContext` provider wraps all `/jobs/:jobId/*` routes, fetching job data and refetching on Socket.IO progress events. Upload page includes PHI attestation (radio group: "No PHI" / "Contains PHI") and sends `phiStatus: 'user_attested'` + `attestationRecord: { attestedAt, choice }` on POST. Hub page shows status strip (filename, PHI badge, source metadata), initializing panel (during extraction), and three spoke tiles (Template Mask, Classify or Label — disabled/"Coming soon", Run AI Models). Spoke pages are hybrid wrappers: they render the existing legacy UI components (`MaskingCanvas`, `MaskingTools`, `ProcessingControls`, `CommandInput`, `TaskSelector`, `FrameViewer`) inside the new route structure. Legacy components continue to read from legacy URLs — canonical URL migration is 4b/4c work. `home.tsx` remains in the codebase, accessible at `/app`; deleted in 4d. `AttestationRecord` type updated to `{ attestedAt: string, choice: 'contains_phi' | 'no_phi' }`.
 
 ### Phase 4a landed (2026-05-12)
