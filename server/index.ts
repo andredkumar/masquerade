@@ -54,7 +54,7 @@ app.use((req, res, next) => {
 
 (async () => {
   // Initialize temporary folder system
-  const { TempFolderManager } = await import('./services/tempFolderManager');
+  const { TempFolderManager } = await import('./services/templateMaskFolderManager');
   await TempFolderManager.initialize();
 
   // Disk cleanup: purge orphaned data from any previous process, ensure

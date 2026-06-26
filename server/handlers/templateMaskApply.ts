@@ -13,7 +13,7 @@
 
 import { storage } from '../storage';
 import { VideoProcessor } from '../services/videoProcessor';
-import { TempFolderManager } from '../services/tempFolderManager';
+import { TempFolderManager } from '../services/templateMaskFolderManager';
 
 export type TemplateMaskApplyResult =
   | { ok: true; jobId: string }

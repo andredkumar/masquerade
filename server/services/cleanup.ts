@@ -100,6 +100,48 @@ export async function safeDelete(absPath: string, allowedRoot: string): Promise<
   await fs.rm(resolvedTarget, { recursive: true, force: true });
 }
 
+/**
+ * Resolve `segments` under `root` and verify the result stays inside `root`.
+ *
+ * Construction-boundary companion to `safeDelete`: the same resolve-and-compare
+ * containment check, but applied where a path is BUILT (before any mkdir/write)
+ * rather than where it is deleted. Every helper that joins a caller-influenced
+ * component (jobId, runId) onto a known root routes through here, so a crafted
+ * `../` component can never escape the root.
+ *
+ * Each segment must be a single, non-empty path component — no separators, no
+ * `.`/`..`, no null byte. Anything else throws. For a server-generated UUID the
+ * returned path is byte-identical to `path.join(root, …)` (root is already
+ * absolute), so legitimate callers see no behavior change.
+ */
+export function resolveWithinRoot(root: string, ...segments: string[]): string {
+  for (const seg of segments) {
+    if (!seg || typeof seg !== 'string') {
+      throw new Error('resolveWithinRoot: empty or non-string path segment');
+    }
+    if (seg.includes('\0')) {
+      throw new Error('resolveWithinRoot: null byte in path segment');
+    }
+    if (seg === '.' || seg === '..' || seg.includes('/') || seg.includes('\\')) {
+      throw new Error(`resolveWithinRoot: illegal path segment "${seg}"`);
+    }
+  }
+
+  const resolvedRoot = path.resolve(root);
+  const target = path.resolve(resolvedRoot, ...segments);
+
+  // Same boundary check as safeDelete: equal to root, or a true descendant.
+  const isRoot = target === resolvedRoot;
+  const isDescendant = target.startsWith(resolvedRoot + path.sep);
+  if (!isRoot && !isDescendant) {
+    throw new Error(
+      `resolveWithinRoot refused: ${target} is not inside ${resolvedRoot}`
+    );
+  }
+
+  return target;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**

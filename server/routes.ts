@@ -110,24 +110,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const videoProcessor = new VideoProcessor(io);
   const frameExtractor = new FrameExtractor();
 
-  // Test endpoint to verify POST requests reach backend
-  app.post("/api/test-post", async (req, res) => {
-    console.log('\n🧪 TEST POST ENDPOINT HIT!');
-    console.log('==========================');
-    console.log('Body:', req.body);
-    console.log('==========================\n');
-    res.json({ success: true, message: 'Test POST received' });
-  });
-
-  // Test non-API route to verify it bypasses Vite
-  app.post("/test-non-api", async (req, res) => {
-    console.log('\n🧪 TEST NON-API ENDPOINT HIT!');
-    console.log('==============================');
-    console.log('Body:', req.body);
-    console.log('==============================\n');
-    res.json({ success: true, message: 'Non-API route works!' });
-  });
-
   // This endpoint has been moved to server/index.ts to avoid Vite interception
 
   // Upload video file and create job

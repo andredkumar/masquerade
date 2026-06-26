@@ -25,7 +25,7 @@
 
 import path from 'path';
 import { promises as fs } from 'fs';
-import { TEMP_EXTRACTED_DIR, SPOKE_AI_DIR, safeDelete } from './cleanup';
+import { TEMP_EXTRACTED_DIR, SPOKE_AI_DIR, safeDelete, resolveWithinRoot } from './cleanup';
 
 /** Subdir name for isolated apply-time frame re-extraction. */
 export const APPLY_SUBDIR = '_apply' as const;
@@ -56,8 +56,10 @@ export function assertNoSegmentDoubling(absPath: string): void {
  * Pure + idempotent: derived fresh from `TEMP_EXTRACTED_DIR` each call.
  */
 export function rawFramesDir(jobId: string): string {
-  assertJobId(jobId);
-  return path.join(TEMP_EXTRACTED_DIR, jobId);
+  // resolveWithinRoot validates jobId (non-empty, single segment, no traversal)
+  // and confirms containment under TEMP_EXTRACTED_DIR. Identical output to
+  // path.join(...) for a valid UUID.
+  return resolveWithinRoot(TEMP_EXTRACTED_DIR, jobId);
 }
 
 /**
@@ -68,8 +70,8 @@ export function rawFramesDir(jobId: string): string {
  * guarantees no re-suffixing across repeated applies.
  */
 export function applyStagingDir(jobId: string): string {
-  assertJobId(jobId);
-  return path.join(TEMP_EXTRACTED_DIR, jobId, APPLY_SUBDIR);
+  // Guarded jobId boundary; APPLY_SUBDIR is a constant single segment.
+  return resolveWithinRoot(TEMP_EXTRACTED_DIR, jobId, APPLY_SUBDIR);
 }
 
 /**
@@ -116,7 +118,7 @@ export async function cleanupApplyStaging(jobId: string): Promise<void> {
  * frames in the PARENT dir are never touched (the delete is `_apply`-bounded).
  */
 export async function prepareCleanApplyStaging(jobId: string): Promise<string> {
-  assertJobId(jobId);
+  // jobId is validated inside cleanupApplyStaging → applyStagingDir (resolveWithinRoot).
   // Step 1: clear any residue from a prior (possibly interrupted) run. This is
   // the load-bearing line — without it the extractor reads back stale frames.
   await cleanupApplyStaging(jobId);
@@ -137,17 +139,9 @@ export async function prepareCleanApplyStaging(jobId: string): Promise<string> {
  * AI handler the same doubling tripwire the apply path has.
  */
 export function aiRunDir(jobId: string, runId: string): string {
-  assertJobId(jobId);
-  if (!runId || typeof runId !== 'string') {
-    throw new Error('runId must be a non-empty string');
-  }
-  const dir = path.join(SPOKE_AI_DIR, jobId, runId);
+  // resolveWithinRoot validates BOTH jobId and runId (non-empty single segments,
+  // no traversal) and confirms containment under SPOKE_AI_DIR.
+  const dir = resolveWithinRoot(SPOKE_AI_DIR, jobId, runId);
   assertNoSegmentDoubling(dir);
   return dir;
-}
-
-function assertJobId(jobId: string): void {
-  if (!jobId || typeof jobId !== 'string') {
-    throw new Error('jobId must be a non-empty string');
-  }
 }

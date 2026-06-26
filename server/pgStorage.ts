@@ -118,6 +118,10 @@ export class PgStorage implements IStorage {
     this.processingProgress.set(jobId, { ...existing, ...progress });
   }
 
+  async deleteProcessingProgress(jobId: string): Promise<void> {
+    this.processingProgress.delete(jobId);
+  }
+
   // ── Hub-and-spoke stubs (Phase 2) ──────────────────────────────────
   // PgStorage is scaffolding (never used at runtime; MemStorage is the
   // active implementation). These stubs satisfy the IStorage interface.

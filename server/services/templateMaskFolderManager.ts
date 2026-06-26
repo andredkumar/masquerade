@@ -1,13 +1,14 @@
 /**
- * Manages the template-mask spoke output directory.
+ * Manages the template-mask spoke output directory (`spokes/template_mask/`).
  *
- * Despite the legacy name, this no longer touches `temp_processed/`.
- * Filename rename deferred to a future cleanup PR.
+ * The class name `TempFolderManager` is retained for call-site stability; the
+ * file was renamed from `tempFolderManager.ts` in Phase 5B-2a to reflect what it
+ * actually manages. It does NOT touch `temp_processed/`.
  */
 
 import fs from 'fs/promises';
 import path from 'path';
-import { SPOKE_TEMPLATE_MASK_DIR } from './cleanup';
+import { SPOKE_TEMPLATE_MASK_DIR, resolveWithinRoot } from './cleanup';
 
 export class TempFolderManager {
   private static readonly TEMP_BASE = SPOKE_TEMPLATE_MASK_DIR;
@@ -16,7 +17,7 @@ export class TempFolderManager {
    * Create a temporary folder for a job
    */
   static async createJobTempFolder(jobId: string): Promise<string> {
-    const folderPath = path.join(this.TEMP_BASE, jobId);
+    const folderPath = resolveWithinRoot(this.TEMP_BASE, jobId);
     
     try {
       await fs.mkdir(folderPath, { recursive: true });
@@ -32,7 +33,7 @@ export class TempFolderManager {
    * Clean up a specific job's temporary folder
    */
   static async cleanupJobTempFolder(jobId: string): Promise<void> {
-    const folderPath = path.join(this.TEMP_BASE, jobId);
+    const folderPath = resolveWithinRoot(this.TEMP_BASE, jobId);
     
     try {
       await fs.rm(folderPath, { recursive: true, force: true });
@@ -60,7 +61,9 @@ export class TempFolderManager {
    * Get the path to a job's temporary folder
    */
   static getJobTempFolder(jobId: string): string {
-    return path.join(this.TEMP_BASE, jobId);
+    // Single jobId chokepoint — saveProcessedImage routes through here, so the
+    // traversal guard covers it transitively.
+    return resolveWithinRoot(this.TEMP_BASE, jobId);
   }
   
   /**

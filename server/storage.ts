@@ -49,6 +49,7 @@ export interface IStorage {
   // Progress tracking
   getProcessingProgress(jobId: string): Promise<ProcessingProgress | undefined>;
   updateProcessingProgress(jobId: string, progress: Partial<ProcessingProgress>): Promise<void>;
+  deleteProcessingProgress(jobId: string): Promise<void>;
 
   // ── Hub-and-spoke methods ──────────────────────────────────────────────
 
@@ -184,6 +185,10 @@ export class MemStorage implements IStorage {
     this.processingProgress.set(jobId, { ...existing, ...progress });
   }
 
+  async deleteProcessingProgress(jobId: string): Promise<void> {
+    this.processingProgress.delete(jobId);
+  }
+
   // ── Hub-and-spoke methods (Phase 2 plumbing) ──────────────────────────
   // No callers yet — wired up in Phase 3.
 
@@ -260,6 +265,10 @@ export class MemStorage implements IStorage {
   }
 
   async deleteVideoJob(id: string): Promise<boolean> {
+    // Fold the progress-map cleanup into the delete so every delete path frees
+    // the entry — otherwise a deleted job's ProcessingProgress leaks for the
+    // process lifetime. Map.delete on a missing key is a safe no-op.
+    await this.deleteProcessingProgress(id);
     return this.videoJobs.delete(id);
   }
 

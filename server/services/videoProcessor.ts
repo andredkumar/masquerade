@@ -5,7 +5,7 @@ import { Server } from 'socket.io';
 import path from 'path';
 import fs from 'fs/promises';
 import Sharp from 'sharp';
-import { TempFolderManager } from './tempFolderManager';
+import { TempFolderManager } from './templateMaskFolderManager';
 import { deleteUploadFile } from './cleanup';
 import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplyStaging, assertNoSegmentDoubling } from './applyPaths';
 
@@ -385,7 +385,7 @@ export class VideoProcessor {
 
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
-      // Persist processed frames to temp_processed/{jobId}/ so the download route
+      // Persist processed frames to spokes/template_mask/{jobId}/ so the download route
       // can build the ZIP lazily when the user clicks download. Do NOT pre-build a ZIP.
       await TempFolderManager.cleanupJobTempFolder(jobId);
       await TempFolderManager.createJobTempFolder(jobId);
@@ -695,7 +695,7 @@ export class VideoProcessor {
 
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
-      // Frames are already saved to temp_processed/{jobId}/ by TempFolderManager.saveProcessedImage
+      // Frames are already saved to spokes/template_mask/{jobId}/ by TempFolderManager.saveProcessedImage
       // above. Do NOT pre-build a ZIP here — the download route builds it lazily with the
       // correct subfolder structure and any optional add-ons requested via query params.
       const tempDir = TempFolderManager.getJobTempFolder(jobId);
@@ -1077,8 +1077,11 @@ export class VideoProcessor {
   private async updateProgress(jobId: string, progress: Partial<ProcessingProgress>) {
     await storage.updateProcessingProgress(jobId, progress);
     
-    // Emit progress update via WebSocket
-    this.io.emit('progress', { jobId, ...progress });
+    // Emit progress update via WebSocket — scoped to the job's room so only
+    // clients that joined this jobId receive its progress (clients join via
+    // socket.on('join', jobId => socket.join(jobId)) in routes.ts). Mirrors the
+    // AI path, which already uses io.to(jobId).emit(...).
+    this.io.to(jobId).emit('progress', { jobId, ...progress });
     
     // Log progress for monitoring
     if (progress.stage === 'extracting') {

@@ -69,17 +69,25 @@ Phase 5 likely **starts with 5A** (small, self-contained, user-visible frontend 
 
 ### 5B. Backend/infra cleanup backlog (carried from Phase 4)
 
-- Remove `/api/videos/:jobId/process` (confirmed dead legacy, no caller; flagged in 4d-2).
-- Rename `tempFolderManager.ts` (it manages `spokes/template_mask`, not `temp_processed`).
-- Remove `temp_processed/` from `SWEEP_TARGETS` + drop `purgeTempProcessedOnStartup` once confirmed quiet.
+**Phase 5B Deploy 1 landed (2026-06-25)** — one reversible deploy; `tsc` held at 17. See
+`docs/refactor/PHASE_5B_REPORT.md`. Completed: shared path-traversal guard `resolveWithinRoot`
+(`cleanup.ts`, applied in `templateMaskFolderManager.ts` + `applyPaths.ts`), room-scoped progress
+broadcast (`videoProcessor.ts:1081`), file rename (`tempFolderManager.ts` → `templateMaskFolderManager.ts`),
+stale-comment fixes (vp:388/698), `deleteProcessingProgress` folded into `deleteVideoJob`, and removal
+of the `/api/test-post` + `/test-non-api` debug endpoints. *(Numbered detail in the Post-refactor
+cleanup backlog below, items 3–10.)*
+
+**Still open after Deploy 1:**
+- Remove `/api/videos/:jobId/process` (confirmed dead legacy, no caller; flagged in 4d-2 — backlog item 16).
+- `5B-1c` dead-code lead — the original `routes.ts:361` ref is STALE (line 361 is live code); needs a corrected reference before removal.
+- `5B-4` — drop `temp_processed/` from `SWEEP_TARGETS` + `purgeTempProcessedOnStartup`: PARKED on the runtime "quiet" confirmation (no code writes there — static-confirmed in 5B).
+- Socket.IO CORS `origin: "*"` (`routes.ts:100–102`) — tighten before launch (new backlog item 17).
+- Express request-dump middleware (`index.ts:9–20`) — logs every POST/PUT/PATCH; follow-up removal.
 - Add a **canonical progress source** so `ProcessingStatus` doesn't show 0% for a beat before the
   first WebSocket progress event (the cosmetic first-paint flicker logged in 4d-1b).
-- Phase 1 security items: path-traversal guard in `TempFolderManager`; room-scope the global
-  Socket.IO progress broadcast (`videoProcessor.ts:~999/1081`); remove dead code; remove debug
-  endpoints (`/api/test-post`, `/test-non-api`) and any request-dump debug logging.
 - Resolve the invalid `ANTHROPIC_API_KEY` on prod (NLP intent parser currently falls back to the
   keyword path).
-- `PgStorage` decision (keep stubs or remove).
+- `PgStorage` decision (keep stubs or remove). *(5B added `deleteProcessingProgress` to it for `IStorage` symmetry.)*
 - Address or `@ts-expect-error` the 17 pre-existing `tsc` errors (`frameExtractor.ts` 10, `maskWorker.ts` 7).
 - Vite chunk-size warning (code splitting).
 - `attached_assets/` not in git (populated server-side) — commit or migrate to S3-served URLs.
@@ -89,6 +97,38 @@ Phase 5 likely **starts with 5A** (small, self-contained, user-visible frontend 
 - Replace `MemStorage` with Postgres-backed storage to end job-record volatility (jobs currently
   wiped on PM2 restart; disk artifacts survive but `Job` records don't). Precondition for any
   feature that needs jobs to persist across restarts; pairs with the eventual login/commercial tier.
+
+## Phase 6 — backlog
+
+### Phase 6 candidate — unify the two AI/export manifest builders
+
+**Discovered during Phase 5A** (not a 5A regression; 5A was frontend-only and
+the manifest builders were untouched — `routes.ts` last changed at 4d-1).
+
+There are two divergent manifest builders in `server/routes.ts`:
+
+- **Frame-by-frame builder (~lines 621–747):** assembles `frames: manifestFrames`
+  (per-frame array) plus a CSV derived from `manifestFrames` (~line 747). This is
+  the per-frame manifest shape.
+- **Run-scoped builder (lines 1742–1780):** the single-run AI download endpoint
+  `GET /api/jobs/:jobId/ai/runs/:runId/download`. Emits run-level metadata
+  (`runName`, `maskCount`, `overlayCount`, run-level `labels[]`) and the 87
+  per-frame mask/overlay PNGs — but NO per-frame `frames[]` array and no CSV.
+
+**Why it surfaced now:** Phase 5A wired the FrameViewer "Continue to Download"
+button (previously a no-op) to the run-scoped endpoint (1742). So users now get
+the run-scoped manifest from that button, which lacks the per-frame label
+metadata the frame-by-frame builder produces. The per-frame masks/overlays ARE
+present in the run-scoped ZIP; only the per-frame *metadata* (manifest `frames[]`
++ CSV) is absent.
+
+**Phase 6 decision:** either (a) port the `manifestFrames` per-frame assembly
+(and CSV) from 621–747 into the run-scoped builder at 1742–1780, or (b) unify
+both builders into one shared manifest function so the two export paths can't
+drift again. Confirm which export paths each builder serves before changing
+either (the 621–747 path may be the legacy whole-job / template-mask download —
+verify its callsite). Frame-by-frame metadata was never lost from the codebase;
+this is reconciliation, not restoration.
 
 ---
 
@@ -129,20 +169,21 @@ verified.
 
 1. ~~**Remove legacy URL aliases**~~ — **DONE in Phase 4d-2 (2026-06-20).** All 11 legacy alias registrations deleted from `routes.ts`; `getLegacyJobHandler`'s definition deleted too (legacy-exclusive dead code). Only canonical URLs registered.
 2. ~~**Remove legacy thin-wrapper from `server/index.ts`**~~ — **DONE in Phase 4d-2 (2026-06-20).** `PATCH /internal/mask-processing/:jobId` wrapper + the dead `applyTemplateMask` import removed from `index.ts`; shared function and canonical route kept.
-3. **Rename `tempFolderManager.ts`** — it manages `spokes/template_mask/`, not `temp_processed/`. Name no longer reflects purpose post-3a.
-4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days.
-5. **Fix path-traversal guard in `TempFolderManager`** — Phase 1 surprise. Security concern: the `resolve + startsWith` check may be bypassable. Audit and harden.
-6. **Fix global progress broadcast** — `videoProcessor.ts:999` broadcasts to all connected sockets instead of the job's room. Info leak / scalability issue (Phase 1 surprise).
-7. **Remove dead code at `routes.ts:361`** — Phase 1 surprise.
-8. **Remove debug endpoints** — `POST /api/test-post` and `POST /test-non-api` (Phase 1 surprise).
-9. **Update stale `videoProcessor.ts` comments** — lines 371 and 643 still mention `temp_processed/{jobId}/` (deferred from Phase 3a).
-10. **Add `deleteProcessingProgress(jobId)` cleanup on job delete** — `DELETE /api/jobs/:jobId` removes VideoJob and Job records but doesn't clear the processing progress map entry (deferred from Phase 3c).
+3. ~~**Rename `tempFolderManager.ts`**~~ — **DONE in Phase 5B (2026-06-25, 5B-2a).** Renamed to `templateMaskFolderManager.ts` via `git mv` (history preserved); class name `TempFolderManager` kept for call-site stability. 3 import specifiers updated, incl. the dynamic `await import()` in `index.ts:57`; boot log confirms `initialize()` fires (cleanup logs print downstream of it).
+4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days. **(5B-4 — PARKED.** Phase 5B static audit found no code writes to `temp_processed/` — only stale comments, since corrected. Removal gated on the runtime "quiet" confirmation from the live host, which can't be observed from source.)
+5. ~~**Fix path-traversal guard in `TempFolderManager`**~~ — **DONE in Phase 5B (2026-06-25, 5B-1a; scope expanded).** Added one shared `resolveWithinRoot(root, ...segments)` validator in `cleanup.ts` (resolve-and-compare, mirrors `safeDelete`) and applied it at every jobId/runId path boundary in BOTH `templateMaskFolderManager.ts` and `applyPaths.ts`. Byte-identical to `path.join` for valid UUIDs; rejects empty/`.`/`..`/separator/null-byte segments.
+6. ~~**Fix global progress broadcast**~~ — **DONE in Phase 5B (2026-06-25, 5B-1b).** Live line was `videoProcessor.ts:1081` (backlog's `:999` was stale). `this.io.emit('progress', …)` → `this.io.to(jobId).emit('progress', …)`, scoping to the job's room (clients already `socket.join(jobId)`; the AI path was already room-scoped). **Verify with a two-tab test** — boot logs don't prove room isolation.
+7. **Remove dead code at `routes.ts:361`** — **5B-1c OPEN (ref stale).** Phase 5B source check found `routes.ts:361` is LIVE code (`height: imageMeta.height` in an image-meta builder), not dead. Needs a corrected line reference before any removal — do NOT remove the current line 361.
+8. ~~**Remove debug endpoints**~~ — **DONE in Phase 5B (2026-06-25, 5B-1d).** `POST /api/test-post` + `POST /test-non-api` (console.log/json stubs, no client callers) deleted from `routes.ts`. *Note:* the express request-dump middleware in `index.ts:9–20` (logs every POST/PUT/PATCH) was out of Deploy 1 scope and remains — a follow-up removal candidate.
+9. ~~**Update stale `videoProcessor.ts` comments**~~ — **DONE in Phase 5B (2026-06-25, 5B-2b).** The two stale `temp_processed/{jobId}/` comments were at lines **388 and 698** (backlog's `371`/`643` were stale); both now read `spokes/template_mask/{jobId}/`, matching where `TempFolderManager` actually writes.
+10. ~~**Add `deleteProcessingProgress(jobId)` cleanup on job delete**~~ — **DONE in Phase 5B (2026-06-25, 5B-2c).** Added to `IStorage` + `MemStorage` + `PgStorage`, and folded INTO `deleteVideoJob` so every delete path frees the progress-map entry (Decision 3 — not an explicit call in the route handler).
 11. **`PgStorage` stub maintenance** — decide whether to keep throw-stubs vs. remove `PgStorage` entirely. All runtime storage is `MemStorage` (deferred since Phase 2).
 12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
 14. ~~**Delete `home.tsx` and any other legacy step containers in 4d**~~ — **DONE in Phase 4d-2 (2026-06-20).** `home.tsx` + `FileUpload.tsx` (home-only) deleted; `/app` route + `Home` import removed from `App.tsx`; `landing.tsx` CTA `/app`→`/upload`.
 16. **Remove dead `POST /api/videos/:jobId/process`** — examined during Phase 4d-2: zero client callers (no constructor in `client/src`; the canonical processing path used by all spokes is `POST /api/jobs/:jobId/template-mask/apply`). It matches `/api/videos/`, so the empty live legacy sweep confirms no caller. Left in 4d-2 (not on the alias removal list) but it is dead legacy and can be deleted.
 15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX.
+17. **Socket.IO CORS is wide open** — `routes.ts:100–102` initializes the Socket.IO server with `cors: { origin: "*" }`. Tighten to the known frontend origin(s) before/at commercial launch. (Logged during Phase 5B; not in 5B Deploy 1 scope.)
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
 
