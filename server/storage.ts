@@ -15,8 +15,11 @@ import { randomUUID } from "crypto";
 /**
  * Maps legacy VideoJob.status values to the Job V2 status field.
  * Returns undefined for unknown values (leave V2 unchanged).
+ *
+ * Exported so PgStorage's VideoJob shim reproduces the status mirror from this
+ * single source of truth rather than duplicating the mapping (Phase 5C-1).
  */
-function mapVideoJobStatusToJobStatus(
+export function mapVideoJobStatusToJobStatus(
   videoJobStatus: string,
 ): Job['status'] | undefined {
   switch (videoJobStatus) {

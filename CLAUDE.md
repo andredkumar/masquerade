@@ -87,7 +87,7 @@ cleanup backlog below, items 3–10.)*
   first WebSocket progress event (the cosmetic first-paint flicker logged in 4d-1b).
 - Resolve the invalid `ANTHROPIC_API_KEY` on prod (NLP intent parser currently falls back to the
   keyword path).
-- `PgStorage` decision (keep stubs or remove). *(5B added `deleteProcessingProgress` to it for `IStorage` symmetry.)*
+- ~~`PgStorage` decision (keep stubs or remove).~~ **RESOLVED in 5C-1 (2026-06-30):** stubs fully implemented (Postgres-backed, **Option A3** single source of truth — `VideoJob`/`Job` derived from one `jobs` row, no blob). Still not wired to the live runtime — cutover is 5C-2.
 - Address or `@ts-expect-error` the 17 pre-existing `tsc` errors (`frameExtractor.ts` 10, `maskWorker.ts` 7).
 - Vite chunk-size warning (code splitting).
 - `attached_assets/` not in git (populated server-side) — commit or migrate to S3-served URLs.
@@ -97,6 +97,46 @@ cleanup backlog below, items 3–10.)*
 - Replace `MemStorage` with Postgres-backed storage to end job-record volatility (jobs currently
   wiped on PM2 restart; disk artifacts survive but `Job` records don't). Precondition for any
   feature that needs jobs to persist across restarts; pairs with the eventual login/commercial tier.
+
+**5C-1 landed (2026-06-30) — foundation, no cutover; built as true Option A3.** Built and
+validated the Postgres storage layer; `MemStorage` is still the live runtime (`storage.ts`
+ends with `new MemStorage()`, unchanged — it stays the oracle). `tsc` held at 17.
+Decision A = **Option A3 (single source of truth)**: **one** `jobs` row per id, every fact in
+exactly one column. The legacy `VideoJob` and the clean hub-and-spoke `Job` are **derived** in
+the `PgStorage` shim — **no** `video_job` blob, **no** `has_job_v2`, **no** standalone
+`video_jobs` table (an earlier pass had shipped A1's blob/`has_job_v2` substance under an
+"Option A" label; this corrects it). Shared facts (`filename, duration, width, height,
+frame_rate, total_frames, error_message`) occupy **one** column read by both derivations; the
+**only** two-column case is `status`, split into `video_status` (legacy 6-value) and
+`job_status` (V2 3-value) because the mirror is lossy/non-invertible — these double as
+facet-existence markers (`video_status IS NOT NULL` ⟺ VideoJob facet; `job_status IS NOT NULL`
+⟺ Job facet). Gate A dispositioned all 21 VideoJob columns (Direct / Derived / Unused);
+`outputZipPath` is Unused→`null` and `fileCount` is derived (`fileList?.length ?? 1`, verified
+write-only/dead-read) — neither gets a column. `ai_runs` is a real child (FK → `jobs.id`
+`ON DELETE cascade`); `ai_initialized` mirrors MemStorage's `job.ai` lifecycle (present-but-empty
+`runs`). `VideoJob`/`insertVideoJobSchema` are now hand-authored in `shared/schema.ts` (the
+table that backed `$inferSelect` is gone). Decision B = B1 RDS. Delivered: driver swap
+(`db.ts` neon-http → `pg`/`drizzle-orm/node-postgres`), `migrations/0000_hard_cable.sql`
+(3 tables, `jobs` = 28 cols) + hand-authored down-path, full `PgStorage` derivation shim (all
+21 `IStorage` methods incl. the status mirror and facet independence), and
+`scripts/conformance-storage.ts` (one suite, all 21 methods, run against `MemStorage` **and**
+`PgStorage`). MemStorage oracle: **35/35 PASS**. The `PgStorage` run — the actual proof the A3
+derivation holds — is gated on Andre provisioning RDS; see
+`docs/refactor/PHASE_5C1_RDS_RUNBOOK.md` (env vars `DATABASE_URL`, test-only
+`TEST_DATABASE_URL`). **Next: 5C-2** = production cutover (app reads Postgres, dual-write/backfill,
+flip `storage.ts` to `PgStorage`; A3 leaves no `video_jobs` table to retire).
+
+### 5D (future) — Hub loading-hang: root cause recorded
+
+Not fixed here (frontend; out of 5C-1 scope) — recording the root-cause surface so 5D starts
+informed. The hub page keys off `Job.status`, which is a **one-way derived mirror** of
+`VideoJob.status`: `updateVideoJob` runs `mapVideoJobStatusToJobStatus` and copies the mapped
+value onto `Job.status` **only if a `jobsV2` record already exists** (`storage.ts:128–137`; the
+map collapses 6 legacy statuses → 3 V2 statuses `extracting`/`ready`/`failed`). `Job.status` is
+never the source of truth. If the V2 record is absent when a `VideoJob` status transition fires,
+the mirror silently no-ops and the hub can hang waiting on a status that never arrives. 5C-1's
+`PgStorage` faithfully **reproduces** this mirror (verified by the conformance suite) rather than
+fixing it — the fix belongs to 5D.
 
 ## Phase 6 — backlog
 
@@ -177,7 +217,7 @@ verified.
 8. ~~**Remove debug endpoints**~~ — **DONE in Phase 5B (2026-06-25, 5B-1d).** `POST /api/test-post` + `POST /test-non-api` (console.log/json stubs, no client callers) deleted from `routes.ts`. *Note:* the express request-dump middleware in `index.ts:9–20` (logs every POST/PUT/PATCH) was out of Deploy 1 scope and remains — a follow-up removal candidate.
 9. ~~**Update stale `videoProcessor.ts` comments**~~ — **DONE in Phase 5B (2026-06-25, 5B-2b).** The two stale `temp_processed/{jobId}/` comments were at lines **388 and 698** (backlog's `371`/`643` were stale); both now read `spokes/template_mask/{jobId}/`, matching where `TempFolderManager` actually writes.
 10. ~~**Add `deleteProcessingProgress(jobId)` cleanup on job delete**~~ — **DONE in Phase 5B (2026-06-25, 5B-2c).** Added to `IStorage` + `MemStorage` + `PgStorage`, and folded INTO `deleteVideoJob` so every delete path frees the progress-map entry (Decision 3 — not an explicit call in the route handler).
-11. **`PgStorage` stub maintenance** — decide whether to keep throw-stubs vs. remove `PgStorage` entirely. All runtime storage is `MemStorage` (deferred since Phase 2).
+11. ~~**`PgStorage` stub maintenance**~~ — **DONE in 5C-1 (2026-06-30).** All 12 throw-stubs replaced with real Postgres-backed implementations (**Option A3**: one `jobs` row as single source of truth; `VideoJob`/`Job` derived in the shim; no `video_job` blob, no `has_job_v2`, no `video_jobs` table; `ai_runs` child). Validated by `scripts/conformance-storage.ts` against the `MemStorage` oracle (35/35). All runtime storage is still `MemStorage`; cutover deferred to 5C-2.
 12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
 14. ~~**Delete `home.tsx` and any other legacy step containers in 4d**~~ — **DONE in Phase 4d-2 (2026-06-20).** `home.tsx` + `FileUpload.tsx` (home-only) deleted; `/app` route + `Home` import removed from `App.tsx`; `landing.tsx` CTA `/app`→`/upload`.

@@ -3,35 +3,96 @@ import { pgTable, text, varchar, integer, real, boolean, jsonb } from "drizzle-o
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
-export const videoJobs = pgTable("video_jobs", {
+// ── Hub-and-spoke `jobs` table (Phase 5C-1, Option A3 — single source) ──
+//
+// ONE canonical row per job id. Each *fact* lives in exactly one column.
+// MemStorage's two independent maps (videoJobs, jobsV2) are reproduced not by
+// persisting two records, but by deriving the legacy `VideoJob` and the clean
+// `Job` shapes from this single row in the PgStorage shim. There is no
+// `video_job` blob and no `has_job_v2`: facet presence is carried by the two
+// status columns, which double as existence markers (a job's status is always
+// a non-null string when that facet exists).
+//
+//   • Shared facts (filename, duration, width, height, frame_rate,
+//     total_frames, error_message): genuinely ONE fact each — identical across
+//     the two facets in the live 1:1 app — so they occupy ONE column read by
+//     both derivations. When two facets coexist, both populate the same value;
+//     deleting one facet leaves these intact for the survivor.
+//
+//   • Two status columns — the ONLY place two columns model two genuine facts.
+//     `video_status` (legacy 6-value lifecycle) and `job_status` (V2 3-value
+//     lifecycle) diverge on the same id (the VideoJob→Job status mirror is
+//     lossy/non-invertible), so neither can be derived from the other.
+//       video_status IS NOT NULL ⟺ VideoJob facet present.
+//       job_status   IS NOT NULL ⟺ Job facet present.
+//
+//   • VideoJob-only and Job-only facts each get their own nullable column,
+//     cleared when their facet is deleted while the other survives.
+//
+// Derived (NOT stored — see Gate A): VideoJob.outputZipPath (Unused → null),
+// VideoJob.fileCount (file_list?.length ?? 1), VideoJob.jobType (= job_type),
+// Job.source (shared dims + source_type).
+//
+// `ai_initialized` mirrors MemStorage's `job.ai` lifecycle: once addAiRun
+// fires, getJobV2 must return `ai: { runs: [...] }` even after every run is
+// deleted (an empty-but-present runs array), which an empty child table alone
+// cannot distinguish.
+export const jobs = pgTable("jobs", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  filename: text("filename").notNull(),
-  filePath: text("file_path").notNull(),
-  originalSize: integer("original_size").notNull(),
-  duration: real("duration").notNull(),
-  width: integer("width").notNull(),
-  height: integer("height").notNull(),
-  frameRate: real("frame_rate").notNull(),
-  totalFrames: integer("total_frames").notNull(),
-  status: text("status").notNull().default("uploaded"), // uploaded, extracting, ready, processing, completed, failed
-  progress: real("progress").notNull().default(0),
+
+  // ── Shared facts (one fact, one column; read by BOTH derivations) ──────
+  filename: text("filename"),
+  duration: real("duration"),
+  width: integer("width"),
+  height: integer("height"),
+  frameRate: real("frame_rate"),
+  totalFrames: integer("total_frames"),
+  errorMessage: text("error_message"),
+
+  // ── Status columns (two genuine facts; also facet-existence markers) ──
+  videoStatus: text("video_status").$type<VideoJob["status"]>(), // uploaded, extracting, ready, processing, completed, failed
+  jobStatus: text("job_status").$type<Job["status"]>(),          // extracting, ready, failed
+
+  // ── VideoJob-only facts (nullable; null ⟺ VideoJob facet absent) ──────
+  filePath: text("file_path"),
+  originalSize: integer("original_size"),
+  progress: real("progress"),
   maskData: jsonb("mask_data"),
   outputSettings: jsonb("output_settings"),
-  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`),
+  createdAt: text("created_at"),
   completedAt: text("completed_at"),
-  errorMessage: text("error_message"),
-  outputZipPath: text("output_zip_path"),
-  // New fields for multiple file support
-  jobType: text("job_type").notNull().default("video"), // video, images
-  fileCount: integer("file_count").notNull().default(1),
-  fileList: jsonb("file_list"), // Array of file info for image batches
-  // Session-based AI labels
-  aiLabels: jsonb("ai_labels").default([]),
+  jobType: text("job_type"),       // video, images
+  fileList: jsonb("file_list"),    // Array of file info for image batches
+  aiLabels: jsonb("ai_labels"),    // session-based AI labels
+
+  // ── Job-only facts (nullable; null ⟺ Job facet absent) ────────────────
+  uploadedAt: text("uploaded_at"),
+  phiStatus: text("phi_status").$type<Job["phiStatus"]>(),
+  attestationRecord: jsonb("attestation_record").$type<AttestationRecord>(),
+  sourceType: text("source_type").$type<JobSource["type"]>(), // video, image_batch
+  extractionRate: real("extraction_rate"),
+  templateMask: jsonb("template_mask").$type<TemplateMaskState>(),
+  labeling: jsonb("labeling").$type<LabelingState>(),
+  aiInitialized: boolean("ai_initialized").notNull().default(false),
+});
+
+export const aiRuns = pgTable("ai_runs", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  jobId: varchar("job_id").notNull().references(() => jobs.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  inputSource: text("input_source").notNull(), // extracted, template_mask, raw
+  modality: text("modality"), // nullable
+  bbox: jsonb("bbox"), // nullable
+  target: text("target").notNull(),
+  outputDir: text("output_dir").notNull(),
+  labels: jsonb("labels").notNull().default([]),
+  approved: boolean("approved").notNull().default(false),
+  createdAt: text("created_at").notNull(),
 });
 
 export const frameProcessingBatches = pgTable("frame_processing_batches", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  jobId: varchar("job_id").notNull().references(() => videoJobs.id),
+  jobId: varchar("job_id").notNull().references(() => jobs.id),
   batchNumber: integer("batch_number").notNull(),
   startFrame: integer("start_frame").notNull(),
   endFrame: integer("end_frame").notNull(),
@@ -40,10 +101,55 @@ export const frameProcessingBatches = pgTable("frame_processing_batches", {
   processedAt: text("processed_at"),
 });
 
-export const insertVideoJobSchema = createInsertSchema(videoJobs).omit({
-  id: true,
-  createdAt: true,
-  completedAt: true,
+// VideoJob is no longer Drizzle-backed (A3 dropped the `video_jobs` table —
+// its facts now live as columns on `jobs`, derived by the PgStorage shim).
+// The legacy `VideoJob` shape and its insert contract are therefore
+// hand-authored here, reproducing the exact field types the retired
+// `videoJobs.$inferSelect` / `createInsertSchema(videoJobs)` produced so no
+// consumer's types shift.
+export interface VideoJob {
+  id: string;
+  filename: string;
+  filePath: string;
+  originalSize: number;
+  duration: number;
+  width: number;
+  height: number;
+  frameRate: number;
+  totalFrames: number;
+  status: string; // uploaded, extracting, ready, processing, completed, failed
+  progress: number;
+  maskData: unknown;
+  outputSettings: unknown;
+  createdAt: string | null;
+  completedAt: string | null;
+  errorMessage: string | null;
+  outputZipPath: string | null;
+  jobType: string; // video, images
+  fileCount: number;
+  fileList: unknown;
+  aiLabels: unknown;
+}
+
+export const insertVideoJobSchema = z.object({
+  filename: z.string(),
+  filePath: z.string(),
+  originalSize: z.number(),
+  duration: z.number(),
+  width: z.number(),
+  height: z.number(),
+  frameRate: z.number(),
+  totalFrames: z.number(),
+  status: z.string().optional(),
+  progress: z.number().optional(),
+  maskData: z.unknown().optional(),
+  outputSettings: z.unknown().optional(),
+  errorMessage: z.string().nullable().optional(),
+  outputZipPath: z.string().nullable().optional(),
+  jobType: z.string().optional(),
+  fileCount: z.number().optional(),
+  fileList: z.unknown().optional(),
+  aiLabels: z.unknown().optional(),
 });
 
 export const insertFrameBatchSchema = createInsertSchema(frameProcessingBatches).omit({
@@ -51,7 +157,6 @@ export const insertFrameBatchSchema = createInsertSchema(frameProcessingBatches)
   processedAt: true,
 });
 
-export type VideoJob = typeof videoJobs.$inferSelect;
 export type InsertVideoJob = z.infer<typeof insertVideoJobSchema>;
 export type FrameProcessingBatch = typeof frameProcessingBatches.$inferSelect;
 export type InsertFrameBatch = z.infer<typeof insertFrameBatchSchema>;
