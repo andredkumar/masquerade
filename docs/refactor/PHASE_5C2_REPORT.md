@@ -3,8 +3,10 @@
 **Type:** one-file code flip + operator-executed provisioning runbook. No dual-write,
 no backfill, no schema/logic change (frozen from 5C-1, proven 35/35 vs real RDS).
 
-**Status:** code flip landed and `tsc`-clean; production verification is operator-side
-(runbook `PHASE_5C2_RDS_RUNBOOK.md`, executed by Andre on the app EC2).
+**Status:** **COMPLETE — verified in production (2026-07-13).** Code flip landed and
+`tsc`-clean; the app runs durably on Postgres. Restart-durability confirmed on the app EC2:
+job `eb553c54` (`Kidney.mp4`) survived a `pm2 restart` and persists in the `jobs` table
+(§7). `MemStorage` retained as the one-edit rollback target.
 
 ---
 
@@ -104,4 +106,48 @@ kept in the tree precisely to make this a one-edit revert.
 **Conformance results vs. RDS:** _n/a to re-run for 5C-2 — the storage layer is
 unchanged from 5C-1's green run (MemStorage 35/35, PgStorage 35/35, 168 assertions,
 ALL SUITES PASSED vs real Aurora). The 5C-2 pass criterion is the restart-durability
-smoke test above, recorded here after the operator's green run._
+smoke test, recorded below._
+
+---
+
+## 7. Production verification — PASS (2026-07-13)
+
+**Result:** job `eb553c54` (`Kidney.mp4`) survived a `pm2 restart` on the app EC2 and was
+confirmed present in the `jobs` table afterward. This is the defining §4.6 check
+(`create job → pm2 restart → job survives`); pre-5C-2 the record vanished on restart.
+**The app is durably on Postgres.**
+
+### Env-mismatch failure encountered en route (and its fix)
+
+Before the green run, the first cutover boot booted green (`database reachable`) yet 500'd on
+every write:
+
+```
+POST /api/uploads/video 500 :: {"error":"relation \"jobs\" does not exist"}
+```
+
+**Root cause — a PM2 environment mismatch, not a code bug.** The running PM2 process carried a
+**stale Neon `DATABASE_URL` cached in its environment** — a reachable but *unmigrated* database.
+So the boot `SELECT 1` passed (it passes against any reachable Postgres) while the A3 `jobs` table
+was absent there. Meanwhile `.env` / `psql` pointed at the correct RDS, which is why the tables
+were visible via `psql` but not to the app. A plain `pm2 restart` reuses the daemon's cached env,
+so it never picked up the corrected value.
+
+**Fix (operator-side):** `pm2 delete` the process and start it fresh with the correct RDS
+`DATABASE_URL` applied (`--update-env` / `pm2 save`), evicting the stale Neon URL. No code change
+was required for the fix itself — the app already reads only `process.env.DATABASE_URL` through the
+single shared `db` singleton (`server/db.ts`); the probe and `PgStorage` cannot diverge from each
+other.
+
+**Diagnostic hardening (`131074c`).** The boot probe was made **schema-aware** so this class of
+failure self-reports at boot instead of surfacing as an opaque first-write 500. It now logs the
+app's actual `DATABASE_URL` target (password stripped) and runs
+`SELECT current_database(), current_user, current_schema(), to_regclass('public.jobs') IS NOT NULL`;
+if `public.jobs` is missing it prints a FATAL env-mismatch message naming the wrong DB and
+`process.exit(1)`s (PM2 crash-loop). Expected healthy boot line:
+
+```
+database reachable (SELECT 1 OK) — running on Postgres · db=masquerade user=<user> schema=public public.jobs=true
+```
+
+Full operator handoff: `docs/refactor/PHASE_5C2_ENV_MISMATCH_HANDOFF.md`.

@@ -126,7 +126,7 @@ derivation holds — is gated on Andre provisioning RDS; see
 `TEST_DATABASE_URL`). PgStorage subsequently ran **35/35 vs real Aurora** (168 assertions
 across both backends, ALL SUITES PASSED). **Next: 5C-2** = production cutover.
 
-**5C-2 landed (2026-07-13) — the app now runs on Postgres.** Decision B = **direct flip**
+**5C-2 COMPLETE (2026-07-13) — app durably on Postgres, verified in production.** Decision B = **direct flip**
 (no dual-write, no backfill): MemStorage was ephemeral (wiped every restart), so there was no
 persistent data to protect, and PgStorage was already proven in 5C-1. The behavioral change is
 one source line in `server/storage.ts`: `export const storage = new PgStorage()` (was
@@ -147,7 +147,16 @@ called only at request time). Nothing user-visible changes **except jobs now sur
 the entire point, and the smoke test that defines success (`create job → pm2 restart → job survives`).
 Production RDS (new instance, encryption ON, SG → app EC2 `3.136.48.97:5432`) is provisioned and
 migrated by the operator via `docs/refactor/PHASE_5C2_RDS_RUNBOOK.md`. `deployment-package/server/storage.ts` is a stale tracked
-build snapshot, **not** flipped (not the live source tree). **Next: 5D** (hub loading-hang) / Phase 6.
+build snapshot, **not** flipped (not the live source tree).
+
+**Production verification (2026-07-13):** job `eb553c54` (`Kidney.mp4`) survived a `pm2 restart`
+and was confirmed present in the `jobs` table — the restart-durability pass criterion is met.
+Getting there surfaced one env-mismatch failure: the running PM2 process carried a **stale Neon
+`DATABASE_URL` cached in its environment** (reachable but unmigrated, so `SELECT 1` passed yet
+`relation "jobs" does not exist` on every write); a plain `pm2 restart` reuses the daemon's cached
+env, so the fix was `pm2 delete` + a fresh start with the correct RDS `DATABASE_URL`. The boot probe
+was made schema-aware (`131074c`) so future boots self-report their actual DB target and FATAL-exit
+on a schema-less DB — see `docs/refactor/PHASE_5C2_ENV_MISMATCH_HANDOFF.md`. **Next: 5D** (hub loading-hang) / Phase 6.
 
 ### 5D (future) — Hub loading-hang: root cause recorded
 
