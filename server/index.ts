@@ -70,9 +70,47 @@ app.use((req, res, next) => {
   if (storage.constructor.name === 'PgStorage') {
     const { db } = await import('./db');
     const { sql } = await import('drizzle-orm');
+
+    // Report the ACTUAL target the app's own Pool (server/db.ts) resolved from
+    // process.env.DATABASE_URL — host / db / user, password stripped. This is the
+    // value BOTH this probe and PgStorage use (one shared `db` singleton). If it does
+    // not match the host/db you see in your `.env` / `psql`, the running PM2 process
+    // has a stale or overriding DATABASE_URL in its environment (a plain `pm2 restart`
+    // reuses the daemon's cached env) — fix that, not the code.
+    let target = '(unparseable DATABASE_URL)';
     try {
-      await db.execute(sql`SELECT 1`);
-      log('database reachable (SELECT 1 OK) — running on Postgres');
+      const u = new URL(process.env.DATABASE_URL ?? '');
+      target = `${u.hostname}:${u.port || '5432'}${u.pathname} user=${u.username}`;
+    } catch { /* leave placeholder */ }
+    log(`app DATABASE_URL target → ${target}`);
+
+    try {
+      // Beyond mere reachability, confirm the connected database actually carries the
+      // A3 schema. `to_regclass('public.jobs')` is NULL when the table is absent, which
+      // is exactly the "SELECT 1 OK but relation \"jobs\" does not exist" symptom of the
+      // process pointing at a reachable-but-unmigrated DB (e.g. a leftover Neon URL in
+      // PM2's env). Surface db/user/schema so it can be compared against psql.
+      const res: { rows: Array<Record<string, unknown>> } = await db.execute(
+        sql`SELECT current_database() AS db, current_user AS usr, current_schema() AS schema, to_regclass('public.jobs') IS NOT NULL AS has_jobs`,
+      );
+      const row = res.rows[0] ?? {};
+      log(
+        `database reachable (SELECT 1 OK) — running on Postgres · db=${row.db} ` +
+        `user=${row.usr} schema=${row.schema} public.jobs=${row.has_jobs}`,
+      );
+      if (row.has_jobs !== true) {
+        console.error(
+          `FATAL: connected to database "${row.db}" (host per target above) but ` +
+          'public.jobs is MISSING there. The app is pointed at a reachable but ' +
+          'UNMIGRATED database — its DATABASE_URL differs from the one you migrated / ' +
+          'see in psql. This is an ENVIRONMENT mismatch, not a code bug: the running ' +
+          'PM2 process is using a stale/overriding DATABASE_URL. Fix it with ' +
+          '`pm2 env <id>` to inspect, then restart with the correct env applied ' +
+          '(`--update-env`, or a `pm2 delete` + fresh start). Refusing to serve writes ' +
+          'against a schema-less DB.\n',
+        );
+        process.exit(1);
+      }
     } catch (err) {
       console.error(
         'FATAL: DATABASE_URL is set but the database is unreachable at boot ' +
