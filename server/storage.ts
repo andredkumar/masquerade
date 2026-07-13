@@ -11,6 +11,10 @@ import {
   type AttestationRecord,
 } from "@shared/schema";
 import { randomUUID } from "crypto";
+// Phase 5C-2 cutover: the live store is now PgStorage. Importing it here loads
+// `./db` (via pgStorage.ts), which throws at boot if DATABASE_URL is unset — the
+// intended loud failure. MemStorage below is retained as the rollback target.
+import { PgStorage } from "./pgStorage";
 
 /**
  * Maps legacy VideoJob.status values to the Job V2 status field.
@@ -280,8 +284,14 @@ export class MemStorage implements IStorage {
   }
 }
 
-// Always use in-memory storage. PgStorage import is intentionally omitted so
-// that `./db` (which throws if DATABASE_URL is unset) is never loaded and no
-// Neon client is ever initialized. AI mask/overlay PNGs are persisted on disk
-// under spokes/ai/<jobId>/<runId>/ (Phase 3b).
-export const storage = new MemStorage();
+// Phase 5C-2 — DIRECT CUTOVER: the app now runs on Postgres. `PgStorage` derives
+// the legacy VideoJob and the V2 Job from one `jobs` row (Option A3, proven 35/35
+// vs real RDS in 5C-1). Loading this line pulls in `./db`, which throws at boot if
+// DATABASE_URL is unset — a missing DB is a loud crash, not a silent MemStorage
+// fallback. AI mask/overlay PNGs are still persisted on disk under
+// spokes/ai/<jobId>/<runId>/ (Phase 3b).
+//
+// ROLLBACK: change `new PgStorage()` back to `new MemStorage()` and rebuild. The
+// MemStorage class above is retained untouched for exactly this reason; reverting
+// restores the pre-5C-2, no-DB-dependency runtime with no data to un-migrate.
+export const storage = new PgStorage();

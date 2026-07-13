@@ -2,6 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { checkFFmpegInstallation, displaySystemStatus } from "./utils/systemCheck";
+import { storage } from "./storage";
 
 const app = express();
 
@@ -53,6 +54,37 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Phase 5C-2 — eager DB reachability probe. On the Postgres path the `pg` Pool is
+  // LAZY: an unreachable/misconfigured RDS (with DATABASE_URL set) would otherwise boot
+  // fine and only fail on the first request. Force a `SELECT 1` here so an unreachable DB
+  // is a LOUD boot failure (process exit → PM2 crash-loop), never a silent-until-first-use
+  // surprise — you know immediately to fix connectivity or roll back.
+  //
+  // Gated on the live store being PgStorage via its constructor name — deliberately NOT a
+  // static `import` of `./db`/`./pgStorage` here, because that would force a DATABASE_URL
+  // dependency onto the MemStorage ROLLBACK path (index.ts would then throw with no DB even
+  // after reverting storage.ts). With this gate, a storage.ts-only rollback to MemStorage
+  // makes this block self-disable (name check is false) → still boots with no DATABASE_URL,
+  // so rollback stays a one-edit change. Assumes the build does not minify class names
+  // (it does not — no `--minify` in the esbuild step).
+  if (storage.constructor.name === 'PgStorage') {
+    const { db } = await import('./db');
+    const { sql } = await import('drizzle-orm');
+    try {
+      await db.execute(sql`SELECT 1`);
+      log('database reachable (SELECT 1 OK) — running on Postgres');
+    } catch (err) {
+      console.error(
+        'FATAL: DATABASE_URL is set but the database is unreachable at boot ' +
+        '(Phase 5C-2 eager probe). Refusing to start on an unreachable Postgres. ' +
+        'Fix connectivity (security group / endpoint / credentials / SSL) or roll back ' +
+        'to MemStorage.\n',
+        err,
+      );
+      process.exit(1);
+    }
+  }
+
   // Initialize temporary folder system
   const { TempFolderManager } = await import('./services/templateMaskFolderManager');
   await TempFolderManager.initialize();

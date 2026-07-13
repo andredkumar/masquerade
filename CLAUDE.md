@@ -123,8 +123,31 @@ table that backed `$inferSelect` is gone). Decision B = B1 RDS. Delivered: drive
 `PgStorage`). MemStorage oracle: **35/35 PASS**. The `PgStorage` run — the actual proof the A3
 derivation holds — is gated on Andre provisioning RDS; see
 `docs/refactor/PHASE_5C1_RDS_RUNBOOK.md` (env vars `DATABASE_URL`, test-only
-`TEST_DATABASE_URL`). **Next: 5C-2** = production cutover (app reads Postgres, dual-write/backfill,
-flip `storage.ts` to `PgStorage`; A3 leaves no `video_jobs` table to retire).
+`TEST_DATABASE_URL`). PgStorage subsequently ran **35/35 vs real Aurora** (168 assertions
+across both backends, ALL SUITES PASSED). **Next: 5C-2** = production cutover.
+
+**5C-2 landed (2026-07-13) — the app now runs on Postgres.** Decision B = **direct flip**
+(no dual-write, no backfill): MemStorage was ephemeral (wiped every restart), so there was no
+persistent data to protect, and PgStorage was already proven in 5C-1. The behavioral change is
+one source line in `server/storage.ts`: `export const storage = new PgStorage()` (was
+`new MemStorage()`), plus the required `import { PgStorage } from './pgStorage'`. **`MemStorage`
+the class is retained untouched as the rollback target** — reverting is a one-edit + rebuild with
+no data to un-migrate. `tsc` held at 17. Boot now **requires `DATABASE_URL`**: the import chain
+`index.ts → routes.ts → storage.ts → pgStorage.ts → db.ts` makes `db.ts` throw synchronously at
+load if it is unset (loud PM2 crash-loop, not a silent MemStorage fallback); an unreachable/bad-cred
+DB (URL set) is caught at **boot** by an eager `SELECT 1` probe in `index.ts` (added 5C-2) that
+`process.exit(1)`s → PM2 crash-loop, rather than surfacing as a first-request 500 (the raw pg Pool is
+lazy). The probe is gated on `storage.constructor.name === 'PgStorage'` and dynamically imports `./db`
+only on that path, so a `storage.ts`-only rollback to MemStorage self-disables it (still boots with no
+`DATABASE_URL`). **No `dotenv`** in this project, so `DATABASE_URL` must be a real PM2 env var
+(ecosystem `env` / `--update-env`), not a `.env` file. SSL server-side is the same shared
+`resolveSsl` (auto-on for `rds.amazonaws.com`). The circular import
+`storage.ts ↔ pgStorage.ts` is safe (`mapVideoJobStatusToJobStatus` is a hoisted `export function`,
+called only at request time). Nothing user-visible changes **except jobs now survive a restart** —
+the entire point, and the smoke test that defines success (`create job → pm2 restart → job survives`).
+Production RDS (new instance, encryption ON, SG → app EC2 `3.136.48.97:5432`) is provisioned and
+migrated by the operator via `docs/refactor/PHASE_5C2_RDS_RUNBOOK.md`. `deployment-package/server/storage.ts` is a stale tracked
+build snapshot, **not** flipped (not the live source tree). **Next: 5D** (hub loading-hang) / Phase 6.
 
 ### 5D (future) — Hub loading-hang: root cause recorded
 

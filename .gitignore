@@ -1,2 +1,5 @@
 node_modules/
 dist/
+
+# macOS junk
+.DS_Store
