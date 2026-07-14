@@ -156,19 +156,39 @@ Getting there surfaced one env-mismatch failure: the running PM2 process carried
 `relation "jobs" does not exist` on every write); a plain `pm2 restart` reuses the daemon's cached
 env, so the fix was `pm2 delete` + a fresh start with the correct RDS `DATABASE_URL`. The boot probe
 was made schema-aware (`131074c`) so future boots self-report their actual DB target and FATAL-exit
-on a schema-less DB — see `docs/refactor/PHASE_5C2_ENV_MISMATCH_HANDOFF.md`. **Next: 5D** (hub loading-hang) / Phase 6.
+on a schema-less DB — see `docs/refactor/PHASE_5C2_ENV_MISMATCH_HANDOFF.md`. **Next: Phase 6.**
 
-### 5D (future) — Hub loading-hang: root cause recorded
+### 5D — Hub loading-hang: COMPLETE (2026-07-13), Phase 5 complete
 
-Not fixed here (frontend; out of 5C-1 scope) — recording the root-cause surface so 5D starts
-informed. The hub page keys off `Job.status`, which is a **one-way derived mirror** of
-`VideoJob.status`: `updateVideoJob` runs `mapVideoJobStatusToJobStatus` and copies the mapped
-value onto `Job.status` **only if a `jobsV2` record already exists** (`storage.ts:128–137`; the
-map collapses 6 legacy statuses → 3 V2 statuses `extracting`/`ready`/`failed`). `Job.status` is
-never the source of truth. If the V2 record is absent when a `VideoJob` status transition fires,
-the mirror silently no-ops and the hub can hang waiting on a status that never arrives. 5C-1's
-`PgStorage` faithfully **reproduces** this mirror (verified by the conformance suite) rather than
-fixing it — the fix belongs to 5D.
+Upload→hub hang (hub stuck "loading" until a hard refresh) — **fixed. Frontend-only.**
+
+**Corrected root cause.** The earlier hypothesis in this note named the `storage.ts:129–140`
+status mirror ("mirror silently no-ops → hub hangs"). **The 5D trace proved that false.** The
+backend was always correct: both facets are created eagerly at upload
+(`routes.ts:162/167`, `:241/246`), extraction completion writes through `updateVideoJob`
+(`videoProcessor.ts:1182`) which fires the mirror `ready → ready` into the already-present Job
+facet, so `job_status = ready` at completion on **both** MemStorage and PgStorage (which is
+*why* a hard refresh worked — a fresh `GET /api/jobs/:jobId` read the already-correct value).
+
+The real defect was in the hub's data source: `client/src/contexts/JobContext.tsx` listened
+for the `progress` socket event but **never emitted `socket.emit('join', jobId)`**, so its
+socket never entered the room the emits are scoped to (`io.to(jobId)`, `videoProcessor.ts:1084`)
+→ zero `progress` events → never refetched past the initial `extracting` snapshot. The two
+working consumers (`ProcessingStatus.tsx`, `CommandInput.tsx`) both join; JobContext was the
+lone anomaly.
+
+**Exposed by 5B, not a 5B regression.** Pre-5B, progress was a global `io.emit` broadcast, so
+the missing `join` was harmless. 5B correctly scoped emits to `io.to(jobId)` (stopping cross-job
+leakage) — the right change — which turned the latent missing-join into a live hang. 5D closes
+the pre-existing latent defect; it does not undo 5B's room-scoping.
+
+**Fix.** `JobContext.tsx` joins the room + re-joins on every (re)connect, and reads via the
+codebase's existing React Query `refetchInterval` mechanism, bounded to poll only while the
+status is non-terminal and stop at `ready`/`failed` (self-heal against a missed/late emit).
+Frontend-only, zero backend/status/schema change, `tsc` stays 17, A3 two-column model and the
+conformance suite untouched. See `docs/refactor/PHASE_5D_PROPOSAL.md` / `PHASE_5D_REPORT.md`.
+
+**Phase 5 complete** (5A, 5B, 5C-1, 5C-2, 5D).
 
 ## Phase 6 — backlog
 
