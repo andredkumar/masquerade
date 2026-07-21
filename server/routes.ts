@@ -34,6 +34,7 @@ import fs from "fs";
 import { promises as fsPromises } from "fs";
 import archiver from "archiver";
 import { applyTemplateMask } from "./handlers/templateMaskApply";
+import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -584,12 +585,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const p = path.join(dir, `overlay_${frameIdx}.png`);
         return fs.existsSync(p) ? p : null;
       };
-      const getLabelFrameConfidence = (label: AiLabel, frameIdx: number): number | null => {
-        const r = label.frameResults?.[frameIdx];
-        if (r && typeof r.confidence === 'number') return r.confidence;
-        return label.confidence ?? null;
-      };
-
       // True if at least one approved label has at least one mask/overlay on disk
       const hasAnyMasks = includeMasks && approvedLabels.some(l => {
         const dir = labelRunDirMap.get(l.id);
@@ -614,14 +609,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Per-frame AI labels are built below with each frame's individual confidence score
 
-      // Derive split assignment from frame index (80/10/10 train/val/test)
-      const determineSplit = (n: number): 'train' | 'val' | 'test' => {
-        const mod = n % 10;
-        if (mod <= 7) return 'train';
-        if (mod === 8) return 'val';
-        return 'test';
-      };
-
       // Extract just the file extension — frame numbering uses sorted-list POSITION (i),
       // so we never trust the integer embedded in the filename.
       const fileExt = (filename: string): string => {
@@ -630,27 +617,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       const outputFormat = (job as any).outputSettings?.format || 'png';
-      const manifestFrames = frameFiles.map((filename, i) => {
-        // Each approved label carries THIS frame's individual confidence (from that
-        // label's own frameResults), so multi-label exports show distinct scores
-        // per label per frame rather than a shared value. Lookup is keyed by sorted
-        // position `i` — the same key the inference loop wrote with.
-        const perFrameLabels = approvedLabels.map(l => ({
-          intent: l.intent,
-          target: l.target,
-          modality: l.modality || null,
-          confidence: getLabelFrameConfidence(l, i),
-          model: l.model,
-          approved: l.approved,
-          bbox: l.bbox || null,
-        }));
-        return {
-          frame_number: i,
-          filename: `frame_${String(i).padStart(4, '0')}.${outputFormat}`,
-          split: determineSplit(i),
-          has_mask: true,
-          ai_labels: perFrameLabels,
-        };
+      // Phase 6 (b)-lite: per-frame frames[] + metadata.csv now come from the
+      // shared core. The whole-job wrapper feeds it the same inputs it used
+      // inline before, so manifest.json / metadata.csv stay byte-identical (D1).
+      const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
+        frameCount: frameFiles.length,
+        labels: approvedLabels,
+        outputFormat,
       });
 
       const manifest: Record<string, any> = {
@@ -722,14 +695,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         ...readmeSections,
       ].join('\n');
 
-      // Build metadata.csv
-      const aiTarget = approvedLabels.map(l => l.target).join('; ');
-      const aiConfidence = approvedLabels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ');
-      const csvHeaders = ['filename', 'frame_number', 'split', 'ai_target', 'ai_confidence'];
-      const csvRows = manifestFrames.map(f =>
-        [f.filename, f.frame_number, f.split, `"${aiTarget}"`, `"${aiConfidence}"`].join(',')
-      );
-      const csv = [csvHeaders.join(','), ...csvRows].join('\n');
+      // metadata.csv is built by the shared core above (Phase 6).
 
       // Stream the ZIP to the client
       res.setHeader('Content-Type', 'application/zip');
@@ -1742,7 +1708,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const maskFiles = allFiles.filter(f => f.startsWith('mask_'));
       const overlayFiles = allFiles.filter(f => f.startsWith('overlay_'));
 
-      // Build manifest for this run
+      // Phase 6: per-frame frames[] + metadata.csv via the shared core. The frame
+      // set is enumerated from THIS run's own mask_<i>.png files (§A.4), so every
+      // listed frame has a mask by construction (has_mask: true). Labels come from
+      // run.labels (canonical) and are approval-filtered here in the wrapper (D2),
+      // never in the core.
+      const approvedRunLabels = run.labels.filter(l => l.approved);
+      const runOutputFormat = (job as any).outputSettings?.format || 'png';
+      const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
+        frameCount: maskFiles.length,
+        labels: approvedRunLabels,
+        outputFormat: runOutputFormat,
+      });
+
+      // §B: payload-only toggle to include the base frames the AI ran on. Does not
+      // affect frames[]/metadata.csv above — those are toggle-independent (§B.4).
+      const includeBaseFrames = req.query.includeBaseFrames === 'true';
+
+      // Build manifest for this run (frames[] is additive over the pre-Phase-6 shape)
       const manifest = {
         jobId: req.params.jobId,
         runId: run.id,
@@ -1760,6 +1743,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         })),
         maskCount: maskFiles.length,
         overlayCount: overlayFiles.length,
+        frames: manifestFrames,
       };
 
       const zipFilename = `ai-run-${run.name.replace(/\s+/g, '-').toLowerCase()}-${job.filename || 'output'}.zip`;
@@ -1785,8 +1769,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
         archive.file(path.join(run.outputDir, f), { name: `overlays/${f}` });
       }
 
-      // Add manifest
+      // Add manifest + metadata.csv
       archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+      archive.append(csv, { name: 'metadata.csv' });
+
+      // §B: base-frame payload (masked-first / raw-fallback), under images/.
+      if (includeBaseFrames) {
+        // run.inputSource is the recorded truth of which source this run consumed,
+        // so the user always gets the frames the AI actually ran on (§B.1 invariant).
+        // Mirrors the Phase 4b-ii inference resolver (listFrameFiles → listRawFrameFiles).
+        let baseDir: string;
+        let baseFiles: string[];
+        if (run.inputSource === 'raw') {
+          const raw = await listRawFrameFiles(req.params.jobId);
+          baseDir = raw.dir; baseFiles = raw.files;
+        } else {
+          const masked = await listFrameFiles(req.params.jobId);
+          if (masked.files.length > 0) {
+            baseDir = masked.dir; baseFiles = masked.files;
+          } else {
+            const raw = await listRawFrameFiles(req.params.jobId);
+            baseDir = raw.dir; baseFiles = raw.files;
+          }
+        }
+        // images/frame_%06d.<ext> — same naming convention as the whole-job builder,
+        // so a whole-job ZIP and a run ZIP share a consistent images/ layout.
+        for (let i = 0; i < baseFiles.length; i++) {
+          const filename = baseFiles[i];
+          const ext = (filename.match(/\.(\w+)$/)?.[1]) || 'png';
+          const paddedNum = String(i).padStart(6, '0');
+          archive.file(path.join(baseDir, filename), { name: `images/frame_${paddedNum}.${ext}` });
+        }
+      }
 
       await archive.finalize();
       console.log(`✅ AI run ZIP streamed for job ${req.params.jobId}, run ${run.id}`);

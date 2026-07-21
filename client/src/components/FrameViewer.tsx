@@ -293,6 +293,10 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
     return urls;
   }, [viewerInfo, inferenceData, currentFrame, mode, visibleLabels, frameUrl, overlayUrl]);
 
+  // §B: user toggle — include the base frames the AI ran on in the run ZIP.
+  // Passed to the backend as ?includeBaseFrames=true; default off = current behavior.
+  const [includeBaseFrames, setIncludeBaseFrames] = useState(false);
+
   // ── Continue-to-download (Bug 3) ────────────────────────────────────
   // The per-frame label payload already carries the owning AIRun id (4d-1).
   // Collect the distinct runIds across all frames so the canonical run-scoped
@@ -313,11 +317,12 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
   }, [inferenceData]);
 
   const handleContinueToDownload = useCallback(() => {
+    const qs = includeBaseFrames ? '?includeBaseFrames=true' : '';
     for (const runId of distinctRunIds) {
-      window.open(`/api/jobs/${jobId}/ai/runs/${runId}/download`, '_blank');
+      window.open(`/api/jobs/${jobId}/ai/runs/${runId}/download${qs}`, '_blank');
     }
     onContinueToDownload();
-  }, [distinctRunIds, jobId, onContinueToDownload]);
+  }, [distinctRunIds, jobId, includeBaseFrames, onContinueToDownload]);
 
   // ── Render ──────────────────────────────────────────────────────────
 
@@ -639,10 +644,23 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
             Back to AI Analysis
           </Button>
         ) : <span />}
-        <Button size="sm" onClick={handleContinueToDownload} data-testid="viewer-continue">
-          Continue to Download
-          <ArrowRight size={14} className="ml-1" />
-        </Button>
+        <div className="flex items-center gap-3">
+          <label
+            className="flex items-center gap-2 text-xs cursor-pointer text-muted-foreground"
+            title="Adds the base frames the AI ran on to the ZIP under images/. Uses the template-masked frames, or the raw frames when no template mask was applied — always the frames the run actually used."
+          >
+            <Checkbox
+              checked={includeBaseFrames}
+              onCheckedChange={(checked) => setIncludeBaseFrames(checked === true)}
+              data-testid="viewer-include-base-frames"
+            />
+            Include base frames
+          </label>
+          <Button size="sm" onClick={handleContinueToDownload} data-testid="viewer-continue">
+            Continue to Download
+            <ArrowRight size={14} className="ml-1" />
+          </Button>
+        </div>
       </div>
 
       {/* Hidden prefetch nodes — never rendered visibly. Browser caches the

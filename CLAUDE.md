@@ -1,6 +1,16 @@
 # Masquerade
 
-## Status — Phase 4 COMPLETE (verified 2026-06-20)
+## Status — Phase 5 COMPLETE (verified 2026-07-14)
+
+Phase 5 is **fully complete and production-verified.** The app now runs durably on
+Postgres (RDS/Aurora, **A3** single-source-of-truth schema) — jobs survive restarts — and
+all five sub-phases are landed: **5A** (AI-spoke canvas relocation + single-run download),
+**5B** (backend/infra cleanup), **5C-1** (Postgres foundation, 35/35 conformance vs real
+RDS), **5C-2** (production cutover — jobs survive restarts), **5D** (upload→hub
+loading-hang fixed). `tsc` baseline unchanged at **17** (10 `frameExtractor.ts` +
+7 `maskWorker.ts`).
+
+### Phase 4 — COMPLETE (verified 2026-06-20)
 
 Phase 4 (frontend hub-and-spoke migration) is **fully deployed and live-verified.**
 The app now runs entirely on canonical `/api/jobs/:jobId/...` URLs; the legacy
