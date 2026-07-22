@@ -96,10 +96,26 @@ const imageUpload = multer({
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
   
-  // Initialize Socket.IO for real-time progress updates
+  // Initialize Socket.IO for real-time progress updates.
+  // Phase 7A-1 — CORS allow-list (was `origin: "*"`). Env-driven so a future
+  // origin needs no code change: ALLOWED_ORIGINS (comma-separated) overrides the
+  // default list if set. Default is the production origin(s); in non-production
+  // the same-port dev origin used by the Vite dev middleware (setupVite runs on
+  // PORT, default 5000) is added so local dev's WebSocket handshake isn't blocked.
+  const DEFAULT_ALLOWED_ORIGINS = [
+    "https://masqueradeimage.com",
+    "https://www.masqueradeimage.com",
+  ];
+  const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+    : [
+        ...DEFAULT_ALLOWED_ORIGINS,
+        ...(process.env.NODE_ENV !== "production" ? ["http://localhost:5000"] : []),
+      ];
+
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: "*",
+      origin: allowedOrigins,
       methods: ["GET", "POST"]
     }
   });
@@ -435,6 +451,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Start video processing with mask data
   app.post("/api/videos/:jobId/process", async (req, res) => {
+    // Phase 7B-1 live-sweep instrument (temporary). This route is believed dead
+    // (static sweep = zero client callers; canonical path is
+    // POST /api/jobs/:jobId/template-mask/apply). This log line lets the operator
+    // confirm ZERO real hits across the testing period before the handler is
+    // removed in Phase 7B. If this line ever fires in prod logs, the route is NOT
+    // dead — investigate the caller before removal. Remove this instrument together
+    // with the handler in 7B.
+    console.warn(`[DEADROUTE-HIT] POST /api/videos/${req.params.jobId}/process` +
+      ` — origin=${req.headers.origin ?? 'none'} referer=${req.headers.referer ?? 'none'}` +
+      ` ua=${req.headers['user-agent'] ?? 'none'}`);
     try {
       const { maskData, outputSettings } = req.body;
       

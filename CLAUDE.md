@@ -1,5 +1,142 @@
 # Masquerade
 
+## Status — Phase 7 IN PROGRESS (pre-testing hardening; started 2026-07-21)
+
+Phase 7 is a **cleanup + hardening pass** to produce a clean build for a heavy manual-testing
+period. **Not commercial work** — auth / HIPAA / billing / multi-tenancy are explicitly deferred
+(operator: ~2–3 months out). Split into **7A (safe, reversible — batched)** and **7B (one-way
+doors — plan-only until testing supplies the gate evidence)**.
+
+Current state: **proposal accepted** (`PHASE_7A_AMENDMENT.md`); **7A implemented in code, NOT yet
+deployed/verified** (`docs/refactor/PHASE_7A_REPORT.md`). 7B is plan-only (not executed). The full
+Edit-2 status flip + baseline-reference update happens only after 7A **deploys and is verified** —
+until then the *deployed* tsc baseline remains **17** (the 17→12 drop below is in the working tree,
+pending deploy).
+
+**7A — safe cleanup (status: IMPLEMENTED in code — awaiting deploy+verify):**
+- 7A-0: base-frame toggle smoke tests (8a/8b/8c) — owed from Phase 6, folded into the 7A deploy
+  verification (esp. 8c: raw run → toggle on → `images/` populated from raw frames). **Owed at deploy.**
+- 7A-1: Socket.IO CORS `origin:"*"` → env-driven allow-list. ✅ **implemented** (`routes.ts`,
+  re-locate): default `["https://masqueradeimage.com","https://www.masqueradeimage.com"]`; dev adds
+  `http://localhost:5000`; `ALLOWED_ORIGINS` env overrides. ⚠️ **verify at deploy**: real upload w/
+  live progress from BOTH apex and `www.` (WS handshake must pass CORS per host).
+- 7A-2: remove Express request-dump middleware. ✅ **implemented** (`index.ts`, was `:9–21`) —
+  confirmed pure logging (ran before `express.json`, `next()` only); API-response logger untouched.
+- 7A-3: first-paint 0% progress flicker. ✅ **implemented** (`ProcessingStatus.tsx`, frontend-only):
+  additive indeterminate "Connecting to processing updates…" branch when job present + `progress`
+  null + not complete; self-healing. Visual check owed at deploy.
+- 7A-4: `ANTHROPIC_API_KEY` invalid on prod. **operator-runbook (no code)** — `intentParser.ts` left
+  unchanged (log-dedup declined). Fallback is graceful (keyword path is Stage-1 PRIMARY). Fix = set a
+  valid key in the PM2 env; **no key committed.**
+- 7A-5: the 17 pre-existing `tsc` errors. ✅ **5 trivial fixes landed** (`dcmjs` ambient decl in new
+  `server/types/dcmjs.d.ts`; 2 catch-var narrows + 2 `Array.from` in `frameExtractor.ts`).
+  **Working-tree tsc 17 → 12.** Per the amendment, the 12 risky narrowings (5 `frameExtractor`
+  pixelBuffer + 5 `maskWorker` bbox-union + 2 `feather`) are **DEFERRED untouched** to a later pass.
+  **New invariant once deployed: tsc stays at 12** (deployed baseline is still 17 until 7A ships).
+- 7A-6: Vite chunk-size warning (661KB single bundle). **DEFERRED** (operator decision) —
+  `vite.config.ts` unchanged; warning accepted for the testing period. Now a backlog item.
+- 7A-7: `attached_assets/`. **report-and-stop (no gitignore)** — grep shows `landing.tsx:18` imports
+  the hero GIF via `@assets` (build/runtime dep). Backlog premise was STALE: all **65** files are
+  already git-tracked. No action; off-repo hosting (S3) is a future decision requiring the import to
+  move off `@assets` first.
+
+**7B — one-way doors (status: PLAN-ONLY; gated on testing evidence):**
+- 7B-1: remove `/api/videos/:jobId/process` (dead legacy, item 16; handler at `routes.ts` ~`:453`,
+  re-locate). Static sweep = ZERO client callers (live path is
+  `POST /api/jobs/:jobId/template-mask/apply`). **`[DEADROUTE-HIT]` instrument ADDED** (first line of
+  the handler, `console.warn` w/ jobId+origin+referer+UA) — operator watches prod logs for it during
+  testing; **if it ever fires, the route is NOT dead.** Removal (handler + instrument) needs a clean
+  **live-log no-hit gate** AND zero source+bundle grep before it happens. (HTTP 200 ≠ removal proof —
+  SPA catch-all.) Handler NOT removed this session.
+- 7B-2: `5B-1c` dead-code removal — **BLOCKED / could not re-confirm**: backlog's `routes.ts:361`
+  ref is STALE (361 is live image-batch builder code). History sweep found no alternative target.
+  Needs operator/planning input before any removal.
+- 7B-3: drop `temp_processed/` from `SWEEP_TARGETS` (`cleanup.ts:68`) + `purgeTempProcessedOnStartup`
+  (`cleanup.ts:328`, called `index.ts:135/140`) — static-clean in 5B; **the upcoming testing period
+  IS the wait-and-watch window**. Remove after a clean observation window (dir stays empty ≥7
+  continuous days under heavy use).
+- 7B-4: item 15 (download masked-vs-raw asymmetry; whole-job 404 at `routes.ts:552–554`) —
+  **operator decision** (unify raw fallback vs leave documented), not yet scheduled.
+
+**Constraints:** A3 storage/schema/status/shim/migrations FROZEN (verified untouched this session).
+No commercial work. 7B not executed until gates pass. Deferred to a later pass: the 12 tsc narrowings
+(7A-5 remainder) + 7A-6 chunk-split. Docs: `docs/refactor/PHASE_7_PROPOSAL.md`,
+`docs/refactor/PHASE_7A_REPORT.md`.
+
+## Status — Phase 6 COMPLETE (deployed + verified 2026-07-21)
+
+Phase 6 (manifest builder unification + base-frame toggle) is **deployed and verified in
+production.** `tsc` baseline unchanged at **17** (10 `frameExtractor.ts` + 7 `maskWorker.ts`).
+
+**What shipped:**
+- **(b)-lite unification.** The per-frame `frames[]` assembly + `metadata.csv` derivation were
+  extracted into one shared core, `server/handlers/frameManifest.ts`
+  (`buildPerFrameManifestAndCsv({ frameCount, labels, outputFormat }) → { frames, csv }`;
+  precedent `templateMaskApply.ts` from 3c). The whole-job builder
+  (`templateMaskDownloadHandler`) and the run-scoped builder
+  (`GET /api/jobs/:jobId/ai/runs/:runId/download`) each keep a thin wrapper that picks its own
+  frame set + approval-filtered label set, calls the core, and wraps its own job/run-level
+  metadata. Not merged into one branchy function — the wrappers genuinely diverge (label scope,
+  frame source, ZIP payload).
+- **Run download gained per-frame data.** The single-run AI ZIP now contains `frames[]` in
+  `manifest.json` **and** a `metadata.csv` (previously it had neither — the drift 5A surfaced).
+  Additive only; all pre-existing run-manifest fields unchanged (**D1**).
+- **NEW: "Include base frames" toggle** on the FrameViewer "Continue to Download" flow
+  (the one authorized frontend change, `FrameViewer.tsx`). Sends
+  `?includeBaseFrames=true`; when on, the run ZIP also carries `images/` base frames via
+  **masked-first / raw-fallback** (`listFrameFiles` → `listRawFrameFiles` from `frameAccess.ts`,
+  keyed on `run.inputSource`, with masked-empty→raw fallback for swept template dirs). Invariant:
+  the user always gets the frames the AI actually ran on. Toggle OFF = pre-Phase-6 behavior
+  exactly (no `images/`).
+
+**Key design facts (for future work):**
+- **Run `frames[]` is enumerated from the run's own `mask_<i>.png` files** (`run.outputDir`),
+  NOT from `template_mask/` — a `raw` run has an empty template-mask dir, so template-mask
+  counting would wrongly yield zero. Metadata frame set and base-frame payload are **decoupled**:
+  the toggle gates only whether `images/` files are added; `frames[]`/CSV are emitted identically
+  regardless.
+- **Co-indexing invariant (proven in the pre-deploy addendum):** for a completed run,
+  `frames[].frame_number == i`, `mask_<i>.png`, `overlay_<i>.png`, and `images/frame_%06d(i)` all
+  denote the same sorted-position `i`, because inference wrote `mask_<i>` while iterating the exact
+  `listFrameFiles`/`listRawFrameFiles` array the download resolver re-reads (same deterministic
+  function, same dir), and one mask is written per base frame unconditionally.
+- **`filename` in `frames[]` is nominal** (synthesized `frame_%04d.<outputFormat>`), NOT a literal
+  ZIP path — the whole-job builder already had 4-pad manifest vs 6-pad `images/` and a possibly
+  different `ext`. Propagated knowingly to preserve D1 field-compatibility. One CSV parser works
+  for both ZIPs.
+- **`has_mask` is `true`** on both paths (run side: true by construction, since the frame set is
+  derived from the mask files).
+- **Intentional temporary asymmetry (item 15 still parked):** the run download has raw-fallback
+  for base frames; the whole-job `templateMaskDownloadHandler` still 404s when `template_mask` is
+  empty and was deliberately NOT given raw-fallback. If you later unify the download fallback, do
+  it on purpose, not by accident.
+- **Swept-dir behavior:** run download with `includeBaseFrames=true` when both frame dirs are
+  swept → `images/` silently omitted, masks/overlays/manifest/CSV still returned (they live in
+  `run.outputDir`, a separate lifecycle). Graceful degrade, not a 410.
+
+**Verification status (honest):**
+- **Run-download `frames[]` + per-frame `ai_labels`: VERIFIED** directly from the post-deploy AI
+  manifest (job `8fa3a9bb`, Kidney.mp4, 46 frames, approved-only, co-indexed 0–45, bbox/confidence
+  present). This was the actual bug fixed. ✅
+- **Whole-job export structurally intact: VERIFIED** (post-deploy manifest has correct headers,
+  populated `ai_labels`, `frames[]`). ✅
+- **D1 byte-identical gate: ACCEPTED-AS-EXPLAINED, not cleanly proven.** The operator's before/after
+  template downloads were taken in *different job states* (before-copy at 21:34 predated the AI run
+  at 21:35, so `ai_labels: []` → `[{…}]` between the two). The delta is fully explained by the
+  state change and shows no format regression, but a same-state before/after diff was not captured.
+  Accepted given userbase = 1. ⚠️
+- **Base-frame toggle smoke tests (8a/8b/8c): NOT YET RUN.** The toggle is additive and unverified
+  in production — especially **8c (raw run: skip mask → run AI → download with toggle on → confirm
+  `images/` populated from raw frames)**, the highest-risk new path. Worth a casual check when
+  convenient; does not block the manifest-unification result.
+- **tsc 17 + clean build: VERIFIED** (pre-flight). ✅
+
+**Docs:** `docs/refactor/PHASE_6_PROPOSAL.md`, `PHASE_6_REPORT.md`, `PHASE_6_REPORT_ADDENDUM.md`
+(the co-indexing proof + Q2/Q3 resolutions). EBS snapshot `pre-phase-6-deploy 2026-07-21` taken.
+Rollback is a plain `git revert` (Phase 6 touched no storage/schema/migrations).
+
+---
+
 ## Status — Phase 5 COMPLETE (verified 2026-07-14)
 
 Phase 5 is **fully complete and production-verified.** The app now runs durably on
@@ -88,19 +225,19 @@ of the `/api/test-post` + `/test-non-api` debug endpoints. *(Numbered detail in 
 cleanup backlog below, items 3–10.)*
 
 **Still open after Deploy 1:**
-- Remove `/api/videos/:jobId/process` (confirmed dead legacy, no caller; flagged in 4d-2 — backlog item 16).
-- `5B-1c` dead-code lead — the original `routes.ts:361` ref is STALE (line 361 is live code); needs a corrected reference before removal.
-- `5B-4` — drop `temp_processed/` from `SWEEP_TARGETS` + `purgeTempProcessedOnStartup`: PARKED on the runtime "quiet" confirmation (no code writes there — static-confirmed in 5B).
-- Socket.IO CORS `origin: "*"` (`routes.ts:100–102`) — tighten before launch (new backlog item 17).
-- Express request-dump middleware (`index.ts:9–20`) — logs every POST/PUT/PATCH; follow-up removal.
+- Remove `/api/videos/:jobId/process` (confirmed dead legacy, no caller; flagged in 4d-2 — backlog item 16). → **Phase 7B-1 (gated; plan-only)** — current `routes.ts:437`; live-log no-hit gate required.
+- `5B-1c` dead-code lead — the original `routes.ts:361` ref is STALE (line 361 is live code); needs a corrected reference before removal. → **Phase 7B-2 (gated; plan-only)** — could not re-confirm; needs operator input.
+- `5B-4` — drop `temp_processed/` from `SWEEP_TARGETS` + `purgeTempProcessedOnStartup`: PARKED on the runtime "quiet" confirmation (no code writes there — static-confirmed in 5B). → **Phase 7B-3 (gated; plan-only)** — testing period is the wait-and-watch window.
+- Socket.IO CORS `origin: "*"` (`routes.ts:100–102`) — tighten before launch (new backlog item 17). → **Phase 7A-1 (PLANNED)**.
+- Express request-dump middleware (`index.ts:9–20`) — logs every POST/PUT/PATCH; follow-up removal. → **Phase 7A-2 (PLANNED)**.
 - Add a **canonical progress source** so `ProcessingStatus` doesn't show 0% for a beat before the
-  first WebSocket progress event (the cosmetic first-paint flicker logged in 4d-1b).
+  first WebSocket progress event (the cosmetic first-paint flicker logged in 4d-1b). → **Phase 7A-3 (PLANNED)**.
 - Resolve the invalid `ANTHROPIC_API_KEY` on prod (NLP intent parser currently falls back to the
-  keyword path).
+  keyword path). → **Phase 7A-4 (PLANNED; likely operator/secret fix, not code)**.
 - ~~`PgStorage` decision (keep stubs or remove).~~ **RESOLVED in 5C-1 (2026-06-30):** stubs fully implemented (Postgres-backed, **Option A3** single source of truth — `VideoJob`/`Job` derived from one `jobs` row, no blob). Still not wired to the live runtime — cutover is 5C-2.
-- Address or `@ts-expect-error` the 17 pre-existing `tsc` errors (`frameExtractor.ts` 10, `maskWorker.ts` 7).
-- Vite chunk-size warning (code splitting).
-- `attached_assets/` not in git (populated server-side) — commit or migrate to S3-served URLs.
+- Address or `@ts-expect-error` the 17 pre-existing `tsc` errors (`frameExtractor.ts` 10, `maskWorker.ts` 7). → **Phase 7A-5 (PLANNED; sequenced LAST; changes tsc baseline, target 0)**.
+- Vite chunk-size warning (code splitting). → **Phase 7A-6 (PLANNED; low-risk only, else defer)**.
+- `attached_assets/` not in git (populated server-side) — commit or migrate to S3-served URLs. → **Phase 7A-7 (PLANNED; decision only, no implementation)**.
 
 ### 5C. Durability (the big infra item)
 
@@ -202,7 +339,12 @@ conformance suite untouched. See `docs/refactor/PHASE_5D_PROPOSAL.md` / `PHASE_5
 
 ## Phase 6 — backlog
 
-### Phase 6 candidate — unify the two AI/export manifest builders
+### Phase 6 candidate — unify the two AI/export manifest builders — ✅ DONE (2026-07-21)
+
+**Resolved via (b)-lite** — shared `frameManifest.ts` core + two thin wrappers; run download
+gained `frames[]` + CSV; base-frame toggle added. See the Phase 6 status block at the top of this
+file and `docs/refactor/PHASE_6_REPORT.md` / `PHASE_6_REPORT_ADDENDUM.md`. The original candidate
+description is retained below for historical context.
 
 **Discovered during Phase 5A** (not a 5A regression; 5A was frontend-only and
 the manifest builders were untouched — `routes.ts` last changed at 4d-1).
@@ -272,20 +414,20 @@ verified.
 1. ~~**Remove legacy URL aliases**~~ — **DONE in Phase 4d-2 (2026-06-20).** All 11 legacy alias registrations deleted from `routes.ts`; `getLegacyJobHandler`'s definition deleted too (legacy-exclusive dead code). Only canonical URLs registered.
 2. ~~**Remove legacy thin-wrapper from `server/index.ts`**~~ — **DONE in Phase 4d-2 (2026-06-20).** `PATCH /internal/mask-processing/:jobId` wrapper + the dead `applyTemplateMask` import removed from `index.ts`; shared function and canonical route kept.
 3. ~~**Rename `tempFolderManager.ts`**~~ — **DONE in Phase 5B (2026-06-25, 5B-2a).** Renamed to `templateMaskFolderManager.ts` via `git mv` (history preserved); class name `TempFolderManager` kept for call-site stability. 3 import specifiers updated, incl. the dynamic `await import()` in `index.ts:57`; boot log confirms `initialize()` fires (cleanup logs print downstream of it).
-4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days. **(5B-4 — PARKED.** Phase 5B static audit found no code writes to `temp_processed/` — only stale comments, since corrected. Removal gated on the runtime "quiet" confirmation from the live host, which can't be observed from source.)
+4. **Remove `temp_processed/` from `SWEEP_TARGETS`** and remove `purgeTempProcessedOnStartup()` once confirmed quiet in production for several days. **(5B-4 — PARKED.** Phase 5B static audit found no code writes to `temp_processed/` — only stale comments, since corrected. Removal gated on the runtime "quiet" confirmation from the live host, which can't be observed from source.) → **Phase 7B-3 (gated; plan-only)** — current `cleanup.ts:68` (SWEEP_TARGETS) + `cleanup.ts:328` (`purgeTempProcessedOnStartup`, called `index.ts:135/140`); testing period is the wait-and-watch window (≥7 clean days).
 5. ~~**Fix path-traversal guard in `TempFolderManager`**~~ — **DONE in Phase 5B (2026-06-25, 5B-1a; scope expanded).** Added one shared `resolveWithinRoot(root, ...segments)` validator in `cleanup.ts` (resolve-and-compare, mirrors `safeDelete`) and applied it at every jobId/runId path boundary in BOTH `templateMaskFolderManager.ts` and `applyPaths.ts`. Byte-identical to `path.join` for valid UUIDs; rejects empty/`.`/`..`/separator/null-byte segments.
 6. ~~**Fix global progress broadcast**~~ — **DONE in Phase 5B (2026-06-25, 5B-1b).** Live line was `videoProcessor.ts:1081` (backlog's `:999` was stale). `this.io.emit('progress', …)` → `this.io.to(jobId).emit('progress', …)`, scoping to the job's room (clients already `socket.join(jobId)`; the AI path was already room-scoped). **Verify with a two-tab test** — boot logs don't prove room isolation.
-7. **Remove dead code at `routes.ts:361`** — **5B-1c OPEN (ref stale).** Phase 5B source check found `routes.ts:361` is LIVE code (`height: imageMeta.height` in an image-meta builder), not dead. Needs a corrected line reference before any removal — do NOT remove the current line 361.
-8. ~~**Remove debug endpoints**~~ — **DONE in Phase 5B (2026-06-25, 5B-1d).** `POST /api/test-post` + `POST /test-non-api` (console.log/json stubs, no client callers) deleted from `routes.ts`. *Note:* the express request-dump middleware in `index.ts:9–20` (logs every POST/PUT/PATCH) was out of Deploy 1 scope and remains — a follow-up removal candidate.
+7. **Remove dead code at `routes.ts:361`** — **5B-1c OPEN (ref stale).** Phase 5B source check found `routes.ts:361` is LIVE code (`height: imageMeta.height` in an image-meta builder), not dead. Needs a corrected line reference before any removal — do NOT remove the current line 361. → **Phase 7B-2 (gated; plan-only)** — re-diagnosis in Phase 7 also could not re-confirm a dead target (history sweep found none); output is "could not re-confirm; needs operator input."
+8. ~~**Remove debug endpoints**~~ — **DONE in Phase 5B (2026-06-25, 5B-1d).** `POST /api/test-post` + `POST /test-non-api` (console.log/json stubs, no client callers) deleted from `routes.ts`. *Note:* the express request-dump middleware in `index.ts:9–20` (logs every POST/PUT/PATCH) was out of Deploy 1 scope and remains — a follow-up removal candidate. → **Phase 7A-2 (PLANNED)** — current `index.ts:9–21`; confirmed pure logging, no side effects.
 9. ~~**Update stale `videoProcessor.ts` comments**~~ — **DONE in Phase 5B (2026-06-25, 5B-2b).** The two stale `temp_processed/{jobId}/` comments were at lines **388 and 698** (backlog's `371`/`643` were stale); both now read `spokes/template_mask/{jobId}/`, matching where `TempFolderManager` actually writes.
 10. ~~**Add `deleteProcessingProgress(jobId)` cleanup on job delete**~~ — **DONE in Phase 5B (2026-06-25, 5B-2c).** Added to `IStorage` + `MemStorage` + `PgStorage`, and folded INTO `deleteVideoJob` so every delete path frees the progress-map entry (Decision 3 — not an explicit call in the route handler).
 11. ~~**`PgStorage` stub maintenance**~~ — **DONE in 5C-1 (2026-06-30).** All 12 throw-stubs replaced with real Postgres-backed implementations (**Option A3**: one `jobs` row as single source of truth; `VideoJob`/`Job` derived in the shim; no `video_job` blob, no `has_job_v2`, no `video_jobs` table; `ai_runs` child). Validated by `scripts/conformance-storage.ts` against the `MemStorage` oracle (35/35). All runtime storage is still `MemStorage`; cutover deferred to 5C-2.
-12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`.
-13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size.
+12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`. → **Phase 7A-5 (PLANNED; sequenced LAST)** — sole item permitted to change the tsc=17 baseline (target 0); ~5 trivial fixes, ~12 need real type-narrowing (do NOT blanket-suppress; may mask latent bugs).
+13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size. → **Phase 7A-6 (PLANNED; low-risk only)** — 661KB single bundle; route-level `React.lazy` for AiSpokePage + TemplateMaskSpokePage, else defer.
 14. ~~**Delete `home.tsx` and any other legacy step containers in 4d**~~ — **DONE in Phase 4d-2 (2026-06-20).** `home.tsx` + `FileUpload.tsx` (home-only) deleted; `/app` route + `Home` import removed from `App.tsx`; `landing.tsx` CTA `/app`→`/upload`.
-16. **Remove dead `POST /api/videos/:jobId/process`** — examined during Phase 4d-2: zero client callers (no constructor in `client/src`; the canonical processing path used by all spokes is `POST /api/jobs/:jobId/template-mask/apply`). It matches `/api/videos/`, so the empty live legacy sweep confirms no caller. Left in 4d-2 (not on the alias removal list) but it is dead legacy and can be deleted.
-15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX.
-17. **Socket.IO CORS is wide open** — `routes.ts:100–102` initializes the Socket.IO server with `cors: { origin: "*" }`. Tighten to the known frontend origin(s) before/at commercial launch. (Logged during Phase 5B; not in 5B Deploy 1 scope.)
+16. **Remove dead `POST /api/videos/:jobId/process`** — examined during Phase 4d-2: zero client callers (no constructor in `client/src`; the canonical processing path used by all spokes is `POST /api/jobs/:jobId/template-mask/apply`). It matches `/api/videos/`, so the empty live legacy sweep confirms no caller. Left in 4d-2 (not on the alias removal list) but it is dead legacy and can be deleted. → **Phase 7B-1 (gated; plan-only)** — current `routes.ts:437`; Phase 7 static sweep re-confirmed ZERO callers, but removal awaits a live-log no-hit gate across the testing period (HTTP 200 ≠ removal proof — SPA catch-all).
+15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX. → **Phase 7B-4 (operator decision)** — whole-job 404 at `routes.ts:552–554`; options: unify raw fallback vs leave documented (proposal recommends leaving documented).
+17. **Socket.IO CORS is wide open** — `routes.ts:100–102` initializes the Socket.IO server with `cors: { origin: "*" }`. Tighten to the known frontend origin(s) before/at commercial launch. (Logged during Phase 5B; not in 5B Deploy 1 scope.) → **Phase 7A-1 (PLANNED)** — env-driven allow-list, prod default `https://masqueradeimage.com`; ⚠️ smoke test = real upload w/ live progress from prod domain.
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
 

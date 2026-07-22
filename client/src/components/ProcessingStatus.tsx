@@ -63,6 +63,36 @@ export default function ProcessingStatus({ jobId }: ProcessingStatusProps) {
     );
   }
 
+  // Phase 7A-3 — first-paint guard. Granular progress is WebSocket-only; on first
+  // paint the job poll can arrive before the first 'progress' event, which used to
+  // render a misleading literal 0% (0 / 0 frames). While we have a job but no
+  // progress yet — and the job isn't already complete — show an indeterminate
+  // "connecting" state instead of 0%. Self-healing: once a 'progress' event lands
+  // (or tm.status becomes 'complete' via the poll) this branch falls through.
+  if (!currentProgress && tm?.status !== 'complete') {
+    return (
+      <div className="border-t border-border bg-card p-6" data-testid="processing-status">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold">Processing Status</h3>
+          <div className="flex items-center space-x-2">
+            <div className="w-2 h-2 rounded-full bg-accent animate-pulse"></div>
+            <Badge variant="secondary">Processing</Badge>
+            {isConnected && (
+              <div className="text-xs text-muted-foreground flex items-center gap-1">
+                <div className="w-1 h-1 bg-green-500 rounded-full"></div>
+                Live
+              </div>
+            )}
+          </div>
+        </div>
+        <Progress className="h-3" data-testid="progress-bar" />
+        <div className="mt-2 text-sm text-muted-foreground" data-testid="progress-connecting">
+          Connecting to processing updates…
+        </div>
+      </div>
+    );
+  }
+
   const getStageLabel = (stage: string) => {
     switch (stage) {
       case 'uploading': return 'Uploading';

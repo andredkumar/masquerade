@@ -6,20 +6,6 @@ import { storage } from "./storage";
 
 const app = express();
 
-// Debug middleware to log ALL requests (including PUT/PATCH)
-app.use((req, res, next) => {
-  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-    console.log('\n🔍 EXPRESS ALL POST/PUT/PATCH REQUESTS:');
-    console.log('=======================================');
-    console.log('Method:', req.method);
-    console.log('URL:', req.url);
-    console.log('Content-Type:', req.headers['content-type']);
-    console.log('Content-Length:', req.headers['content-length']);
-    console.log('=======================================\n');
-  }
-  next();
-});
-
 app.use(express.json({ limit: '50mb' })); // Increase limit to handle large canvas data
 app.use(express.urlencoded({ extended: false }));
 

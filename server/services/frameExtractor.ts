@@ -355,7 +355,7 @@ export class FrameExtractor {
               uint8Array[i] = binaryString.charCodeAt(i);
             }
           } catch (e) {
-            throw new Error(`Failed to decode base64 pixel data: ${e.message}`);
+            throw new Error(`Failed to decode base64 pixel data: ${e instanceof Error ? e.message : String(e)}`);
           }
         } else if (typeof firstValue === 'object' && firstValue) {
           // Handle nested object structure (common in DICOM)
@@ -521,8 +521,8 @@ export class FrameExtractor {
         // Find min/max for normalization if no window settings
         let min = 0, max = 65535;
         if (!windowCenter || !windowWidth) {
-          min = Math.min(...uint16Data);
-          max = Math.max(...uint16Data);
+          min = Math.min(...Array.from(uint16Data));
+          max = Math.max(...Array.from(uint16Data));
           console.log(`Auto-calculated range: ${min}-${max}`);
         }
         
@@ -846,7 +846,7 @@ export class FrameExtractor {
           frames.push(frameBuffer);
           console.log(`✅ DICOM frame ${frameIndex} extracted`);
         } catch (error) {
-          console.error(`❌ Failed to extract DICOM frame ${frameIndex}:`, error.message);
+          console.error(`❌ Failed to extract DICOM frame ${frameIndex}:`, error instanceof Error ? error.message : String(error));
           console.log(`⚠️ Unsupported pixel data format, using first frame extraction`);
           // Use first frame as fallback
           const fallbackFrame = await this.extractDicomImage(videoPath);
