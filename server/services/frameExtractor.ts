@@ -191,6 +191,32 @@ export class FrameExtractor {
     samplingFps: number | null,
     nativeFps: number,
   ): Promise<string[]> {
+    // 🎞️ DICOM interception (restored — see docs/refactor/DICOM_REGRESSION_FIX_REPORT.md).
+    // ffmpeg cannot demux a DICOM container ("Invalid data found"), so route DICOM through
+    // the pixel-extraction path (extractDicomFrame) exactly as extractFrameBatch already
+    // does. Purely additive: MP4/regular video is not DICOM → falls through to the unchanged
+    // ffmpeg block below. Uncompressed DICOM only; samplingFps is intentionally ignored here
+    // (every frame is extracted), matching the pre-280cb38 behavior.
+    if (await this.isDicomFile(videoPath)) {
+      const { totalFrames } = await this.extractVideoMetadata(videoPath);
+      console.log('[dicom-extract]', path.basename(videoPath), 'frames:', totalFrames);
+      await fs.mkdir(outputDir, { recursive: true });
+
+      const dicomPaths: string[] = [];
+      for (let i = 0; i < totalFrames; i++) {
+        const frameBuffer = await this.extractDicomFrame(videoPath, i);
+        // Match ffmpeg's image2 muxer naming: frame_%06d.png, 1-indexed (start_number=1),
+        // so the sorted readback below (:224-229) and all downstream consumers are identical
+        // to the video path. DICOM frameIndex i is 0-based → on-disk file number i + 1.
+        const framePath = path.join(outputDir, `frame_${String(i + 1).padStart(6, '0')}.png`);
+        await fs.writeFile(framePath, frameBuffer);
+        dicomPaths.push(framePath);
+      }
+
+      console.log(`🎬 Extracted ${dicomPaths.length} DICOM frames into ${outputDir}`);
+      return dicomPaths;
+    }
+
     const effectiveFps = samplingFps == null ? nativeFps : samplingFps;
     const estimatedCount = Math.max(1, Math.round(durationSec * effectiveFps));
 
