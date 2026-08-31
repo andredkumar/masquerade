@@ -22,16 +22,18 @@ interface TransformationMatrix {
 /**
  * The per-apply mask, built once (2B-3a).
  *
- * `blackOverlay` is the form the per-frame libvips composite consumes: pure
- * black RGB with the mask's alpha, so `composite(blend:'over')` blacks out
- * exactly the pixels the old JS loop zeroed. `maskRgba` is retained because the
- * per-stack fallback path still expects the original RGBA raster.
+ * `maskedOffsets` holds the byte offset into a raw 3-channel frame of every
+ * pixel the mask redacts, so the per-frame work scales with the *masked* pixel
+ * count rather than the frame. On the prod clip that is 1,494 entries out of
+ * 1,222,656 pixels — 0.12 %. `maskRgba` is retained because the per-stack
+ * fallback path still expects the original RGBA raster.
  */
 interface ApplyMask {
   width: number;
   height: number;
   maskRgba: Buffer;
-  blackOverlay: Buffer;
+  /** Byte offsets `(y*width + x) * 3` of every masked pixel, ascending. */
+  maskedOffsets: Uint32Array;
   maskedPixels: number;
 }
 
@@ -611,25 +613,29 @@ export class VideoProcessor {
 
       const maskRgba = await this.createMaskRgbaBuffer(maskData, width, height);
 
-      // Pure black with the mask's alpha. `composite(blend:'over')` with this
-      // overlay is byte-for-byte the old loop's `if (alpha > 0) rgb = 0`
-      // (verified: max abs diff 0 over 3,048,516 bytes — see ROUND2B3A_REPORT).
+      // 2B-3a hotfix: flatten the binary mask alpha into a list of byte offsets
+      // into a raw 3-channel frame. The old loop's cost was dominated by the
+      // SCAN (1.2 M alpha tests per frame), not the writes (1,494 on the prod
+      // clip); the offset list removes the scan entirely. Worst case — the whole
+      // frame drawn — the list is every pixel, which is exactly the old loop's
+      // cost, so this is never slower.
+      //
+      // This runs once per apply, so the scan below is paid once, not 348 times.
       const pixels = width * height;
-      const blackOverlay = Buffer.alloc(pixels * 4);
+      const offsets = new Uint32Array(pixels);
       let maskedPixels = 0;
       for (let i = 0; i < pixels; i++) {
-        const a = maskRgba[i * 4 + 3];
-        if (a > 0) {
-          // The old loop was a binary test on `alpha > 0`, so the overlay is
-          // binary too — never a partial alpha that would blend instead of black.
-          blackOverlay[i * 4 + 3] = 255;
-          maskedPixels++;
-        }
+        // The old loop tested `alpha > 0` (binary), so this reproduces it exactly.
+        if (maskRgba[i * 4 + 3] > 0) offsets[maskedPixels++] = i * 3;
       }
+      const maskedOffsets = offsets.subarray(0, maskedPixels);
 
-      end({ ok: true, w: width, h: height, masked_px: maskedPixels, total_px: pixels });
+      end({
+        ok: true, w: width, h: height,
+        masked_px: maskedPixels, total_px: pixels, offsets: maskedOffsets.length,
+      });
       console.log(`🎭 Mask built once for this apply: ${width}x${height}, ${maskedPixels}/${pixels} px masked (${((maskedPixels / pixels) * 100).toFixed(2)}%)`);
-      return { width, height, maskRgba, blackOverlay, maskedPixels };
+      return { width, height, maskRgba, maskedOffsets, maskedPixels };
     } catch (err) {
       end({ ok: false, reason: err instanceof Error ? err.message : String(err) });
       return null;
@@ -1528,12 +1534,12 @@ export class VideoProcessor {
         && prebuiltMask.width === volumeWidth
         && prebuiltMask.height === volumeHeight;
       let maskRgba: Buffer;
-      let blackOverlay: Buffer | null = null;
+      let maskedOffsets: Uint32Array | null = null;
       let maskedPixelsTotal: number;
       let maskBuildMs = 0;
       if (maskFits && prebuiltMask) {
         maskRgba = prebuiltMask.maskRgba;
-        blackOverlay = prebuiltMask.blackOverlay;
+        maskedOffsets = prebuiltMask.maskedOffsets;
         maskedPixelsTotal = prebuiltMask.maskedPixels;
       } else {
         console.log('🎭 Creating volumetric mask for entire batch (fallback — no usable prebuilt mask)...');
@@ -1553,23 +1559,34 @@ export class VideoProcessor {
       // Process all frames in parallel using the same mask
       const volumeProcessingPromises = frameBuffers.map(async (framePixels, frameIndex) => {
         const frameNumber = tasks[frameIndex].frameNumber;
-        // 2B-3a: the masking itself moves off the Node main thread. The loop
-        // below ran ~1.2M iterations per frame — ~10 ms x 348 frames of
-        // JavaScript that no amount of libvips concurrency could touch.
-        // `composite(blend:'over')` with a pure-black overlay carrying the
-        // mask's alpha is byte-for-byte identical (verified: max abs diff 0
-        // over 3,048,516 bytes — see ROUND2B3A_REPORT.md) and runs inside
-        // libvips' own threads.
+        // 2B-3a hotfix: mask by offset list. The original loop's cost was the
+        // SCAN — 1.2 M alpha tests per frame — not the writes, of which the prod
+        // clip has 1,494 (0.12 % of the frame). `maskedOffsets` is built once per
+        // apply, so per frame we touch only the pixels that actually change.
         //
-        // The JS loop is kept for the one case the composite cannot reproduce
-        // exactly: a frame WITH an alpha channel, where the old loop zeroed RGB
-        // but left A untouched. Extracted frames are RGB (ffmpeg -pix_fmt
-        // rgb24; the DICOM writer emits 3-channel), so this is a guard against
-        // an unexpected input, not a live path.
-        const useVips = blackOverlay !== null && imageChannels === 3;
+        // This replaces 2B-3a's libvips composite, which measured WORSE on the
+        // deployed t3.large (apply.done 13.4 s → 19.3 s): composite + removeAlpha
+        // premultiplies, blends and unpremultiplies the WHOLE frame, so it did
+        // far more arithmetic than the loop it replaced, on one physical core.
+        // Cost must scale with masked pixels, not with the frame.
+        //
+        // The full scan survives only for a frame WITH an alpha channel, where
+        // the old loop zeroed RGB but left A untouched and 3-channel offsets
+        // would not line up. Extracted frames are RGB (ffmpeg -pix_fmt rgb24;
+        // the DICOM writer emits 3-channel), so that is a guard, not a live path.
+        const useOffsets = maskedOffsets !== null && imageChannels === 3;
         let maskedPixels = maskedPixelsTotal;
         const tMask = process.hrtime.bigint();
-        if (!useVips) {
+        if (useOffsets && maskedOffsets) {
+          // Exactly the old loop's write (`RGB = 0`), restricted to the pixels
+          // where it did anything.
+          for (let k = 0; k < maskedOffsets.length; k++) {
+            const o = maskedOffsets[k];
+            framePixels[o] = 0;     // Red = 0 (black)
+            framePixels[o + 1] = 0; // Green = 0 (black)
+            framePixels[o + 2] = 0; // Blue = 0 (black)
+          }
+        } else {
           maskedPixels = 0;
           // Apply the same mask to this frame layer
           for (let i = 0; i < pixelsPerFrame; i++) {
@@ -1587,7 +1604,7 @@ export class VideoProcessor {
 
         const maskMs = Number(process.hrtime.bigint() - tMask) / 1e6;
 
-        console.log(`\u{1F3AF} Frame ${frameNumber}: ${maskedPixels}/${pixelsPerFrame} pixels masked (${((maskedPixels/pixelsPerFrame)*100).toFixed(2)}%) [${useVips ? 'vips' : 'js'}]`);
+        console.log(`\u{1F3AF} Frame ${frameNumber}: ${maskedPixels}/${pixelsPerFrame} pixels masked (${((maskedPixels/pixelsPerFrame)*100).toFixed(2)}%) [${useOffsets ? 'offsets' : 'js'}]`);
 
         // Step 4: Use Sharp pipeline for optimized output generation
         const outputSettings = tasks[frameIndex].outputSettings;
@@ -1601,18 +1618,6 @@ export class VideoProcessor {
           }
         });
 
-        if (useVips && blackOverlay) {
-          processedImage = processedImage
-            .composite([{
-              input: blackOverlay,
-              raw: { width: volumeWidth, height: volumeHeight, channels: 4 },
-              blend: 'over',
-            }])
-            // `over` with an alpha-carrying overlay promotes the frame to RGBA;
-            // the old loop returned 3 channels, so drop it back.
-            .removeAlpha();
-        }
-        
         // CORRECTED 3D PIPELINE: Apply aspect ratio first, then output size
         // OUTPUT SETTINGS TAKE ABSOLUTE PRIORITY over mask data
         const aspectMode = outputSettings.aspectRatioMode || 'letterbox';
@@ -1670,7 +1675,7 @@ export class VideoProcessor {
             stackIdx: perf.stackIdx,
             decode_ms: +(decodeMs[frameIndex] ?? 0).toFixed(1),
             mask_ms: +maskMs.toFixed(1),
-            mask_mode: useVips ? 'vips' : 'js',
+            mask_mode: useOffsets ? 'offsets' : 'js',
             encode_ms: +encodeMs.toFixed(1),
             fmt: outFormat,
             w: volumeWidth,
