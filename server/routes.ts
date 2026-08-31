@@ -244,7 +244,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log('🚀 DICOM: First frame displayed, continuing background extraction');
         const dicomFilePath = req.file.path;
         setImmediate(() => {
-          videoProcessor.startBackgroundFrameExtraction(job.id, dicomFilePath, quickMetadata.totalFrames)
+          videoProcessor.startBackgroundFrameExtraction(job.id, dicomFilePath, quickMetadata.totalFrames, true)
             .catch(error => {
               console.error('❌ DICOM background extraction failed:', error);
               // Extraction failed → job never becomes applyable, so no redo loop
@@ -320,7 +320,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log('🚀 STARTING BACKGROUND FRAME EXTRACTION FOR ALL', metadata.totalFrames, 'FRAMES');
       const stdFilePath = req.file.path;
       setImmediate(() => {
-        videoProcessor.startBackgroundFrameExtraction(job.id, stdFilePath, metadata.totalFrames)
+        videoProcessor.startBackgroundFrameExtraction(job.id, stdFilePath, metadata.totalFrames, false)
           .catch(error => {
             console.error('❌ Background extraction failed:', error);
             // Extraction failed → job never becomes applyable, so no redo loop

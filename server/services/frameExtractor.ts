@@ -266,6 +266,71 @@ export class FrameExtractor {
     return created;
   }
 
+  /**
+   * Round 2B-3b — single-pass extraction of every frame straight to disk, for
+   * the UPLOAD-time background extractor.
+   *
+   * Deliberately separate from `extractAllFramesSequential` (which stays
+   * byte-for-byte untouched, DICOM branch included) because the two have
+   * different jobs: that one is the apply-time fallback and owns the `_apply`
+   * staging contract; this one fills the persistent raw-frame dir and reports
+   * live progress. They share only the ffmpeg invocation shape, deliberately:
+   * the same image2 muxer, the same `frame_%06d.png` 1-indexed naming, the same
+   * `-vsync 0`, so the frames this writes are indistinguishable from the ones
+   * the apply path would have produced.
+   *
+   * **MP4 only.** The caller routes DICOM to the per-frame loop; nothing here
+   * can demux a DICOM container.
+   *
+   * **Native rate, no `fps` filter.** The batch extractor it replaces
+   * (`extractFrameBatch`) selects frames by index and ignores `samplingFps`
+   * entirely, so this must too — down-sampling here would change the on-disk
+   * frame count and trip the Round 2B-1 reuse guard on every apply.
+   *
+   * `-compression_level 1` trades ~20% larger PNGs for a markedly cheaper zlib
+   * pass. These frames are intermediate (the masked output is re-encoded from
+   * them), and PNG is lossless at every level, so the pixels are identical.
+   *
+   * @param onProgress called with ffmpeg's running frame count as it decodes
+   * @returns the number of `frame_*.png` files on disk when ffmpeg finished
+   */
+  async extractAllFramesSinglePass(
+    videoPath: string,
+    outputDir: string,
+    onProgress?: (framesDone: number) => void,
+  ): Promise<number> {
+    await fs.mkdir(outputDir, { recursive: true });
+
+    const outputPattern = path.join(outputDir, 'frame_%06d.png');
+
+    const run = (opts: string[]) => new Promise<void>((resolve, reject) => {
+      ffmpeg(videoPath)
+        .outputOptions(opts)
+        .output(outputPattern)
+        .on('progress', (p: { frames?: number }) => {
+          if (onProgress && typeof p.frames === 'number') onProgress(p.frames);
+        })
+        .on('end', () => resolve())
+        .on('error', (err) => reject(new Error(`Single-pass frame extraction failed: ${err.message}`)))
+        .run();
+    });
+
+    try {
+      await run(['-vsync', '0', '-compression_level', '1']);
+    } catch (err) {
+      // `-compression_level` is a PNG-encoder option; if this ffmpeg build
+      // rejects it the command fails immediately and cheaply. Retry once
+      // without it rather than failing every upload over an encoder flag —
+      // the flag is a speed optimization, not a correctness requirement.
+      console.warn(`⚠️  [single-pass] retrying without -compression_level: ${err instanceof Error ? err.message : err}`);
+      await run(['-vsync', '0']);
+    }
+
+    // Count what actually landed, the same readback the apply path uses.
+    const all = await fs.readdir(outputDir);
+    return all.filter(f => /^frame_\d+\.png$/.test(f)).length;
+  }
+
   async extractFirstFrame(videoPath: string): Promise<Buffer> {
     // Check if file is DICOM
     const isDicom = await this.isDicomFile(videoPath);

@@ -1,6 +1,6 @@
 import { storage } from '../storage';
-import { FrameExtractor } from './frameExtractor';
-import type { MaskData, OutputSettings, ProcessingProgress } from '@shared/schema';
+import { FrameExtractor, type VideoMetadata } from './frameExtractor';
+import type { Job, MaskData, OutputSettings, ProcessingProgress } from '@shared/schema';
 import { Server } from 'socket.io';
 import path from 'path';
 import fs from 'fs/promises';
@@ -350,9 +350,6 @@ export class VideoProcessor {
 
       await this.updateProgress(jobId, { stage: 'extracting', progress: 5 });
 
-      // Extract video metadata
-      const metadata = await this.frameExtractor.extractVideoMetadata(videoPath);
-
       // ── FRAME SOURCE: REUSE temp_extracted/, ELSE RE-EXTRACT ───────
       // Round 2B-1. Round 1 measured apply-time re-extraction at 19.5 s of a
       // 33.3 s apply (58%) on a 348-frame clip whose frames were already sitting
@@ -366,6 +363,37 @@ export class VideoProcessor {
       let extractedBuffers: Buffer[];
       let extractedCount: number;
       const reuse = await this.tryReuseRawFrames(jobId, samplingFps);
+
+      // 2B-3b — source metadata without re-probing the upload.
+      //
+      // `extractVideoMetadata` used to run unconditionally, before we knew
+      // whether we'd even need it. On the reuse path the only consumer is the
+      // `updateVideoJob` write below (duration/dims/frameRate), and the Job V2
+      // record already carries exactly those four values from upload time — so
+      // the probe is pure waste there. For DICOM it was an entire file read plus
+      // a dcmjs parse of a file we no longer open at all.
+      //
+      // The re-extract path still probes: it needs `duration`/`frameRate` to
+      // drive extractAllFramesSequential and `isDicom` to label the probe. No
+      // new columns — this reads what A3 already stores (ROUND2B3_PROPOSAL §2B-3b).
+      const cached = reuse?.source;
+      const cacheUsable = !!cached
+        && cached.duration > 0 && cached.width > 0 && cached.height > 0 && cached.frameRate > 0;
+      let metadata: VideoMetadata;
+      if (reuse && cacheUsable && cached) {
+        metadata = {
+          duration: cached.duration,
+          width: cached.width,
+          height: cached.height,
+          frameRate: cached.frameRate,
+          totalFrames: cached.totalFrames,
+        };
+        perfMark(jobId, 'apply.metadata', { mode: 'cached' });
+      } else {
+        const endMeta = perfSpan(jobId, 'apply.metadata', { mode: 'probe' });
+        metadata = await this.frameExtractor.extractVideoMetadata(videoPath);
+        endMeta({ reason: reuse ? 'incomplete_cache' : 'reextract' });
+      }
 
       if (reuse) {
         extractedBuffers = reuse.buffers;
@@ -675,7 +703,7 @@ export class VideoProcessor {
   private async tryReuseRawFrames(
     jobId: string,
     samplingFps: number | null,
-  ): Promise<{ buffers: Buffer[] } | null> {
+  ): Promise<{ buffers: Buffer[]; source: Job['source'] } | null> {
     const reject = (reason: string, extra: Record<string, unknown> = {}) => {
       perfMark(jobId, 'apply.source', { mode: 'reextract', reason, ...extra });
       return null;
@@ -706,7 +734,7 @@ export class VideoProcessor {
       if (tornIdx !== -1) return reject('torn_png', { i: tornIdx, file: files[tornIdx] });
 
       perfMark(jobId, 'apply.source', { mode: 'reuse', frames: buffers.length });
-      return { buffers };
+      return { buffers, source: jobV2.source };
     } catch (err) {
       // Reuse is an optimization; it must never be the reason an apply fails.
       return reject('error', { message: err instanceof Error ? err.message : String(err) });
@@ -1328,7 +1356,15 @@ export class VideoProcessor {
   }
 
   // 🚀 NEW: Background frame extraction immediately after upload
-  async startBackgroundFrameExtraction(jobId: string, videoPath: string, totalFrames: number): Promise<void> {
+  async startBackgroundFrameExtraction(
+    jobId: string,
+    videoPath: string,
+    totalFrames: number,
+    // 2B-3b: the upload handler already branched on DICOM-ness, so it passes the
+    // answer in rather than making us re-read the whole file to find it again
+    // (isDicomFile reads the entire file to inspect 4 bytes). Omitted → detect.
+    isDicomHint?: boolean,
+  ): Promise<void> {
     // [PERF] Round 1 §3.2 (upload path). `bg_extract.done` is the span close.
     const bgT0 = Date.now();
     const endBgExtract = perfSpan(jobId, 'bg_extract.done');
@@ -1348,15 +1384,7 @@ export class VideoProcessor {
         status: 'Background frame extraction in progress'
       });
       
-      // Create batches for parallel extraction (10-20 frames per batch as specified)
-      const batchSize = 15; // Optimal batch size for memory management
-      const batches = [];
-      for (let i = 0; i < totalFrames; i += batchSize) {
-        const end = Math.min(i + batchSize - 1, totalFrames - 1);
-        batches.push({ start: i, end });
-      }
-      
-      console.log(`📋 Created ${batches.length} batches of ~${batchSize} frames each`);
+      const isDicom = isDicomHint ?? await this.frameExtractor.isDicomFile(videoPath);
 
       // Raw frames are written to disk under temp_extracted/<jobId>/ (Phase 4b-0).
       // This replaces the volatile global.extractedFrames in-memory map: frames
@@ -1372,62 +1400,158 @@ export class VideoProcessor {
       console.log(`🗂️  [raw-frames] mkdir ${path.resolve(rawDir)}`);
       await fs.mkdir(rawDir, { recursive: true });
 
-      // Extract all frames in parallel batches
-      let extractedFrames = 0;
-
-      for (const batch of batches) {
-        try {
-          console.log(`🗢️ Extracting batch: frames ${batch.start}-${batch.end}`);
-          const batchFrames = await this.frameExtractor.extractFrameBatch(
-            videoPath,
-            batch.start,
-            batch.end
-          );
-
-          // Persist each frame to disk. Frame numbering is 1-indexed to match
-          // ffmpeg's %06d output, so background-extracted frame 0 → frame_000001.png.
-          // jobId is a server-generated UUID (not user input); the read helpers
-          // additionally bound every path against TEMP_EXTRACTED_DIR.
-          await Promise.all(
-            batchFrames.map((frameBuffer, index) => {
-              const frameNumber = batch.start + index;
-              const padded = String(frameNumber + 1).padStart(6, '0');
-              return fs.writeFile(path.join(rawDir, `frame_${padded}.png`), frameBuffer);
-            }),
-          );
-
-          // First batch is on disk → frame_000001.png exists and the
-          // draw-the-mask-now UX would be unblocked if anything read it.
-          if (!firstFrameLogged) {
+      // The `bg_extract.first_frame_on_disk` probe is what Round 2A's
+      // draw-while-extracting depends on, so it must measure the file actually
+      // landing — not ffmpeg's internal frame counter. Poll for the file.
+      const watchFirstFrame = (stop: { done: boolean }) => {
+        const firstPath = path.join(rawDir, 'frame_000001.png');
+        const tick = async () => {
+          if (stop.done || firstFrameLogged) return;
+          try {
+            await fs.access(firstPath);
             firstFrameLogged = true;
             perfMark(jobId, 'bg_extract.first_frame_on_disk', {
               ms_since_start: Date.now() - bgT0,
-              batchFrames: batchFrames.length,
             });
+            return;
+          } catch {
+            setTimeout(tick, 100);
           }
+        };
+        void tick();
+      };
 
-          extractedFrames += batchFrames.length;
-          const progress = (extractedFrames / totalFrames) * 100;
-          
-          // Update progress
-          await this.updateProgress(jobId, {
-            stage: 'extracting',
-            currentFrame: extractedFrames,
-            totalFrames,
-            extractionProgress: progress,
-            status: `Extracted ${extractedFrames}/${totalFrames} frames (${progress.toFixed(1)}%)`
-          });
-          
-          console.log(`✅ Batch complete: ${extractedFrames}/${totalFrames} frames (${progress.toFixed(1)}%)`);
-          
-        } catch (batchError) {
-          console.error(`❌ Batch extraction failed:`, batchError);
-          // Continue with other batches rather than failing completely
+      // Emit the SAME progress payload the batch loop emitted, so Round 2A's
+      // Apply note and the hub panel keep working unchanged. Throttled: ffmpeg
+      // reports more often than the old 23-batches-per-clip, and each emit is a
+      // DB write plus a socket send.
+      let extractedFrames = 0;
+      let lastEmit = 0;
+      let lastEmitted = -1;
+      const emitProgress = async (framesDone: number, force = false) => {
+        const now = Date.now();
+        if (!force && (now - lastEmit < 500 || framesDone === lastEmitted)) return;
+        lastEmit = now;
+        lastEmitted = framesDone;
+        const progress = totalFrames > 0 ? Math.min((framesDone / totalFrames) * 100, 100) : 0;
+        await this.updateProgress(jobId, {
+          stage: 'extracting',
+          currentFrame: framesDone,
+          totalFrames,
+          extractionProgress: progress,
+          status: `Extracted ${framesDone}/${totalFrames} frames (${progress.toFixed(1)}%)`,
+        });
+      };
+
+      if (isDicom) {
+        // ── DICOM: unchanged per-frame loop in 15-frame batches ────────
+        // extractFrameBatch is the only path that can read a DICOM container;
+        // ffmpeg cannot demux one. 2B-3b is explicitly MP4-only.
+        const batchSize = 15;
+        for (let start = 0; start < totalFrames; start += batchSize) {
+          const end = Math.min(start + batchSize - 1, totalFrames - 1);
+          try {
+            console.log(`🗢️ Extracting batch: frames ${start}-${end}`);
+            const batchFrames = await this.frameExtractor.extractFrameBatch(videoPath, start, end);
+
+            // Persist each frame to disk. Frame numbering is 1-indexed to match
+            // ffmpeg's %06d output, so background-extracted frame 0 → frame_000001.png.
+            // jobId is a server-generated UUID (not user input); the read helpers
+            // additionally bound every path against TEMP_EXTRACTED_DIR.
+            await Promise.all(
+              batchFrames.map((frameBuffer, index) => {
+                const padded = String(start + index + 1).padStart(6, '0');
+                return fs.writeFile(path.join(rawDir, `frame_${padded}.png`), frameBuffer);
+              }),
+            );
+
+            if (!firstFrameLogged) {
+              firstFrameLogged = true;
+              perfMark(jobId, 'bg_extract.first_frame_on_disk', {
+                ms_since_start: Date.now() - bgT0,
+                batchFrames: batchFrames.length,
+              });
+            }
+
+            extractedFrames += batchFrames.length;
+            await emitProgress(extractedFrames, true);
+            console.log(`✅ Batch complete: ${extractedFrames}/${totalFrames} frames`);
+          } catch (batchError) {
+            console.error(`❌ Batch extraction failed:`, batchError);
+            // Continue with other batches rather than failing completely
+          }
         }
+      } else {
+        // ── MP4: one ffmpeg pass (2B-3b) ───────────────────────────────
+        // Round 1 measured the 15-frame batch extractor at 131 ms/frame against
+        // 56 ms/frame for the apply-time single pass on the same file — the
+        // batch loop pays a seek and a process spawn per batch. Same muxer,
+        // same 1-indexed frame_%06d.png naming, same native rate, so what lands
+        // on disk is indistinguishable from what the apply path would write.
+        const stop = { done: false };
+        watchFirstFrame(stop);
+        try {
+          extractedFrames = await this.frameExtractor.extractAllFramesSinglePass(
+            videoPath,
+            rawDir,
+            (framesDone) => { void emitProgress(framesDone); },
+          );
+        } finally {
+          stop.done = true;
+        }
+        await emitProgress(extractedFrames, true);
+        console.log(`✅ Single-pass extraction complete: ${extractedFrames}/${totalFrames} frames`);
       }
       
       console.log(`🎉 BACKGROUND EXTRACTION COMPLETE: ${extractedFrames} frames written to ${rawDir}`);
-      endBgExtract({ frames: extractedFrames, outcome: 'ok' });
+
+      // 2B-3b parity tripwire. The Round 2B-1 reuse guard requires
+      // `files.length === totalFrames`; if the single pass decodes a different
+      // count than the upload-time estimate (floor(duration x frameRate) — wrong
+      // for VFR and for any clip whose real frame count isn't that product),
+      // every apply falls back to re-extraction and 2B-1's 19.5 s saving is lost
+      // on every apply, forever, for that job.
+      //
+      // So: reconcile totalFrames to what is actually on disk, exactly as
+      // processVideo already does after its own extraction (`totalFrames:
+      // extractedCount`). `totalFrames` is ONE shared column in PgStorage, read
+      // by both rowToVideoJob (:469) and rowToJob's `source.totalFrames` (:498),
+      // so this single existing-write-path call updates both facets. No schema
+      // change, no new column.
+      //
+      // The warning and `parity: false` stay regardless — reconciling the count
+      // must not make the divergence invisible; it is still worth knowing that
+      // the upload-time estimate was wrong for this clip.
+      //
+      // Ordering matters: this lands BEFORE status flips to `ready`, so an apply
+      // fired the instant the tile unlocks already reads the corrected count.
+      let parityCorrected = false;
+      if (extractedFrames !== totalFrames) {
+        console.warn(
+          `⚠️  [parity] extracted ${extractedFrames} frames but job.totalFrames is ${totalFrames}`,
+        );
+        if (!isDicom) {
+          await storage.updateVideoJob(jobId, { totalFrames: extractedFrames });
+          parityCorrected = true;
+          console.warn(`⚠️  [parity] totalFrames reconciled to ${extractedFrames} so apply-time reuse still applies`);
+        } else {
+          // DICOM is NOT reconciled. Its totalFrames comes from
+          // detectDicomFrameCount, which is exact — so a mismatch here means the
+          // per-batch catch above swallowed a real extraction failure and frames
+          // are genuinely MISSING. Rewriting the count would make the reuse
+          // guard accept a short frame set and silently mask/export fewer frames
+          // than the source has. A short DICOM set must keep failing the guard.
+          console.warn(`⚠️  [parity] DICOM count NOT reconciled — a short set means frames failed to extract`);
+        }
+      }
+      endBgExtract({
+        frames: extractedFrames,
+        expected: totalFrames,
+        parity: extractedFrames === totalFrames,
+        corrected: parityCorrected,
+        path: isDicom ? 'dicom-batch' : 'ffmpeg-single-pass',
+        outcome: 'ok',
+      });
 
       // Update job status to ready for masking
       await storage.updateVideoJob(jobId, { status: 'ready' });
