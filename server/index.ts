@@ -3,6 +3,7 @@ import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { checkFFmpegInstallation, displaySystemStatus } from "./utils/systemCheck";
 import { storage } from "./storage";
+import os from "os";
 
 const app = express();
 
@@ -107,6 +108,20 @@ app.use((req, res, next) => {
       );
       process.exit(1);
     }
+  }
+
+  // Round 2B-2 — unshackle libvips. sharp defaults its threadpool to 1 on
+  // glibc Linux without jemalloc (a memory-fragmentation guard), which Round 1
+  // measured on prod as `sharp_concurrency: 1`: every decode, resize and encode
+  // in the apply loop went through a single thread no matter how many stacks
+  // Promise.all had in flight. Set it to the core count so the mask loop can
+  // actually use the box. Must run before any sharp work; `apply.env` already
+  // logs the effective value each apply.
+  {
+    const sharpModule = (await import('sharp')).default;
+    const threads = Math.max(1, os.cpus().length);
+    sharpModule.concurrency(threads);
+    console.log(`🧵 sharp concurrency set to ${sharpModule.concurrency()} (cpus: ${os.cpus().length})`);
   }
 
   // Initialize temporary folder system

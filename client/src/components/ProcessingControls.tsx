@@ -44,7 +44,9 @@ export default function ProcessingControls({
   const [outputSize, setOutputSize] = useState<'224x224' | '256x256' | '512x512' | '1024x1024' | '416x416' | 'original' | 'custom'>('original');
   const [customWidth, setCustomWidth] = useState(512);
   const [customHeight, setCustomHeight] = useState(512);
-  const [outputFormat, setOutputFormat] = useState<'png' | 'jpg'>('png');
+  // 2B addendum §A.3 — output defaults to JPEG. PNG is lossless but roughly 3×
+  // the file size at the compressionLevel the encoder uses, so it is opt-in.
+  const [outputFormat, setOutputFormat] = useState<'png' | 'jpg'>('jpg');
   const [includeMetadata, setIncludeMetadata] = useState(true);
   const [aspectRatioMode, setAspectRatioMode] = useState<'stretch' | 'letterbox' | 'crop'>('letterbox');
   const { toast } = useToast();
@@ -251,10 +253,15 @@ export default function ProcessingControls({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="png">PNG (Lossless)</SelectItem>
               <SelectItem value="jpg">JPG (Compressed)</SelectItem>
+              <SelectItem value="png">PNG (Lossless)</SelectItem>
             </SelectContent>
           </Select>
+          {outputFormat === "png" && (
+            <p className="text-xs text-muted-foreground mt-1" data-testid="png-size-note">
+              Lossless. About 3&times; larger files.
+            </p>
+          )}
         </div>
 
         <div className="flex items-center space-x-2">

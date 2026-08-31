@@ -8,6 +8,7 @@ import Sharp from 'sharp';
 import { TempFolderManager } from './templateMaskFolderManager';
 import { deleteUploadFile } from './cleanup';
 import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplyStaging, assertNoSegmentDoubling } from './applyPaths';
+import { listRawFrameFiles, isCompletePngBuffer } from './frameAccess';
 import os from 'os';
 import { perfMark, perfSpan } from './perf';
 
@@ -334,50 +335,69 @@ export class VideoProcessor {
       // Extract video metadata
       const metadata = await this.frameExtractor.extractVideoMetadata(videoPath);
 
-      // ── SINGLE-PASS SEQUENTIAL FRAME EXTRACTION ────────────────────
-      // The previous batch-based approach (select=between(n,…) + -vsync vfr,
-      // run in parallel per batch) extracted frames non-sequentially and
-      // duplicated frames across overlapping batch ranges. We now extract
-      // ALL frames in one ffmpeg pass at a duration-based fps, write them
-      // to a staging directory, and feed the resulting buffers into the
-      // existing parallel batch pipeline. ffmpeg is invoked exactly once.
+      // ── FRAME SOURCE: REUSE temp_extracted/, ELSE RE-EXTRACT ───────
+      // Round 2B-1. Round 1 measured apply-time re-extraction at 19.5 s of a
+      // 33.3 s apply (58%) on a 348-frame clip whose frames were already sitting
+      // in temp_extracted/<jobId>/ from the upload 28 s earlier. Round 2A made
+      // reuse safe by construction: Apply is unreachable until status is
+      // `ready`, and `ready` is written only after the last extraction batch.
       //
-      // Re-entrancy: clear `_apply` to an EMPTY dir before re-extracting. A run
-      // interrupted before its finally cleanup (SIGTERM/OOM) can leave stale
-      // frames here; extractAllFramesSequential reads back every frame_*.png to
-      // size the frame set, so any residue would inflate/corrupt the frame
-      // count. prepareCleanApplyStaging makes the apply idempotent across
-      // re-invocation and returns the same temp_extracted/<jobId>/_apply path.
-      const endStaging = perfSpan(jobId, 'apply.staging_clean');
-      await prepareCleanApplyStaging(jobId);
-      endStaging();
+      // The reuse branch is guarded four ways; ANY doubt falls through to the
+      // untouched re-extract path below, which is still the only path for
+      // sampled applies, short/mismatched frame sets, and torn files.
+      let extractedBuffers: Buffer[];
+      let extractedCount: number;
+      const reuse = await this.tryReuseRawFrames(jobId, samplingFps);
 
-      // `path` comes from metadata.isDicom (already resolved above) so the probe
-      // costs no extra I/O and the DICOM branch itself stays untouched.
-      const endExtractAll = perfSpan(jobId, 'apply.extract_all', {
-        path: metadata.isDicom ? 'dicom' : 'ffmpeg',
-      });
-      const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
-        videoPath,
-        extractedFramesDir,
-        metadata.duration,
-        path.basename(videoPath),
-        samplingFps,
-        metadata.frameRate,
-        jobId, // [PERF] enables the DICOM-branch `apply.extract_frame` probe only
-      );
-      const extractedCount = extractedPaths.length;
-      endExtractAll({ frames: extractedCount });
+      if (reuse) {
+        extractedBuffers = reuse.buffers;
+        extractedCount = reuse.buffers.length;
+      } else {
+        // ── SINGLE-PASS SEQUENTIAL FRAME EXTRACTION ──────────────────
+        // The previous batch-based approach (select=between(n,…) + -vsync vfr,
+        // run in parallel per batch) extracted frames non-sequentially and
+        // duplicated frames across overlapping batch ranges. We now extract
+        // ALL frames in one ffmpeg pass at a duration-based fps, write them
+        // to a staging directory, and feed the resulting buffers into the
+        // existing parallel batch pipeline. ffmpeg is invoked exactly once.
+        //
+        // Re-entrancy: clear `_apply` to an EMPTY dir before re-extracting. A run
+        // interrupted before its finally cleanup (SIGTERM/OOM) can leave stale
+        // frames here; extractAllFramesSequential reads back every frame_*.png to
+        // size the frame set, so any residue would inflate/corrupt the frame
+        // count. prepareCleanApplyStaging makes the apply idempotent across
+        // re-invocation and returns the same temp_extracted/<jobId>/_apply path.
+        const endStaging = perfSpan(jobId, 'apply.staging_clean');
+        await prepareCleanApplyStaging(jobId);
+        endStaging();
 
-      // [PERF] Addition to §3.2: frames are read off disk in one bulk
-      // Promise.all here, NOT per-frame inside the mask loop, so the spec's
-      // per-frame `read_ms` has no per-frame site. This span is the whole
-      // read bucket.
-      const endReadAll = perfSpan(jobId, 'apply.read_all');
-      const extractedBuffers: Buffer[] = await Promise.all(
-        extractedPaths.map(p => fs.readFile(p)),
-      );
-      endReadAll({ frames: extractedCount });
+        // `path` comes from metadata.isDicom (already resolved above) so the probe
+        // costs no extra I/O and the DICOM branch itself stays untouched.
+        const endExtractAll = perfSpan(jobId, 'apply.extract_all', {
+          path: metadata.isDicom ? 'dicom' : 'ffmpeg',
+        });
+        const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
+          videoPath,
+          extractedFramesDir,
+          metadata.duration,
+          path.basename(videoPath),
+          samplingFps,
+          metadata.frameRate,
+          jobId, // [PERF] enables the DICOM-branch `apply.extract_frame` probe only
+        );
+        extractedCount = extractedPaths.length;
+        endExtractAll({ frames: extractedCount });
+
+        // [PERF] Addition to §3.2: frames are read off disk in one bulk
+        // Promise.all here, NOT per-frame inside the mask loop, so the spec's
+        // per-frame `read_ms` has no per-frame site. This span is the whole
+        // read bucket.
+        const endReadAll = perfSpan(jobId, 'apply.read_all');
+        extractedBuffers = await Promise.all(
+          extractedPaths.map(p => fs.readFile(p)),
+        );
+        endReadAll({ frames: extractedCount });
+      }
 
       await storage.updateVideoJob(jobId, {
         duration: metadata.duration,
@@ -430,7 +450,13 @@ export class VideoProcessor {
       await TempFolderManager.cleanupJobTempFolder(jobId);
       await TempFolderManager.createJobTempFolder(jobId);
       const tempDir = TempFolderManager.getJobTempFolder(jobId);
-      const ext = outputSettings.format || 'png';
+      // 2B addendum §A.2 — the extension follows the encoder. Default output is
+      // JPEG, so the default extension is `.jpg`; `.png` only when the user
+      // selected PNG. Before this, every masked frame was JPEG bytes in a
+      // `.png` file. Consumers list masked frames by sorted `frame_*` prefix
+      // (listFrameFiles accepts png/jpg/jpeg) and derive the extension from the
+      // filename, so nothing downstream keys on a hardcoded `.png`.
+      const ext = outputSettings.format === 'png' ? 'png' : 'jpg';
       let savedCount = 0;
       // [PERF] Addition to §3.2: masked frames are written here, after the mask
       // loop, so the spec's per-frame `write_ms` has no per-frame site inside a
@@ -531,6 +557,77 @@ export class VideoProcessor {
           console.warn(`⚠️  Failed to clean up apply staging dir ${extractedFramesDir}:`, cleanupErr);
         }
       }
+    }
+  }
+
+  /**
+   * Round 2B-1 — decide whether the apply can mask the raw frames already on
+   * disk instead of decoding the original upload a second time.
+   *
+   * Returns the frame buffers on success, or `null` to mean "fall through to
+   * the existing re-extract path". Every rejection is logged as
+   * `[PERF] apply.source {mode:'reextract', reason}` so a fallback in prod is
+   * diagnosable from the log alone rather than looking like a silent no-op.
+   *
+   * The four guards, in the order they can fail:
+   *
+   * 1. `samplingFps == null`. Background extraction always runs at the native
+   *    rate, so a sampled apply (`-vf fps=N`) must still re-extract — reusing
+   *    native frames would silently produce a different frame set than the user
+   *    asked for. NOT in the 2B proposal; added because it is a correctness
+   *    hazard, not an optimization detail. Today the UI always sends null.
+   * 2. `jobV2.status === 'ready'`. The V2 status (not the legacy VideoJob one)
+   *    because `mapVideoJobStatusToJobStatus` folds ready/masking/processing/
+   *    completed into `ready` — so a redo apply on a `completed` job still
+   *    qualifies, which is exactly the case the 2B test matrix re-runs.
+   * 3. Frame count equals the job's `totalFrames`, and is > 0. A short or
+   *    swept directory must never be masked as if it were the whole clip.
+   * 4. Every file carries a PNG IEND trailer (the Round 2A `isCompletePngBuffer`
+   *    guard). Belt-and-braces: `ready` already means the writes finished.
+   *
+   * Co-indexing: the buffers come back in `listRawFrameFiles` order — the same
+   * sorted, positional index the frames endpoint, the AI raw-frame fallback and
+   * the run download already use. Masked frame i is therefore derived from the
+   * exact frame the user drew on.
+   */
+  private async tryReuseRawFrames(
+    jobId: string,
+    samplingFps: number | null,
+  ): Promise<{ buffers: Buffer[] } | null> {
+    const reject = (reason: string, extra: Record<string, unknown> = {}) => {
+      perfMark(jobId, 'apply.source', { mode: 'reextract', reason, ...extra });
+      return null;
+    };
+
+    try {
+      if (samplingFps != null) return reject('sampling_fps', { samplingFps });
+
+      const jobV2 = await storage.getJobV2(jobId);
+      if (!jobV2) return reject('no_job_v2');
+      if (jobV2.status !== 'ready') return reject('status_not_ready', { status: jobV2.status });
+
+      const expected = jobV2.source?.totalFrames ?? 0;
+      const { dir, files } = await listRawFrameFiles(jobId);
+      if (!files.length) return reject('no_raw_frames', { expected });
+      if (expected <= 0) return reject('unknown_expected', { have: files.length });
+      if (files.length !== expected) {
+        return reject('count_mismatch', { have: files.length, expected });
+      }
+
+      const endReadAll = perfSpan(jobId, 'apply.read_all', { source: 'reuse' });
+      const buffers = await Promise.all(files.map(f => fs.readFile(path.join(dir, f))));
+      endReadAll({ frames: buffers.length });
+
+      // A torn file means some write never finished; masking half a frame is
+      // worse than paying for the re-extract.
+      const tornIdx = buffers.findIndex(b => !isCompletePngBuffer(b));
+      if (tornIdx !== -1) return reject('torn_png', { i: tornIdx, file: files[tornIdx] });
+
+      perfMark(jobId, 'apply.source', { mode: 'reuse', frames: buffers.length });
+      return { buffers };
+    } catch (err) {
+      // Reuse is an optimization; it must never be the reason an apply fails.
+      return reject('error', { message: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -1423,11 +1520,17 @@ export class VideoProcessor {
           console.log(`📐 3D Frame ${frameNumber}: Keeping original dimensions ${volumeWidth}x${volumeHeight}`);
         }
         
-        // Convert to final format
+        // Convert to final format (2B addendum §A.1). The encoder now follows
+        // `outputSettings.format` instead of being unconditionally JPEG while the
+        // filename claimed `.png`. Default stays JPEG q90 — byte-identical output
+        // for the default path — and PNG is chosen explicitly by the user.
+        // compressionLevel 3 is the measured sweet spot (ROUND2B_REPORT.md §3):
+        // ~7 ms / ~332 KB, versus ~14 ms / ~311 KB at libvips' default level 6.
+        const outFormat: 'png' | 'jpeg' = outputSettings.format === 'png' ? 'png' : 'jpeg';
         const tEncode = process.hrtime.bigint();
-        const outputBuffer = await processedImage
-          .jpeg({ quality: 90 })
-          .toBuffer();
+        const outputBuffer = outFormat === 'png'
+          ? await processedImage.png({ compressionLevel: 3, adaptiveFiltering: false }).toBuffer()
+          : await processedImage.jpeg({ quality: 90 }).toBuffer();
         const encodeMs = Number(process.hrtime.bigint() - tEncode) / 1e6;
 
         // [PERF] §3.2 `apply.frame`. `read_ms`/`write_ms` are absent by
@@ -1443,6 +1546,7 @@ export class VideoProcessor {
             decode_ms: +(decodeMs[frameIndex] ?? 0).toFixed(1),
             mask_ms: +maskMs.toFixed(1),
             encode_ms: +encodeMs.toFixed(1),
+            fmt: outFormat,
             w: volumeWidth,
             h: volumeHeight,
             out_bytes: outputBuffer.length,

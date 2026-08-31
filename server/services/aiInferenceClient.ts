@@ -8,7 +8,8 @@ const SAM2_SERVICE_URL = process.env.SAM2_SERVICE_URL || 'http://172.31.6.85:800
 
 export interface InferenceRequest {
   modelConfig: ModelConfig;
-  imageBase64: string;   // PNG frame as base64 string (no data: prefix)
+  imageBase64: string;   // Frame bytes as base64 (no data: prefix, no MIME sent —
+                         // PNG or JPEG since the 2B addendum; the service sniffs content)
   intent: ParsedIntent;  // from shared/schema.ts
   jobId?: string;        // passed through to GPU service for tracking
   bbox?: { x1: number; y1: number; x2: number; y2: number } | null; // user-drawn bbox prompt

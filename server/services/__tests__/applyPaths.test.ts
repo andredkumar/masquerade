@@ -172,9 +172,13 @@ test('run-2 re-extraction with run-1 RESIDUE present: readback is run-2 frames o
 });
 
 test('cleanupApplyStaging rejects an empty jobId', async () => {
+  // The rejection message moved in Phase 5B, when the per-helper jobId check was
+  // replaced by the shared `resolveWithinRoot` validator in cleanup.ts. The
+  // behavior under test — an empty jobId must never resolve to a deletable path
+  // — is unchanged; only the wording is. (2B addendum §B.)
   await assert.rejects(
     () => cleanupApplyStaging(''),
-    /jobId must be a non-empty string/,
+    /empty or non-string path segment/,
   );
 });
 

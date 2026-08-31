@@ -164,6 +164,22 @@ export async function listRawFrameFiles(
 }
 
 /**
+ * Content-Type for a frame file, derived from its extension.
+ *
+ * 2B addendum §A.2: masked frames are `.jpg` by default and `.png` only when
+ * the user picked PNG, so the serving routes can no longer hardcode
+ * `image/png`. Raw extracted frames are always PNG and unaffected. Unknown
+ * extensions fall back to PNG, matching the pre-addendum behavior for the
+ * `.png`-named JPEGs written by earlier deploys (browsers sniff content, so
+ * those keep rendering for the rest of their retention window).
+ */
+export function mimeForFrameFile(filenameOrPath: string): string {
+  const ext = path.extname(filenameOrPath).toLowerCase();
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  return 'image/png';
+}
+
+/**
  * The 8-byte PNG IEND chunk that terminates every complete PNG file:
  *   length(0x00000000) + type("IEND") + CRC(0xAE426082)
  * A PNG whose write is still in flight has no IEND yet.

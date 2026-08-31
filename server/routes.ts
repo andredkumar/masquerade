@@ -26,6 +26,7 @@ import {
   listRawFrameFiles,
   colorForLabelId,
   isCompletePngBuffer,
+  mimeForFrameFile,
 } from "./services/frameAccess";
 import { aiRunDir } from "./services/applyPaths";
 import Sharp from "sharp";
@@ -676,7 +677,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return (m && m[1]) || 'png';
       };
 
-      const outputFormat = (job as any).outputSettings?.format || 'png';
+      // 2B addendum §A.2 — default output format is JPEG. This fallback is only
+      // reached if a job somehow has frames on disk but no outputSettings; the
+      // manifest schema is unchanged (D1).
+      const outputFormat = (job as any).outputSettings?.format || 'jpg';
       // Phase 6 (b)-lite: per-frame frames[] + metadata.csv now come from the
       // shared core. The whole-job wrapper feeds it the same inputs it used
       // inline before, so manifest.json / metadata.csv stay byte-identical (D1).
@@ -1319,7 +1323,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!absPath) return res.status(404).json({ error: `frame ${n} not found` });
 
       res.setHeader('Cache-Control', 'private, max-age=3600');
-      res.setHeader('Content-Type', 'image/png');
+      // 2B addendum §A.2 — the `.png` in this route's URL is part of the route
+      // name (kept for client compatibility); the payload may now be JPEG, so
+      // the type comes from the resolved file's extension.
+      res.setHeader('Content-Type', mimeForFrameFile(absPath));
       // sendFile validates the absolute path; we already validated against
       // SPOKE_TEMPLATE_MASK_DIR in resolveFramePath, so this is doubly safe.
       res.sendFile(absPath, (err) => {
@@ -1599,7 +1606,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         const framePath = path.join(tempDir, frameFiles[frameNumber]);
         const buffer = await fsPromises.readFile(framePath);
-        res.set("Content-Type", "image/png");
+        // 2B addendum §A.2 — masked frames may be .jpg or .png; derive the type
+        // from the extension rather than asserting PNG.
+        res.set("Content-Type", mimeForFrameFile(frameFiles[frameNumber]));
         res.set("Cache-Control", "private, max-age=3600");
         return res.send(buffer);
       }
@@ -1802,7 +1811,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // run.labels (canonical) and are approval-filtered here in the wrapper (D2),
       // never in the core.
       const approvedRunLabels = run.labels.filter(l => l.approved);
-      const runOutputFormat = (job as any).outputSettings?.format || 'png';
+      const runOutputFormat = (job as any).outputSettings?.format || 'jpg';
       const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
         frameCount: maskFiles.length,
         labels: approvedRunLabels,
