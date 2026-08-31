@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import sharp from 'sharp';
 import * as dcmjs from 'dcmjs';
+import { perfSpan } from './perf';
 
 export interface VideoMetadata {
   duration: number;
@@ -190,6 +191,11 @@ export class FrameExtractor {
     sourceFilename: string,
     samplingFps: number | null,
     nativeFps: number,
+    // [PERF] Round 1 §3.2 (`apply.extract_frame`, DICOM branch only). Optional
+    // and log-only: when omitted (any caller other than the apply path) not a
+    // single probe fires and the extraction logic below is byte-for-byte the
+    // pre-Round-1 code.
+    perfJobId?: string,
   ): Promise<string[]> {
     // 🎞️ DICOM interception (restored — see docs/refactor/DICOM_REGRESSION_FIX_REPORT.md).
     // ffmpeg cannot demux a DICOM container ("Invalid data found"), so route DICOM through
@@ -204,7 +210,9 @@ export class FrameExtractor {
 
       const dicomPaths: string[] = [];
       for (let i = 0; i < totalFrames; i++) {
+        const endExtractFrame = perfJobId ? perfSpan(perfJobId, 'apply.extract_frame', { i }) : null;
         const frameBuffer = await this.extractDicomFrame(videoPath, i);
+        endExtractFrame?.();
         // Match ffmpeg's image2 muxer naming: frame_%06d.png, 1-indexed (start_number=1),
         // so the sorted readback below (:224-229) and all downstream consumers are identical
         // to the video path. DICOM frameIndex i is 0-based → on-disk file number i + 1.

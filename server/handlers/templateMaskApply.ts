@@ -14,6 +14,7 @@
 import { storage } from '../storage';
 import { VideoProcessor } from '../services/videoProcessor';
 import { TempFolderManager } from '../services/templateMaskFolderManager';
+import { perfMark } from '../services/perf';
 
 export type TemplateMaskApplyResult =
   | { ok: true; jobId: string }
@@ -35,6 +36,11 @@ export async function applyTemplateMask(
   rawSamplingFps: unknown,
   io: any,
 ): Promise<TemplateMaskApplyResult> {
+  // [PERF] Round 1 (§3.2 apply path). `ms_since_bg_extract_done` is omitted:
+  // no bg-extraction completion timestamp is persisted on either job record,
+  // so it is not derivable here (§3.2 allows omitting it).
+  perfMark(jobId, 'apply.request');
+
   if (!maskData || !outputSettings) {
     return { ok: false, status: 400, error: 'maskData and outputSettings are required' };
   }

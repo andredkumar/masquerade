@@ -46,6 +46,13 @@ export default function HubPage() {
 
   const isReady = job.status === "ready";
   const isFailed = job.status === "failed";
+  // Round 2A: the template mask only needs frame 1, which is on disk within the
+  // first extraction batch — so the tile opens as soon as extraction starts.
+  // Apply is what waits for `ready`, gated inside the spoke. The AI tile keeps
+  // the `ready` gate: inference needs every frame.
+  // See docs/refactor/FRAME0_GATE_HISTORY.md.
+  const isExtracting = job.status === "extracting";
+  const canMask = isReady || isExtracting;
 
   // Derive spoke tile statuses
   const templateMaskStatus = job.templateMask
@@ -166,7 +173,12 @@ export default function HubPage() {
             title="Template Mask"
             icon={<Layers size={24} />}
             status={templateMaskStatus}
-            disabled={!isReady}
+            subLabel={
+              isExtracting && !job.templateMask
+                ? "Frame 1 ready — draw your mask while frames extract"
+                : undefined
+            }
+            disabled={!canMask}
             onClick={() => navigate("/template-mask")}
           />
 
@@ -199,6 +211,7 @@ function SpokeTile({
   title,
   icon,
   status,
+  subLabel,
   disabled,
   comingSoon,
   onClick,
@@ -206,6 +219,8 @@ function SpokeTile({
   title: string;
   icon: React.ReactNode;
   status: string;
+  /** Optional second line, e.g. the Round 2A "draw while extracting" hint. */
+  subLabel?: string;
   disabled: boolean;
   comingSoon?: boolean;
   onClick?: () => void;
@@ -233,6 +248,9 @@ function SpokeTile({
         <p className={`text-xs mt-1 ${comingSoon ? "text-muted-foreground italic" : "text-muted-foreground"}`}>
           {status}
         </p>
+        {subLabel && (
+          <p className="text-xs mt-1 text-primary">{subLabel}</p>
+        )}
       </div>
     </button>
   );

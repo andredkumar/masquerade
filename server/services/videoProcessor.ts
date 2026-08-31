@@ -8,6 +8,8 @@ import Sharp from 'sharp';
 import { TempFolderManager } from './templateMaskFolderManager';
 import { deleteUploadFile } from './cleanup';
 import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplyStaging, assertNoSegmentDoubling } from './applyPaths';
+import os from 'os';
+import { perfMark, perfSpan } from './perf';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -302,7 +304,28 @@ export class VideoProcessor {
     // the hourly sweep / SIGTERM / cleanupJobArtifacts reclaim them instead.
     let reachedTerminal = false;
 
+    // [PERF] Round 1 §3.2. The apply total is spanned here rather than from the
+    // HTTP handler because processVideo is fired detached (`.catch(...)`) and
+    // cannot be handed a closure without changing its signature. The
+    // handler→processVideo gap is derivable from the `t` fields on
+    // `apply.request` and `apply.done`.
+    const endApply = perfSpan(jobId, 'apply.done');
+
     try {
+      // [PERF] §3.2 — concurrency facts, once per apply. Tells us whether H2
+      // (mask loop not actually parallel / capped by the libuv threadpool) is
+      // even possible before we look at a single timing.
+      perfMark(jobId, 'apply.env', {
+        cpus: os.cpus().length,
+        uv_threadpool: process.env.UV_THREADPOOL_SIZE ?? 'default(4)',
+        sharp_concurrency: Sharp.concurrency(),
+        // Outer batch width (processFrameBuffersInParallel → Promise.all over batches)
+        batch_size: outputSettings?.batchSize || 12,
+        // Inner stack width (one processFrameBatch call = one `apply.stack`)
+        volume_batch_size: 8,
+        node: process.version,
+      });
+
       console.log('🔍 ENTERED processVideo method successfully!');
       console.log('🔍 Parameters:', { jobId, videoPath, maskDataType: maskData?.type, hasOutputSettings: !!outputSettings, samplingFps });
 
@@ -325,7 +348,15 @@ export class VideoProcessor {
       // size the frame set, so any residue would inflate/corrupt the frame
       // count. prepareCleanApplyStaging makes the apply idempotent across
       // re-invocation and returns the same temp_extracted/<jobId>/_apply path.
+      const endStaging = perfSpan(jobId, 'apply.staging_clean');
       await prepareCleanApplyStaging(jobId);
+      endStaging();
+
+      // `path` comes from metadata.isDicom (already resolved above) so the probe
+      // costs no extra I/O and the DICOM branch itself stays untouched.
+      const endExtractAll = perfSpan(jobId, 'apply.extract_all', {
+        path: metadata.isDicom ? 'dicom' : 'ffmpeg',
+      });
       const extractedPaths = await this.frameExtractor.extractAllFramesSequential(
         videoPath,
         extractedFramesDir,
@@ -333,11 +364,20 @@ export class VideoProcessor {
         path.basename(videoPath),
         samplingFps,
         metadata.frameRate,
+        jobId, // [PERF] enables the DICOM-branch `apply.extract_frame` probe only
       );
       const extractedCount = extractedPaths.length;
+      endExtractAll({ frames: extractedCount });
+
+      // [PERF] Addition to §3.2: frames are read off disk in one bulk
+      // Promise.all here, NOT per-frame inside the mask loop, so the spec's
+      // per-frame `read_ms` has no per-frame site. This span is the whole
+      // read bucket.
+      const endReadAll = perfSpan(jobId, 'apply.read_all');
       const extractedBuffers: Buffer[] = await Promise.all(
         extractedPaths.map(p => fs.readFile(p)),
       );
+      endReadAll({ frames: extractedCount });
 
       await storage.updateVideoJob(jobId, {
         duration: metadata.duration,
@@ -392,12 +432,17 @@ export class VideoProcessor {
       const tempDir = TempFolderManager.getJobTempFolder(jobId);
       const ext = outputSettings.format || 'png';
       let savedCount = 0;
+      // [PERF] Addition to §3.2: masked frames are written here, after the mask
+      // loop, so the spec's per-frame `write_ms` has no per-frame site inside a
+      // stack. This span is the whole write bucket.
+      const endWriteAll = perfSpan(jobId, 'apply.write_all');
       for (const { frameNumber, buffer } of processedFrames) {
         if (!buffer || buffer.length === 0) continue;
         const filename = `frame_${String(frameNumber).padStart(6, '0')}.${ext}`;
         await fs.writeFile(path.join(tempDir, filename), buffer);
         savedCount++;
       }
+      endWriteAll({ frames: savedCount, ext });
       console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
 
       await storage.updateVideoJob(jobId, {
@@ -427,6 +472,7 @@ export class VideoProcessor {
       });
 
       reachedTerminal = true;
+      endApply({ frames: savedCount, outcome: 'completed' });
       return tempDir;
 
     } catch (error) {
@@ -458,6 +504,7 @@ export class VideoProcessor {
       });
 
       reachedTerminal = true;
+      endApply({ frames: 0, outcome: 'failed' });
       throw error;
     } finally {
       // Reclaim ONLY the apply-time staging subdir (`_apply`). It holds the
@@ -1015,6 +1062,9 @@ export class VideoProcessor {
 
     const totalFrames = extractedBuffers.length;
     const VOLUME_BATCH_SIZE = 8;
+    // [PERF] §3.2 `apply.stack` — monotonic across the whole apply, so stacks
+    // stay distinguishable even though the outer batches run concurrently.
+    let perfStackIdx = 0;
 
     const batchPromises = batches.map(async (batch, batchIndex) => {
       const frameBuffers = extractedBuffers.slice(batch.start, batch.end + 1);
@@ -1034,7 +1084,11 @@ export class VideoProcessor {
           frameNumber: batch.start + volumeStart + index,
         }));
 
-        const volumeResults = await this.processFrameBatch(volumeTasks);
+        const volumeResults = await this.processFrameBatch(volumeTasks, {
+          jobId,
+          stackIdx: perfStackIdx++,
+          batchIdx: batchIndex,
+        });
 
         if (global.gc) global.gc();
 
@@ -1095,7 +1149,13 @@ export class VideoProcessor {
 
   // 🚀 NEW: Background frame extraction immediately after upload
   async startBackgroundFrameExtraction(jobId: string, videoPath: string, totalFrames: number): Promise<void> {
+    // [PERF] Round 1 §3.2 (upload path). `bg_extract.done` is the span close.
+    const bgT0 = Date.now();
+    const endBgExtract = perfSpan(jobId, 'bg_extract.done');
+    let firstFrameLogged = false;
+
     try {
+      perfMark(jobId, 'bg_extract.start', { totalFrames });
       console.log(`🚀 BACKGROUND EXTRACTION STARTED: JobID ${jobId}, ${totalFrames} frames`);
       
       // Update job status to indicate background extraction is starting
@@ -1156,6 +1216,16 @@ export class VideoProcessor {
             }),
           );
 
+          // First batch is on disk → frame_000001.png exists and the
+          // draw-the-mask-now UX would be unblocked if anything read it.
+          if (!firstFrameLogged) {
+            firstFrameLogged = true;
+            perfMark(jobId, 'bg_extract.first_frame_on_disk', {
+              ms_since_start: Date.now() - bgT0,
+              batchFrames: batchFrames.length,
+            });
+          }
+
           extractedFrames += batchFrames.length;
           const progress = (extractedFrames / totalFrames) * 100;
           
@@ -1177,7 +1247,8 @@ export class VideoProcessor {
       }
       
       console.log(`🎉 BACKGROUND EXTRACTION COMPLETE: ${extractedFrames} frames written to ${rawDir}`);
-      
+      endBgExtract({ frames: extractedFrames, outcome: 'ok' });
+
       // Update job status to ready for masking
       await storage.updateVideoJob(jobId, { status: 'ready' });
       await this.updateProgress(jobId, {
@@ -1190,6 +1261,7 @@ export class VideoProcessor {
       
     } catch (error) {
       console.error(`❌ Background extraction failed for job ${jobId}:`, error);
+      endBgExtract({ frames: 0, outcome: 'failed' });
       await storage.updateVideoJob(jobId, { status: 'error' });
       await this.updateProgress(jobId, {
         stage: 'error',
@@ -1209,7 +1281,25 @@ export class VideoProcessor {
     outputSize: { width: number; height: number };
     outputSettings: OutputSettings;
     frameNumber: number;
-  }>): Promise<Array<{ success: boolean; processedBuffer: Buffer; error?: string; frameNumber: number }>> {
+  }>,
+  // [PERF] Round 1 §3.2. Optional and additive: only the template-mask apply
+  // path (processFrameBuffersInParallel) passes it, so the images/legacy call
+  // sites are unchanged and emit nothing.
+  perf?: { jobId: string; stackIdx: number; batchIdx: number },
+  ): Promise<Array<{ success: boolean; processedBuffer: Buffer; error?: string; frameNumber: number }>> {
+    const endStack = perf
+      ? perfSpan(perf.jobId, 'apply.stack', {
+          stackIdx: perf.stackIdx,
+          batchIdx: perf.batchIdx,
+          stackSize: tasks.length,
+          firstFrame: tasks[0]?.frameNumber ?? -1,
+        })
+      : null;
+    // Per-frame decode happens in Step 1 (sequential) and the mask/encode in
+    // Step 3, so decode times are parked here and emitted with the rest of the
+    // frame's `apply.frame` line.
+    const decodeMs: number[] = [];
+
     try {
       console.log(`🏗️ BATCH VOLUMETRIC PROCESSING: Processing ${tasks.length} frames as 3D volume`);
       
@@ -1230,10 +1320,12 @@ export class VideoProcessor {
       
       for (let i = 0; i < tasks.length; i++) {
         const task = tasks[i];
+        const tDecode = process.hrtime.bigint();
         const image = Sharp(task.frameBuffer);
         const metadata = await image.metadata();
         const frameRgb = await image.raw().toBuffer({ resolveWithObject: true });
-        
+        decodeMs.push(Number(process.hrtime.bigint() - tDecode) / 1e6);
+
         frameBuffers.push(frameRgb.data);
         frameMetadata.push({
           width: metadata.width || 1920,
@@ -1253,7 +1345,9 @@ export class VideoProcessor {
       const volumeDepth = tasks.length;
       
       console.log('🎭 Creating volumetric mask for entire batch...');
+      const tMaskBuild = process.hrtime.bigint();
       const maskRgba = await this.createMaskRgbaBuffer(firstTask.maskData, volumeWidth, volumeHeight);
+      const maskBuildMs = Number(process.hrtime.bigint() - tMaskBuild) / 1e6;
       console.log(`🎭 Mask created: ${maskRgba.length} bytes, will be applied to ${volumeDepth} layers`);
       
       // Step 3: Apply mask transformation to entire 3D volume simultaneously  
@@ -1266,7 +1360,8 @@ export class VideoProcessor {
       const volumeProcessingPromises = frameBuffers.map(async (framePixels, frameIndex) => {
         const frameNumber = tasks[frameIndex].frameNumber;
         let maskedPixels = 0;
-        
+        const tMask = process.hrtime.bigint();
+
         // Apply the same mask to this frame layer
         for (let i = 0; i < pixelsPerFrame; i++) {
           const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha
@@ -1280,6 +1375,8 @@ export class VideoProcessor {
           }
         }
         
+        const maskMs = Number(process.hrtime.bigint() - tMask) / 1e6;
+
         console.log(`🎯 Frame ${frameNumber}: ${maskedPixels}/${pixelsPerFrame} pixels masked (${((maskedPixels/pixelsPerFrame)*100).toFixed(2)}%)`);
         
         // Step 4: Use Sharp pipeline for optimized output generation
@@ -1327,10 +1424,31 @@ export class VideoProcessor {
         }
         
         // Convert to final format
+        const tEncode = process.hrtime.bigint();
         const outputBuffer = await processedImage
           .jpeg({ quality: 90 })
           .toBuffer();
-          
+        const encodeMs = Number(process.hrtime.bigint() - tEncode) / 1e6;
+
+        // [PERF] §3.2 `apply.frame`. `read_ms`/`write_ms` are absent by
+        // construction — the disk read is one bulk Promise.all before the loop
+        // (`apply.read_all`) and the write is one loop after it
+        // (`apply.write_all`). `decode_ms` is the Sharp decode to raw pixels
+        // (Step 1), `mask_ms` the synchronous pixel loop, `encode_ms` the
+        // resize + JPEG encode. H3 is decided by encode_ms vs mask_ms here.
+        if (perf) {
+          perfMark(perf.jobId, 'apply.frame', {
+            i: frameNumber,
+            stackIdx: perf.stackIdx,
+            decode_ms: +(decodeMs[frameIndex] ?? 0).toFixed(1),
+            mask_ms: +maskMs.toFixed(1),
+            encode_ms: +encodeMs.toFixed(1),
+            w: volumeWidth,
+            h: volumeHeight,
+            out_bytes: outputBuffer.length,
+          });
+        }
+
         return {
           success: true,
           processedBuffer: outputBuffer,
@@ -1344,11 +1462,17 @@ export class VideoProcessor {
       const batchTime = Date.now() - batchStart;
       const fps = (tasks.length / batchTime) * 1000;
       console.log(`🚀 BATCH COMPLETE: ${tasks.length} frames in ${batchTime}ms (${fps.toFixed(1)} FPS)`);
-      
+
+      endStack?.({
+        decode_ms: +decodeMs.reduce((a, b) => a + b, 0).toFixed(1),
+        mask_build_ms: +maskBuildMs.toFixed(1),
+        outcome: 'ok',
+      });
       return results;
-      
+
     } catch (error) {
       console.error('❌ Batch volumetric processing failed:', error);
+      endStack?.({ outcome: 'failed' });
       // Return individual failures for each frame
       return tasks.map(task => ({
         success: false,

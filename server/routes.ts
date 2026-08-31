@@ -25,6 +25,7 @@ import {
   listFrameFiles,
   listRawFrameFiles,
   colorForLabelId,
+  isCompletePngBuffer,
 } from "./services/frameAccess";
 import { aiRunDir } from "./services/applyPaths";
 import Sharp from "sharp";
@@ -35,6 +36,7 @@ import { promises as fsPromises } from "fs";
 import archiver from "archiver";
 import { applyTemplateMask } from "./handlers/templateMaskApply";
 import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
+import { perfMark, perfSpan } from "./services/perf";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -138,6 +140,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const uploadedPath = req.file?.path;
     req.on('aborted', () => { void deleteUploadFile(uploadedPath); });
 
+    // [PERF] Round 1 (§3.2 upload path). The jobId does not exist yet at this
+    // point, so pre-creation lines are keyed by a per-request correlation ref;
+    // `upload.job_created` joins that ref to the real jobId for the pivot.
+    const uploadRef = `upl_${randomUUID().slice(0, 8)}`;
+    perfMark(uploadRef, 'upload.multer_done', {
+      bytes: req.file?.size ?? 0,
+      filename: req.file?.originalname ?? null,
+    });
+
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No video file uploaded" });
@@ -155,10 +166,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log('🏥 DICOM DETECTED: Starting optimized DICOM workflow');
 
         // STEP 1: Extract first frame IMMEDIATELY (fast DICOM first frame)
+        const endFirstFrameDicom = perfSpan(uploadRef, 'upload.first_frame', { path: 'dicom' });
         const firstFrameBuffer = await frameExtractor.extractFirstFrame(req.file.path);
+        endFirstFrameDicom();
 
         // STEP 2: Extract only basic metadata quickly (no full analysis yet)
+        const endProbeDicom = perfSpan(uploadRef, 'upload.ffprobe', { path: 'dicom' });
         const quickMetadata = await frameExtractor.extractVideoMetadata(req.file.path);
+        endProbeDicom({
+          frames: quickMetadata.totalFrames,
+          w: quickMetadata.width,
+          h: quickMetadata.height,
+          fps: quickMetadata.frameRate,
+        });
 
         // Create video job with initial data
         const jobData = {
@@ -200,7 +220,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           errorMessage: null,
         });
 
+        perfMark(job.id, 'upload.job_created', { uploadRef, path: 'dicom' });
+
         // STEP 3: Return first frame immediately to user for fast display
+        perfMark(job.id, 'upload.response_sent', { uploadRef });
         res.json({
           jobId: job.id,
           metadata: {
@@ -237,7 +260,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log('🎬 STANDARD VIDEO: Starting regular video workflow');
 
       // Extract basic metadata
+      const endProbe = perfSpan(uploadRef, 'upload.ffprobe', { path: 'ffmpeg' });
       const metadata = await frameExtractor.extractVideoMetadata(req.file.path);
+      endProbe({
+        frames: metadata.totalFrames,
+        w: metadata.width,
+        h: metadata.height,
+        fps: metadata.frameRate,
+      });
 
       // Create video job
       const jobData = {
@@ -256,6 +286,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       const job = await storage.createVideoJob(jobData);
+      perfMark(job.id, 'upload.job_created', { uploadRef, path: 'ffmpeg' });
 
       // Phase 3d: create hub-and-spoke Job record eagerly
       const extractionRate = typeof req.body.samplingFps === 'number' && req.body.samplingFps > 0
@@ -280,7 +311,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
 
       // Extract first frame for masking
+      const endFirstFrame = perfSpan(job.id, 'upload.first_frame', { path: 'ffmpeg' });
       const firstFrameBuffer = await frameExtractor.extractFirstFrame(req.file.path);
+      endFirstFrame();
 
       // 🚀 START BACKGROUND EXTRACTION OF ALL FRAMES IMMEDIATELY
       console.log('🚀 STARTING BACKGROUND FRAME EXTRACTION FOR ALL', metadata.totalFrames, 'FRAMES');
@@ -296,6 +329,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
       });
 
+      perfMark(job.id, 'upload.response_sent', { uploadRef });
       res.json({
         jobId: job.id,
         metadata: {
@@ -1576,11 +1610,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // path-traversal validation, dedup, and sorting; frames are addressed by
       // sorted position (index 0 = first frame), matching the template_mask
       // branch above.
+      const { dir: rawDir, files: rawFiles } = await listRawFrameFiles(jobId);
+
+      // Round 2A: mid-extraction reads are no longer refused on status alone.
+      // Phase 4b's `if (status === 'extracting') return 503` was written when
+      // raw frames lived in `global.extractedFrames` and genuinely did not
+      // exist until the run finished; since 4b-0 moved them to disk,
+      // frame_000001.png is readable within the first batch. The gate now asks
+      // the only question that still matters — is THIS frame on disk and whole?
+      // — so the user can draw the template mask while extraction continues.
+      // See docs/refactor/FRAME0_GATE_HISTORY.md.
       if (jobV2.status === 'extracting') {
-        return res.status(503).json({ error: "Extraction in progress" });
+        if (frameNumber < rawFiles.length) {
+          const partial = await fsPromises.readFile(path.join(rawDir, rawFiles[frameNumber]));
+          // The extractor writes a batch's frames with concurrent writeFiles, so
+          // a read can land mid-write. A truncated PNG has no IEND trailer;
+          // treat it as "not ready yet" rather than painting a half frame.
+          if (isCompletePngBuffer(partial)) {
+            res.set("Content-Type", "image/png");
+            res.set("Cache-Control", "private, max-age=3600");
+            return res.send(partial);
+          }
+        }
+        // `framesReady` lets the spoke show "Extracting… 12 / 640" without a
+        // socket dependency. no-store so a browser never caches this answer and
+        // keeps replaying it after extraction completes.
+        res.set("Cache-Control", "no-store");
+        return res.status(503).json({
+          error: "Extraction in progress",
+          framesReady: rawFiles.length,
+        });
       }
 
-      const { dir: rawDir, files: rawFiles } = await listRawFrameFiles(jobId);
+      // ── ready / failed: unchanged from Phase 4b-0 ─────────────────
       if (!rawFiles.length) {
         // Directory absent or empty: frames were swept (6h retention) or the
         // server restarted before extraction completed.

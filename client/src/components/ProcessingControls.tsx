@@ -21,6 +21,12 @@ interface ProcessingControlsProps {
   hasExistingMask?: boolean;
   isProcessing?: boolean;
   lastProcessedSettings?: OutputSettings | null;
+  /**
+   * Round 2A: live extraction status shown under the Apply button while the job
+   * is still extracting (Apply is `disabled` for the same window). null/omitted
+   * once extraction is done — the button just enables, no reload.
+   */
+  extractionNote?: string | null;
 }
 
 export default function ProcessingControls({
@@ -32,7 +38,8 @@ export default function ProcessingControls({
   disabled,
   hasExistingMask = false,
   isProcessing = false,
-  lastProcessedSettings = null
+  lastProcessedSettings = null,
+  extractionNote = null
 }: ProcessingControlsProps) {
   const [outputSize, setOutputSize] = useState<'224x224' | '256x256' | '512x512' | '1024x1024' | '416x416' | 'original' | 'custom'>('original');
   const [customWidth, setCustomWidth] = useState(512);
@@ -277,7 +284,16 @@ export default function ProcessingControls({
            hasExistingMask ? (settingsHaveChanged ? "Re-process with New Settings" : "Apply Mask to All") : "Apply Mask to All Frames"}
         </Button>
         
-        {hasExistingMask && !isProcessing && (
+        {extractionNote && (
+          <p
+            className="text-xs text-primary text-center"
+            data-testid="extraction-note"
+          >
+            {extractionNote}
+          </p>
+        )}
+
+        {hasExistingMask && !isProcessing && !extractionNote && (
           <p className="text-xs text-muted-foreground text-center">
             {settingsHaveChanged ? 
               "Settings changed - click above to re-process with new output settings" :

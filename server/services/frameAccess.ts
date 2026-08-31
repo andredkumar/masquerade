@@ -164,6 +164,45 @@ export async function listRawFrameFiles(
 }
 
 /**
+ * The 8-byte PNG IEND chunk that terminates every complete PNG file:
+ *   length(0x00000000) + type("IEND") + CRC(0xAE426082)
+ * A PNG whose write is still in flight has no IEND yet.
+ */
+const PNG_IEND = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+const PNG_IEND_TRAILER = PNG_IEND.subarray(4); // 49 45 4E 44 AE 42 60 82
+
+/**
+ * True if `buf` ends with the PNG IEND trailer — i.e. the file is a *complete*
+ * PNG, not one caught mid-write.
+ *
+ * Round 2A race guard. `startBackgroundFrameExtraction` writes each batch's
+ * frames with concurrent `fs.writeFile`s, and the frames endpoint may now read
+ * `temp_extracted/<jobId>/` while that is still happening, so a read can land on
+ * a partially written frame. Serving a truncated PNG would paint a half-frame on
+ * the masking canvas; the caller treats "incomplete" as "not ready yet" (503).
+ *
+ * Buffer form so the route can reuse the read it already performs to serve the
+ * body — no second read.
+ */
+export function isCompletePngBuffer(buf: Buffer): boolean {
+  if (buf.length < PNG_IEND_TRAILER.length) return false;
+  return buf.subarray(buf.length - PNG_IEND_TRAILER.length).equals(PNG_IEND_TRAILER);
+}
+
+/**
+ * Path form of {@link isCompletePngBuffer}. Returns false (rather than throwing)
+ * when the file is unreadable or gone — an unreadable frame is, for the
+ * caller's purposes, simply not ready.
+ */
+export async function isCompletePng(absPath: string): Promise<boolean> {
+  try {
+    return isCompletePngBuffer(await fs.readFile(absPath));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Deterministic color for a labelId. FNV-1a hash → HSL hue with fixed
  * saturation/lightness so colors stay readable on both light and dark
  * backgrounds. The same labelId always renders the same color across

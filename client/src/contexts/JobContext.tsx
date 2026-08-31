@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { Job } from "@shared/schema";
+import type { Job, ProcessingProgress } from "@shared/schema";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
 interface JobContextValue {
@@ -8,6 +8,15 @@ interface JobContextValue {
   isLoading: boolean;
   error: string | null;
   refetch: () => void;
+  /**
+   * Latest granular `progress` payload for this job, or null before the first
+   * event lands. Granular progress is WebSocket-only — it is not a field on the
+   * V2 Job record (see ProcessingStatus.tsx). Round 2A surfaces it here rather
+   * than opening a second socket in the spoke: this context already joins the
+   * job room and already listens for `progress`; it was simply discarding the
+   * payload after calling refetch().
+   */
+  progress: ProcessingProgress | null;
 }
 
 const JobContext = createContext<JobContextValue | null>(null);
@@ -20,6 +29,7 @@ function toErrorMessage(err: unknown): string {
 
 export function JobProvider({ jobId, children }: { jobId: string; children: ReactNode }) {
   const { socket } = useWebSocket();
+  const [progress, setProgress] = useState<ProcessingProgress | null>(null);
 
   // Phase 5D: the hub's canonical job read. Uses the app's default queryFn
   // (lib/queryClient.ts) which resolves ['/api/jobs', jobId] → GET /api/jobs/:jobId.
@@ -58,8 +68,10 @@ export function JobProvider({ jobId, children }: { jobId: string; children: Reac
     join();
     socket.on("connect", join);
 
-    const handleProgress = (data: { jobId?: string }) => {
-      if (data.jobId === jobId) refetch();
+    const handleProgress = (data: Partial<ProcessingProgress> & { jobId?: string }) => {
+      if (data.jobId !== jobId) return;
+      setProgress(data as ProcessingProgress);
+      refetch();
     };
     socket.on("progress", handleProgress);
 
@@ -71,7 +83,7 @@ export function JobProvider({ jobId, children }: { jobId: string; children: Reac
 
   return (
     <JobContext.Provider
-      value={{ job, isLoading: query.isLoading, error, refetch: () => void refetch() }}
+      value={{ job, isLoading: query.isLoading, error, refetch: () => void refetch(), progress }}
     >
       {children}
     </JobContext.Provider>
