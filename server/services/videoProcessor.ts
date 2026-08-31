@@ -9,10 +9,6 @@ import { TempFolderManager } from './templateMaskFolderManager';
 import { deleteUploadFile } from './cleanup';
 import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplyStaging, assertNoSegmentDoubling } from './applyPaths';
 import { listRawFrameFiles, isCompletePngBuffer } from './frameAccess';
-import { rawFramesDir as rawFramesDirFor } from './applyPaths';
-import {
-  resolveApplyEngine, resolveQv, writeBboxMask, runFfmpegApply, type BboxMask,
-} from './ffmpegApply';
 import os from 'os';
 import { perfMark, perfSpan } from './perf';
 
@@ -346,8 +342,6 @@ export class VideoProcessor {
         batch_size: outputSettings?.batchSize || 12,
         // Inner stack width (one processFrameBatch call = one `apply.stack`)
         volume_batch_size: 8,
-        // Round 2C experiment: 'sharp' (default, deployed) | 'ffmpeg'
-        apply_engine: resolveApplyEngine(),
         node: process.version,
       });
 
@@ -480,156 +474,59 @@ export class VideoProcessor {
       // build serves the whole run.
       const prebuiltMask = await this.buildApplyMask(jobId, extractedBuffers[0], maskData);
 
-      // ── Round 2C EXPERIMENT: ffmpeg apply engine ─────────────────────
-      // Deliberately narrow (experiment doc §2): reuse path only (the frames
-      // must already be the contiguous 1-indexed sequence in temp_extracted/),
-      // JPEG output, original size, non-empty mask. Anything else — PNG output,
-      // any resize/letterbox/crop, the re-extract fallback, image batches —
-      // routes to the sharp engine exactly as today, so the experiment moves one
-      // variable. A throw or an in≠out frame count also falls back to sharp.
-      let ffmpegFrames: number | null = null;
-      let bboxMask: BboxMask | null = null;
-      const engine = resolveApplyEngine();
-      const sizeIsOriginal = outputSettings.size === 'original'
-        || (outputSettings.width === metadata.width && outputSettings.height === metadata.height);
-      const ffmpegEligible = engine === 'ffmpeg'
-        && !!reuse
-        && !!prebuiltMask
-        && prebuiltMask.maskedPixels > 0
-        && outputSettings.format !== 'png'
-        && sizeIsOriginal;
+      // Create frame batches OVER the already-extracted frame list
+      const batchSize = outputSettings.batchSize || 12;
+      const batches = this.createFrameBatches(extractedCount, batchSize);
 
-      if (engine === 'ffmpeg' && !ffmpegEligible) {
-        perfMark(jobId, 'apply.engine', {
-          engine: 'sharp',
-          reason: !reuse ? 'not_reuse_path'
-            : !prebuiltMask ? 'no_prebuilt_mask'
-            : prebuiltMask.maskedPixels === 0 ? 'empty_mask'
-            : outputSettings.format === 'png' ? 'png_output'
-            : 'size_not_original',
+      // Create batch records in storage
+      for (let i = 0; i < batches.length; i++) {
+        await storage.createFrameBatch({
+          jobId,
+          batchNumber: i + 1,
+          startFrame: batches[i].start,
+          endFrame: batches[i].end,
+          status: 'pending'
         });
       }
 
-      if (ffmpegEligible && prebuiltMask) {
-        const endEngine = perfSpan(jobId, 'apply.engine', { engine: 'ffmpeg' });
-        try {
-          bboxMask = await writeBboxMask(jobId, prebuiltMask.width, prebuiltMask.maskedOffsets);
-          if (!bboxMask) throw new Error('bbox mask is empty');
+      // Process batches in parallel — each batch gets a SLICE of the already
+      // extracted frame buffers, so ffmpeg is never re-invoked here.
+      const processedFrames = await this.processFrameBuffersInParallel(
+        jobId,
+        extractedBuffers,
+        batches,
+        maskData,
+        outputSettings,
+        prebuiltMask
+      );
 
-          // The output dir must exist and be empty before ffmpeg writes into it,
-          // and the frame-count check below depends on it holding nothing else.
-          await TempFolderManager.cleanupJobTempFolder(jobId);
-          await TempFolderManager.createJobTempFolder(jobId);
+      await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
 
-          const t0 = Date.now();
-          let lastEmit = 0;
-          const written = await runFfmpegApply({
-            rawDir: rawFramesDirFor(jobId),
-            outDir: TempFolderManager.getJobTempFolder(jobId),
-            mask: bboxMask,
-            expectedFrames: extractedCount,
-            onProgress: (framesDone) => {
-              const now = Date.now();
-              if (now - lastEmit < 500) return;
-              lastEmit = now;
-              const progress = 10 + Math.min(framesDone / Math.max(extractedCount, 1), 1) * 80;
-              void this.updateProgress(jobId, {
-                progress: Math.min(progress, 90),
-                currentFrame: framesDone,
-                fps: parseFloat((framesDone / Math.max((now - t0) / 1000, 0.001)).toFixed(1)),
-                eta: 0,
-              });
-            },
-          });
-
-          if (written !== extractedCount) {
-            throw new Error(`frame count mismatch: ${extractedCount} in, ${written} out`);
-          }
-          ffmpegFrames = written;
-          endEngine({
-            frames: written,
-            qv: resolveQv(),
-            bbox: `${bboxMask.width}x${bboxMask.height}+${bboxMask.x}+${bboxMask.y}`,
-            masked_px: bboxMask.pixels,
-            mask_path: bboxMask.filePath,
-          });
-        } catch (ffErr) {
-          // Never fail an apply over the experiment. Fall through to sharp,
-          // which re-cleans the output dir itself before its own save loop.
-          const message = ffErr instanceof Error ? ffErr.message : String(ffErr);
-          endEngine({ ok: false, error: message });
-          console.error('⚠️  [2C] ffmpeg apply engine failed — falling back to sharp:', message);
-          ffmpegFrames = null;
-        }
-      }
-
-      // Round 2C: the ffmpeg engine has already written the masked frames
-      // straight to the spoke dir, so the whole sharp mask loop and its save
-      // loop are skipped. When it is not in play — the default, and every
-      // fallback — the block below is exactly the deployed sharp path.
-      let tempDir: string;
+      // Persist processed frames to spokes/template_mask/{jobId}/ so the download route
+      // can build the ZIP lazily when the user clicks download. Do NOT pre-build a ZIP.
+      await TempFolderManager.cleanupJobTempFolder(jobId);
+      await TempFolderManager.createJobTempFolder(jobId);
+      const tempDir = TempFolderManager.getJobTempFolder(jobId);
+      // 2B addendum §A.2 — the extension follows the encoder. Default output is
+      // JPEG, so the default extension is `.jpg`; `.png` only when the user
+      // selected PNG. Before this, every masked frame was JPEG bytes in a
+      // `.png` file. Consumers list masked frames by sorted `frame_*` prefix
+      // (listFrameFiles accepts png/jpg/jpeg) and derive the extension from the
+      // filename, so nothing downstream keys on a hardcoded `.png`.
+      const ext = outputSettings.format === 'png' ? 'png' : 'jpg';
       let savedCount = 0;
-
-      if (ffmpegFrames !== null) {
-        tempDir = TempFolderManager.getJobTempFolder(jobId);
-        savedCount = ffmpegFrames;
-        await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
-        console.log(`💾 [2C] ffmpeg engine wrote ${savedCount} frames to ${tempDir}`);
-      } else {
-        // Create frame batches OVER the already-extracted frame list
-        const batchSize = outputSettings.batchSize || 12;
-        const batches = this.createFrameBatches(extractedCount, batchSize);
-
-        // Create batch records in storage
-        for (let i = 0; i < batches.length; i++) {
-          await storage.createFrameBatch({
-            jobId,
-            batchNumber: i + 1,
-            startFrame: batches[i].start,
-            endFrame: batches[i].end,
-            status: 'pending'
-          });
-        }
-
-        // Process batches in parallel — each batch gets a SLICE of the already
-        // extracted frame buffers, so ffmpeg is never re-invoked here.
-        const processedFrames = await this.processFrameBuffersInParallel(
-          jobId,
-          extractedBuffers,
-          batches,
-          maskData,
-          outputSettings,
-          prebuiltMask
-        );
-
-        await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
-
-        // Persist processed frames to spokes/template_mask/{jobId}/ so the download route
-        // can build the ZIP lazily when the user clicks download. Do NOT pre-build a ZIP.
-        await TempFolderManager.cleanupJobTempFolder(jobId);
-        await TempFolderManager.createJobTempFolder(jobId);
-        tempDir = TempFolderManager.getJobTempFolder(jobId);
-        // 2B addendum §A.2 — the extension follows the encoder. Default output is
-        // JPEG, so the default extension is `.jpg`; `.png` only when the user
-        // selected PNG. Before this, every masked frame was JPEG bytes in a
-        // `.png` file. Consumers list masked frames by sorted `frame_*` prefix
-        // (listFrameFiles accepts png/jpg/jpeg) and derive the extension from the
-        // filename, so nothing downstream keys on a hardcoded `.png`.
-        const ext = outputSettings.format === 'png' ? 'png' : 'jpg';
-        savedCount = 0;
-        // [PERF] Addition to §3.2: masked frames are written here, after the mask
-        // loop, so the spec's per-frame `write_ms` has no per-frame site inside a
-        // stack. This span is the whole write bucket.
-        const endWriteAll = perfSpan(jobId, 'apply.write_all');
-        for (const { frameNumber, buffer } of processedFrames) {
-          if (!buffer || buffer.length === 0) continue;
-          const filename = `frame_${String(frameNumber).padStart(6, '0')}.${ext}`;
-          await fs.writeFile(path.join(tempDir, filename), buffer);
-          savedCount++;
-        }
-        endWriteAll({ frames: savedCount, ext });
-        console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
+      // [PERF] Addition to §3.2: masked frames are written here, after the mask
+      // loop, so the spec's per-frame `write_ms` has no per-frame site inside a
+      // stack. This span is the whole write bucket.
+      const endWriteAll = perfSpan(jobId, 'apply.write_all');
+      for (const { frameNumber, buffer } of processedFrames) {
+        if (!buffer || buffer.length === 0) continue;
+        const filename = `frame_${String(frameNumber).padStart(6, '0')}.${ext}`;
+        await fs.writeFile(path.join(tempDir, filename), buffer);
+        savedCount++;
       }
+      endWriteAll({ frames: savedCount, ext });
+      console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',

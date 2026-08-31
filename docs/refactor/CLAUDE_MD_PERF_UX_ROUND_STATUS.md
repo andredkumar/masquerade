@@ -56,6 +56,25 @@
   → let reuse fall back). `isDicomHint` passed from the upload handlers so `isDicomFile` doesn't
   re-read the file.
 
+- **2C — ffmpeg apply engine: tried, measured, DELETED.** One ffmpeg process (PNG sequence →
+  `overlay` → JPEG sequence) ran the same apply in **7.73 s vs sharp 8.47 s (1.10×)**, below the
+  pre-committed 1.5× bar, so the engine was removed (`ROUND2C_REPORT.md`, outcome: deleted).
+  **Conclusion: ~8 s is the decode+encode floor for 348 frames on one physical core.** Node overhead
+  was ~1 s, not the 4 s assumed. The software track on this box is closed; remaining levers are *less
+  work* (grayscale raw frames, sampling rate, output size) and *more cores*.
+
+### Facts surfaced this round that were documented nowhere
+
+- **Masked frames are 0-indexed; raw frames are 1-indexed.** `spokes/template_mask/<jobId>/` is
+  `frame_000000.jpg … frame_000347.jpg` (save loop pads `frameNumber` from 0) and
+  `frameAccess.resolveFramePath` builds the masked filename directly from `n`; `temp_extracted/<jobId>/`
+  is `frame_000001.png …` (ffmpeg image2 muxer). Any code writing masked frames must use base 0 or
+  `GET /frames/:n` serves every frame off by one while every count check still passes.
+- **The parity reconcile fires in practice.** The second clip uploaded after 2B-3b decoded 124 frames
+  against an ffprobe estimate of 123; `totalFrames` was reconciled before `ready` and reuse kept
+  working (`corrected: true`). MP4 only — DICOM counts are exact and a mismatch there means missing
+  frames, so DICOM is deliberately *not* reconciled.
+
 ### Binding lessons from this round (add to the project's list)
 
 - **Measure at the production shape.** The 3a regression passed a laptop A/B with a 16 % mask on many
@@ -103,5 +122,6 @@ users arrive: `c6i.xlarge` (4 dedicated vCPU) — every stage above is CPU-bound
 `PERF_ROUND1_RESULTS.md`, `FRAME0_GATE_HISTORY.md`, `ROUND2A_FRAME0_UNBLOCK.md`, `ROUND2A_REPORT.md`,
 `ROUND2A_DEPLOY_RUNBOOK.md`, `ROUND2B_PROPOSAL.md`, `ROUND2B_REPORT.md`, `ROUND2B_ADDENDUM.md`,
 `ROUND2B_DEPLOY_RUNBOOK.md`, `ROUND2B3_PROPOSAL.md`, `ROUND2B3A_REPORT.md`, `ROUND2B3A_HOTFIX.md`,
-`ROUND2B3A_HOTFIX_REPORT.md`, `ROUND2B3B_REPORT.md`. EBS snapshots `pre-round2a-deploy` …
-`pre-round2b3b-deploy` (2026-08-30). Rollback for any single step is a plain `git revert`.
+`ROUND2B3A_HOTFIX_REPORT.md`, `ROUND2B3B_REPORT.md`, `ROUND2C_FFMPEG_APPLY_EXPERIMENT.md`,
+`ROUND2C_REPORT.md`. EBS snapshots `pre-round2a-deploy` … `pre-round2c-deploy` (2026-08-30).
+Rollback for any single step is a plain `git revert`.

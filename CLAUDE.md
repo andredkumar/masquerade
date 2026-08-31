@@ -57,6 +57,25 @@ Verified on prod (`t3.large`, 2 vCPU) against one reference clip: `Normal Lung s
   → let reuse fall back). `isDicomHint` passed from the upload handlers so `isDicomFile` doesn't
   re-read the file.
 
+- **2C — ffmpeg apply engine: tried, measured, DELETED.** One ffmpeg process (PNG sequence →
+  `overlay` → JPEG sequence) ran the same apply in **7.73 s vs sharp 8.47 s (1.10×)**, below the
+  pre-committed 1.5× bar, so the engine was removed (`ROUND2C_REPORT.md`, outcome: deleted).
+  **Conclusion: ~8 s is the decode+encode floor for 348 frames on one physical core.** Node overhead
+  was ~1 s, not the 4 s assumed. The software track on this box is closed; remaining levers are *less
+  work* (grayscale raw frames, sampling rate, output size) and *more cores*.
+
+### Facts surfaced this round that were documented nowhere
+
+- **Masked frames are 0-indexed; raw frames are 1-indexed.** `spokes/template_mask/<jobId>/` is
+  `frame_000000.jpg … frame_000347.jpg` (save loop pads `frameNumber` from 0) and
+  `frameAccess.resolveFramePath` builds the masked filename directly from `n`; `temp_extracted/<jobId>/`
+  is `frame_000001.png …` (ffmpeg image2 muxer). Any code writing masked frames must use base 0 or
+  `GET /frames/:n` serves every frame off by one while every count check still passes.
+- **The parity reconcile fires in practice.** The second clip uploaded after 2B-3b decoded 124 frames
+  against an ffprobe estimate of 123; `totalFrames` was reconciled before `ready` and reuse kept
+  working (`corrected: true`). MP4 only — DICOM counts are exact and a mismatch there means missing
+  frames, so DICOM is deliberately *not* reconciled.
+
 ### Binding lessons from this round (add to the project's list)
 
 - **Measure at the production shape.** The 3a regression passed a laptop A/B with a 16 % mask on many
@@ -104,8 +123,9 @@ users arrive: `c6i.xlarge` (4 dedicated vCPU) — every stage above is CPU-bound
 `PERF_ROUND1_RESULTS.md`, `FRAME0_GATE_HISTORY.md`, `ROUND2A_FRAME0_UNBLOCK.md`, `ROUND2A_REPORT.md`,
 `ROUND2A_DEPLOY_RUNBOOK.md`, `ROUND2B_PROPOSAL.md`, `ROUND2B_REPORT.md`, `ROUND2B_ADDENDUM.md`,
 `ROUND2B_DEPLOY_RUNBOOK.md`, `ROUND2B3_PROPOSAL.md`, `ROUND2B3A_REPORT.md`, `ROUND2B3A_HOTFIX.md`,
-`ROUND2B3A_HOTFIX_REPORT.md`, `ROUND2B3B_REPORT.md`. EBS snapshots `pre-round2a-deploy` …
-`pre-round2b3b-deploy` (2026-08-30). Rollback for any single step is a plain `git revert`.
+`ROUND2B3A_HOTFIX_REPORT.md`, `ROUND2B3B_REPORT.md`, `ROUND2C_FFMPEG_APPLY_EXPERIMENT.md`,
+`ROUND2C_REPORT.md`. EBS snapshots `pre-round2a-deploy` … `pre-round2c-deploy` (2026-08-30).
+Rollback for any single step is a plain `git revert`.
 
 ---
 
@@ -351,6 +371,16 @@ Sub-phases — all landed + verified:
 - **Many "bugs" were observation artifacts, not real bugs** — phantom frame deletion
   (timing/stale-tab), "old code running" (server on wrong SHA / cached bundle), 0-frame reads
   (wrong working directory). Verify actual state before acting; don't fix non-bugs.
+- **Measure at the production shape** (perf/UX round). The 2B-3a regression passed a laptop A/B with
+  a 16 % mask on many cores; prod is a 0.12 % mask on one physical core, and the change was *slower*
+  there. Any masking/pixel A/B must run at prod-like mask coverage, and every number must state its
+  coverage next to it.
+- **Pixel-equivalence proof before any change to masking arithmetic** — byte-identical against the
+  retained old path, on a real frame. It caught an inverted composite (`dest-in` would have blacked
+  out everything *except* the PHI) that every frame-count and co-indexing check would have passed.
+- **The Node main thread is a resource.** `sharp.concurrency` cannot help a synchronous JS loop, and
+  moving work into libvips only helps if the libvips work is *smaller* than what it replaces (2B-2
+  measured zero; the 2B-3a composite measured worse).
 
 ### Deploy-hygiene checklist
 
@@ -595,6 +625,19 @@ verified.
 15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX. → **Phase 7B-4 (operator decision)** — whole-job 404 at `routes.ts:552–554`; options: unify raw fallback vs leave documented (proposal recommends leaving documented).
 17. **Socket.IO CORS is wide open** — `routes.ts:100–102` initializes the Socket.IO server with `cors: { origin: "*" }`. Tighten to the known frontend origin(s) before/at commercial launch. (Logged during Phase 5B; not in 5B Deploy 1 scope.) → **Phase 7A-1 (PLANNED)** — env-driven allow-list, prod default `https://masqueradeimage.com`; ⚠️ smoke test = real upload w/ live progress from prod domain.
 18. **Restart mid-extraction leaves a silent dead-end job** *(= PERF/UX backlog #3)* — surfaced by Round 2A (frame-0 unblock), **ACCEPTED AS-IS by operator decision 2026-08-30**, logged here rather than fixed. `temp_extracted/` is not purged at boot (only `uploads/` and `temp_processed/` are — `index.ts:125-126`), job status is durable in Postgres since 5C-2, and nothing reconciles stale `'extracting'` jobs at startup. So if the server restarts mid-extraction *after* at least one 15-frame batch landed (the common case), the Round 2A frames endpoint correctly serves `frame_000001.png` (`routes.ts:1623-1643`) — the hub tile is open, the canvas paints, the user can draw — but `status` never reaches `'ready'`, so Apply stays disabled forever behind "Extracting frames…" with no error. **Not a regression:** `uploads/` was purged at boot, so that job could never have applied either way; before 2A the hub tile was simply locked, so the user never got in. If the restart landed *before* the first batch, the spoke's 120 s poll cap fires and shows the existing error state — that sub-case is already handled. → **Future pass (not scheduled).** Two candidate fixes, both outside Round 2A's scope: (a) a startup reconciliation pass marking stale `'extracting'` jobs `'failed'` — touches status semantics, so A3-adjacent and needs its own gate; (b) a client-side staleness timeout in the spoke that surfaces "extraction stalled" when `status` hasn't moved for N minutes — client-only, cheaper, but cosmetic. See `docs/refactor/ROUND2A_REPORT.md` §3.
+
+*Items 19–26 are the "Backlog opened by this round" list from the PERF / UX round (top of this file),
+folded into this canonical list. Numbering is offset by one because slot 18 was already taken by that
+round's own first entry — item 21 below is a pointer to it rather than a duplicate.*
+
+19. **2B-3c — grayscale evaluation** — raw frames as 8-bit gray (`-pix_fmt gray`), gated on a frame-1 chroma check so colour Doppler stays RGB. ~3× less disk in `temp_extracted/` (raw frames are ~350 KB each, 123 MB for the 348-frame reference clip), and it would make a lossless PNG masked-output option roughly the size of today's JPEG. **Experiment + recommendation only, no default change.** → scoped in `docs/refactor/ROUND2B3_PROPOSAL.md` §2B-3c.
+20. **"Review masked frames" in the template-mask spoke** — `FrameViewer` (Clean mode) already reads `?source=template_mask`; today the only way to check an apply result is to download the ZIP or open the AI spoke. Small UX gap, no backend work.
+21. *(= item 18 above)* **Stale-`extracting` reconciliation at boot.** Listed as #3 in the PERF/UX round's backlog; the full analysis and the two candidate fixes are in item 18.
+22. **Image-batch output mislabel** — `processImages` always encodes PNG (`videoProcessor.ts:1801`) but names the file from the *uploaded* file's extension (`templateMaskFolderManager.ts:84`), so a masked `photo.jpg` is PNG bytes in a `.jpg` file. Mirror of the video-path bug fixed in the 2B addendum (`docs/refactor/ROUND2B_REPORT.md` §A), on a different code path. Not fixed there because it changes output bytes for existing image jobs.
+23. **Delete `maskWorker.ts`** — confirmed dead in Round 1 (nothing in `server/` or `client/` imports `MaskWorkerPool`), and it carries **7 of the 12** tsc errors. Deleting it alone takes the baseline 12 → 5. Separate pass, because it changes the tsc invariant — see item 12.
+24. **Stack scheduling** — 58 stacks in flight against a 4-thread libuv pool inflates `apply.frame.decode_ms` into queue-wait. Maybe ~2× left in the ~8 s apply. Round 2C established that ~8 s is close to the decode+encode floor for 348 frames on one physical core, so this is the only remaining software lever; diminishing, and only worth it if apply time matters again. → `docs/refactor/ROUND2C_REPORT.md`.
+25. **Small open items.** `ANTHROPIC_API_KEY` still unset on prod (7A-4). The orphan base64 `firstFrame` in the upload response has been dead since Phase 4b — nothing consumes it. `MemStorage` (rollback target only) doesn't mirror `totalFrames` to `jobsV2`, so the 2B-1 reuse guard would trip if anyone reverted the 5C-2 cutover — documented rather than fixed, since `storage.ts` is A3-frozen (`docs/refactor/ROUND2B3B_REPORT.md` §1.6).
+26. **Product: usage/tier model** — keyed on frames × resolution × format, all three of which are already on the job record. Raised when the JPEG-vs-PNG disk question came up (2B addendum); no design yet.
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
 
@@ -980,6 +1023,14 @@ directly — go through `safeDelete`, `deleteUploadFile`, or
 anymore. It remains as a defensive sweep target in `SWEEP_TARGETS` and is
 purged on every server boot (`purgeTempProcessedOnStartup`). Remove from
 `SWEEP_TARGETS` once confirmed quiet in production.
+
+**Frame naming differs by directory, and consumers must not assume one convention.**
+`temp_extracted/<jobId>/` holds **`.png`, 1-indexed** (`frame_000001.png` — ffmpeg's image2 muxer).
+`spokes/template_mask/<jobId>/` holds **`.jpg` by default (`.png` only when the user selects PNG),
+0-indexed** (`frame_000000.jpg` — the save loop pads `frameNumber`, which starts at 0).
+`frameAccess.resolveFramePath` builds a masked-frame name straight from the index, so anything that
+writes masked frames must keep the 0-indexed convention. Both listings match by **extension**, not by
+a `frame_` prefix — a stray `.png`/`.jpg` in either directory is counted as a frame.
 
 `spokes/template_mask/<jobId>/` is **not** deleted post-download. Folders persist
 after download to allow the frame viewer to be reopened. Practical effect:

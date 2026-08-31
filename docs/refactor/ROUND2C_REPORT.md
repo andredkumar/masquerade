@@ -1,5 +1,14 @@
 # Round 2C report — ffmpeg apply engine, behind `APPLY_ENGINE` (experiment)
 
+> **Outcome (prod, 2026-08-30): ffmpeg 7.73 s vs sharp 8.47 s = 1.10× — below the 1.5× bar; engine
+> deleted.** Conclusion: ~8 s is the decode+encode floor for 348 frames on one physical core; Node
+> overhead was ~1 s.
+>
+> Removed: `server/services/ffmpegApply.ts`, the eligibility branch and all `APPLY_ENGINE` /
+> `APPLY_FFMPEG_QV` handling in `videoProcessor.ts` (including `apply_engine` on `apply.env`), and
+> `scripts/compare-apply-engines.ts`. `git diff -w server/services/videoProcessor.ts 8795f4f`
+> (the pre-2C commit) is empty. Everything below is kept as the record of what was built and why.
+
 **Spec:** `docs/refactor/ROUND2C_FFMPEG_APPLY_EXPERIMENT.md` · **Landed:** 2026-08-30. **NOT deployed.**
 **Default is unchanged:** `APPLY_ENGINE` unset → `sharp` → today's deployed path.
 
