@@ -1,5 +1,114 @@
 # Masquerade
 
+## Status — PERF / UX round COMPLETE (deployed + verified 2026-08-30)
+
+Verified on prod (`t3.large`, 2 vCPU) against one reference clip: `Normal Lung sliding 2.mp4`,
+348 frames, 1536×796, 43 fps.
+
+**Result on the reference clip (upload-complete → masked frames on disk): ~81 s → ~17 s.**
+
+| stage | Round 1 (before) | now | change |
+|---|---|---|---|
+| first frame on disk (user can draw) | never — UI blocked until `ready` | ~1–2 s | Round 2A |
+| background extraction (`bg_extract.done`) | 45.6 s | **8.0 s** | 2B-3b |
+| apply: re-extraction (`apply.extract_all`) | 19.5 s | **0** (`apply.source: reuse`) | 2B-1 |
+| apply: mask loop | 13.4 s | ~8.4 s | 2B-3a + hotfix |
+| apply total (`apply.done`) | 33.3 s | **8.7 s** | |
+
+### What shipped (each its own deploy, each re-measured on the same clip)
+
+- **Round 1 — instrumentation.** `server/services/perf.ts`; `[PERF] {json}` lines at every pipeline
+  stage (`upload.*`, `bg_extract.*`, `apply.*`). **They stay in prod.** Collect with
+  `pm2 logs masquerade --raw | grep '\[PERF\]'`; pivot commands in `docs/refactor/PERF_ROUND1_REPORT.md`
+  Appendix C. Numbers: `PERF_ROUND1_RESULTS.md`.
+- **Round 2A — draw while extracting restored.** Frames endpoint raw branch serves frame *n* during
+  `extracting` if on disk and a complete PNG (IEND check, `frameAccess.isCompletePngBuffer`), 503
+  `no-store` otherwise; hub Template Mask tile enabled during `extracting` (AI tile still gated on
+  `ready`); spoke polls `frames/0` on 503; **Apply disabled until `status === 'ready'`** with live
+  extraction progress (`JobContext` now exposes the `progress` payload). History of why it was blocked:
+  `FRAME0_GATE_HISTORY.md` (a Phase-4b design default for an in-memory store, carried forward — no
+  error ever required it).
+- **2B-1 — apply reuses `temp_extracted/`.** `tryReuseRawFrames` in `processVideo`: guards
+  `samplingFps == null`, `jobV2.status === 'ready'`, on-disk count `=== totalFrames`, every file IEND-
+  complete; any doubt → the unchanged re-extract path (`extractAllFramesSequential` + `_apply/`,
+  DICOM branch intact). `[PERF] apply.source {mode: reuse|reextract, reason}`. Upload-time metadata
+  reused on the reuse path (`apply.metadata {mode: cached|probe}`), existing A3 columns only.
+- **2B-2 — `sharp.concurrency(os.cpus().length)`** at boot (`index.ts`). Measured **no gain** on the
+  mask loop by itself — the loop was main-thread JS, not libvips. Kept; harmless.
+- **Output format fix.** Masked frames were **JPEG bytes in `.png` files** (encoder unconditionally
+  JPEG, extension from `outputSettings.format || 'png'`). Now the encoder follows the format:
+  **default JPEG q90 → `.jpg` / `image/jpeg`**; PNG (`compressionLevel: 3`) only when the user selects
+  it (UI copy: "Lossless. About 3× larger files."). Default path is byte-identical to before.
+  `listFrameFiles` accepts `png|jpg|jpeg`; `mimeForFrameFile` derives Content-Type; manifest
+  `outputFormat` fallback is `'jpg'`. Operator decision: JPEG default, PNG opt-in (disk: ~100 MB clips).
+- **2B-3a + hotfix — mask built once, applied by offset list.** `buildApplyMask` once per apply
+  (`[PERF] apply.mask_build {ms, masked_px, total_px, offsets}`), then per frame zero a precomputed
+  `Uint32Array` of masked byte offsets on the raw buffer (`mask_mode: 'offsets'`). Byte-identical to
+  the old full-scan loop at 0.12 %, 16 %, and 100 % coverage; faster at all three. The intermediate
+  libvips-composite version was **slower on prod** (full-frame premultiply/blend to change 0.12 % of
+  pixels) and is deleted.
+- **2B-3b — single-pass background extraction (MP4).** `frameExtractor.extractAllFramesSinglePass`
+  (new method, additive): one ffmpeg run, `-vsync 0 -compression_level 1`, image2 muxer straight into
+  `temp_extracted/<jobId>/frame_%06d.png` (1-indexed). Progress from fluent-ffmpeg `.on('progress')`,
+  throttled 500 ms, same socket payload. **DICOM keeps the 15-frame batch loop** (byte-identical
+  verified). `bg_extract.done` carries `path`, `expected`, `parity`, `corrected`: on MP4 a count
+  mismatch vs the ffprobe estimate is reconciled into `totalFrames` (shared A3 column, via
+  `updateVideoJob`) **before** `ready`; on DICOM it is **not** (exact count → mismatch = missing frames
+  → let reuse fall back). `isDicomHint` passed from the upload handlers so `isDicomFile` doesn't
+  re-read the file.
+
+### Binding lessons from this round (add to the project's list)
+
+- **Measure at the production shape.** The 3a regression passed a laptop A/B with a 16 % mask on many
+  cores; prod is a 0.12 % mask on one physical core. Any masking/pixel A/B must run at prod-like mask
+  coverage and state coverage next to every number.
+- **Pixel-equivalence proof before any change to masking arithmetic** (byte-identical vs the retained
+  old path). It caught an inverted composite (`dest-in` would have blacked out everything *except* the
+  PHI) that every count/co-indexing check would have passed.
+- **Node main thread is a resource.** `sharp.concurrency` cannot help a synchronous JS loop; and moving
+  work into libvips only helps if the libvips work is smaller than what it replaces.
+- Round 1's `maskWorker.ts` is **dead code** (nothing imports it) and carries 7 of the 12 tsc errors.
+
+### Constraints unchanged
+tsc = **12** (same 12: 5 `frameExtractor.ts` pixelBuffer + 7 `maskWorker.ts`) · A3 frozen (no
+schema/status/column changes in this round) · `extractAllFramesSequential` + DICOM branch untouched
+(now the apply fallback) · `frame_%06d`, 1-indexed, positional indexing preserved · Phase 6
+co-indexing invariant preserved (masked frame *i* now derives from the exact `listRawFrameFiles()[i]`
+the AI fallback and run download index — stronger than before) · 7B one-way doors still parked.
+
+### Infra facts
+App server `t3.large` (2 vCPU = 1 physical core, burstable; check `CPUCreditBalance` if a run is
+mysteriously slow). Disk 29 GB, ~19 GB free; raw frames ≈ 350 KB each (123 MB for the 348-frame clip).
+**Verify `3.136.48.97` is an Elastic IP before any instance resize.** Candidate upgrade when other
+users arrive: `c6i.xlarge` (4 dedicated vCPU) — every stage above is CPU-bound.
+
+### Backlog opened by this round (none blocking)
+1. **2B-3c grayscale evaluation** — raw frames as 8-bit gray (`-pix_fmt gray`) gated on a frame-1
+   chroma check (color Doppler stays RGB); ~3× disk on `temp_extracted/`, and a lossless PNG option
+   the size of JPEG. Experiment + recommendation only.
+2. **"Review masked frames" in the template-mask spoke** — `FrameViewer` (Clean mode) already reads
+   `?source=template_mask`; today the only way to check a mask result is the ZIP or the AI spoke.
+3. **Stale-`extracting` reconciliation at boot** — after a restart mid-extraction, 2A now lets the user
+   into a canvas whose Apply never enables (upload purged at boot). Mark such jobs `failed` at startup.
+4. **Image-batch output mislabel** — always encodes PNG but names from the upload's extension
+   (`image_001_photo.jpg` containing PNG). Mirror of the fixed video bug; `videoProcessor.ts:1801`.
+5. **Delete `maskWorker.ts`** (dead) → tsc baseline 12 → 5. Separate pass; changes the invariant.
+6. **Stack scheduling** — 58 stacks in flight vs a 4-thread libuv pool inflates `decode_ms`; maybe
+   ~2× left in the 8 s apply. Diminishing; only if apply time matters again.
+7. `ANTHROPIC_API_KEY` still unset on prod (7A-4). Orphan base64 `firstFrame` in the upload response
+   (dead since 4b). MemStorage (rollback target only) doesn't mirror `totalFrames` to `jobsV2`, so the
+   reuse guard would trip there — documented, A3-frozen.
+8. Product: a usage/tier model keyed on frames × resolution × format (all already on the job record).
+
+**Docs:** `docs/refactor/TEMPLATE_MASK_APPLY_PERF_ROUND1.md`, `PERF_ROUND1_REPORT.md`,
+`PERF_ROUND1_RESULTS.md`, `FRAME0_GATE_HISTORY.md`, `ROUND2A_FRAME0_UNBLOCK.md`, `ROUND2A_REPORT.md`,
+`ROUND2A_DEPLOY_RUNBOOK.md`, `ROUND2B_PROPOSAL.md`, `ROUND2B_REPORT.md`, `ROUND2B_ADDENDUM.md`,
+`ROUND2B_DEPLOY_RUNBOOK.md`, `ROUND2B3_PROPOSAL.md`, `ROUND2B3A_REPORT.md`, `ROUND2B3A_HOTFIX.md`,
+`ROUND2B3A_HOTFIX_REPORT.md`, `ROUND2B3B_REPORT.md`. EBS snapshots `pre-round2a-deploy` …
+`pre-round2b3b-deploy` (2026-08-30). Rollback for any single step is a plain `git revert`.
+
+---
+
 ## Status — Phase 7A DEPLOYED + VERIFIED (2026-07-22)
 
 Phase 7 is a **cleanup + hardening pass** to produce a clean build for a heavy manual-testing
@@ -75,7 +184,7 @@ No commercial work. 7B not executed until gates pass. Deferred to a later pass: 
 DICOM template-masking is restored and production-verified: **single-frame and multiframe
 uncompressed DICOM both extract, mask, carry through to the AI spoke, and download correctly.**
 Found during post-7A testing (issue #1 of two the operator reported; issue #2 = the upload/extraction
-slowdown, now the active work — see the "PERFORMANCE / UX handoff" section below).
+slowdown, **resolved** — see "PERF / UX round COMPLETE" at the top of this file).
 
 **Root cause:** commit `280cb38` (2026-04-28, *pre-Phase-2*) rewrote the apply-path extraction to the
 DICOM-blind `extractAllFramesSequential`, which handed the raw `.dcm` straight to ffmpeg
@@ -98,13 +207,14 @@ numbers +26; code at those sites untouched). A3 frozen.
   exists; DICOM-ness is detected at the extraction layer (`isDicomFile()`), by design.
 - **DICOM extraction ignores `samplingFps`** (extracts every frame), matching pre-`280cb38` behavior.
   DICOM down-sampling would be a separate future feature.
-- **DICOM double-extraction exists:** `startBackgroundFrameExtraction` extracts DICOM frames to
-  `temp_extracted/<jobId>/` at upload time, then `processVideo` **re-extracts** from the raw `.dcm` at
-  apply time (the fixed path). This redundancy is a **known performance lead for issue #2** (see the
-  handoff below). The Option-A "reuse frames already on disk" approach was rejected for the hotfix
-  (background-extraction timing race) but is a candidate for the perf work.
-- **DICOM extraction is per-frame synchronous** (`await extractDicomFrame` in a loop), matching
-  `extractFrameBatch` — also a perf lead for issue #2.
+- ~~**DICOM double-extraction exists**~~ — **FIXED in 2B-1.** `startBackgroundFrameExtraction` still
+  extracts DICOM frames to `temp_extracted/<jobId>/` at upload time, but `processVideo` now **reuses
+  them** instead of re-extracting from the raw `.dcm`. The Option-A "reuse frames already on disk"
+  approach that was rejected for the DICOM hotfix (background-extraction timing race) became safe once
+  Round 2A gated Apply on `status === 'ready'`. Re-extraction survives as the guarded fallback.
+- **DICOM extraction is per-frame synchronous** (`await extractDicomFrame` in a loop, and it re-reads
+  + re-parses the whole `.dcm` on every frame) — still true at **upload** time; 2B-3b left the DICOM
+  batch loop alone deliberately (ffmpeg cannot demux a DICOM container). No longer paid at apply time.
 
 **Verified:** single-frame `.dcm` (`frames:1`), multiframe `.dcm` (extracted count = `NumberOfFrames`),
 mask carries into AI spoke, downloads good; **MP4 regression guard passed**. Docs:
@@ -115,105 +225,6 @@ mask carries into AI spoke, downloads good; **MP4 regression guard passed**. Doc
 unverified — confirmed test data is uncompressed Explicit VR LE (`1.2.840.10008.1.2.1`). If a
 compressed DICOM misbehaves later, that's a separate scoped item (add a decode path), not a
 regression of this fix.
-
----
-
-## ▶ ACTIVE WORK — PERFORMANCE / UX: upload + frame-extraction slowness (handoff for new chat)
-
-**This is the current focus, replacing further Phase 7 work for now.** The operator reports that
-**uploads and specifically frame extraction are slow** — slower than the Phase 2–4 era by their
-recollection. Goal: improve the perceived and actual speed of upload → frame-extraction → ready.
-
-### The single most important discipline for this work: MEASURE BEFORE OPTIMIZING
-
-A performance regression is **not** like the DICOM functional bug (which had a clean error message
-pointing at a line). There is no error here — only "it feels slow." The strong temptation is to guess
-at a cause and optimize something that isn't the real bottleneck. **Do not.** The binding project
-lesson (a confidently-wrong `storage.ts:129` diagnosis caught only by tracing) applies doubly to
-performance. The **first Claude Code round must be pure instrumentation + measurement, no
-optimization**: add timing around each pipeline stage, run representative uploads (small + large MP4,
-single + multiframe DICOM), and produce a **table of where the wall-clock time actually goes** before
-proposing a single change. Only then diagnose, then fix.
-
-### Current pipeline shape (confirm against source — these are from docs, may have drifted)
-
-Upload → extraction flow (video; DICOM shares the extraction layer):
-1. **Multer** streams the upload to `uploads/<hash>` on disk (`upload.single('video')`).
-2. **ffprobe** (fluent-ffmpeg) reads metadata synchronously in the handler (duration, dims,
-   frameRate, totalFrames). Blocks the response.
-3. Handler creates records and **responds 200** (jobId + metadata).
-4. **`setImmediate(() => processVideo(...))`** / `startBackgroundFrameExtraction` runs frame
-   extraction in the background, writing one PNG per frame to `temp_extracted/<jobId>/`, emitting
-   Socket.IO progress.
-5. Later, on template-mask **apply**, `processVideo` calls `extractAllFramesSequential` — a **single
-   upfront ffmpeg pass** (introduced by `280cb38`) that extracts all frames again into an `_apply`
-   staging dir, then processes the buffers.
-
-### Concrete leads already known (from the DICOM investigation — verify, don't assume)
-
-These are **hypotheses to measure**, not confirmed causes:
-- **Double extraction.** Frames are extracted at **upload time** (`startBackgroundFrameExtraction` →
-  `temp_extracted/`) AND **again at apply time** (`processVideo` → `extractAllFramesSequential` →
-  `_apply` staging). For DICOM this is provably redundant (the diagnosis noted apply re-extracts from
-  the raw `.dcm` and ignores the already-on-disk frames). If this holds for video too, it's a large,
-  avoidable cost. **The rejected DICOM "Option A" (reuse frames already on disk at apply time) is the
-  candidate fix** — but it has a background-extraction **timing race** (apply may fire before
-  background extraction finished) and a swept-dir fallback need. Measure first, then design around the
-  race carefully.
-- **Per-frame synchronous DICOM extraction.** `extractDicomFrame` is `await`ed in a loop (no
-  parallelism). For large multiframe DICOMs this serializes every frame. (Video uses ffmpeg's own
-  single-pass, which is different.)
-- **`extractAllFramesSequential` single-pass vs the old per-batch approach.** `280cb38` replaced a
-  batched/parallel extractor with a single upfront pass. Whether that's faster or slower is
-  **unmeasured** — the operator's "slower than Phase 2–4" memory may or may not trace here. Worth a
-  direct before/after if the git history allows building the old path for comparison.
-- **ffprobe blocking the upload response** (step 2). The 200 doesn't return until ffprobe finishes.
-  Usually small, but measure it — it's on the critical path to "upload feels done."
-
-### Hard constraints for the performance work (carry these into the new chat)
-
-- **tsc stays at 12.** (New baseline since 7A-5; NOT 17.)
-- **A3 storage/schema/status/shim/conformance/`migrations/` FROZEN.** A perf fix should live in the
-  extraction/pipeline layer (`frameExtractor.ts`, `videoProcessor.ts`, the upload handlers), not the
-  data layer.
-- **Do not regress the DICOM fix** (the additive branch in `extractAllFramesSequential`) or the
-  working MP4 path. Any extraction change must re-run the DICOM + MP4 smoke tests
-  (single-frame `.dcm`, multiframe `.dcm`, MP4) as a regression guard.
-- **Do not disturb the parked 7B one-way doors** or their evidence-gathering (`[DEADROUTE-HIT]`,
-  `temp_processed/` quiet window). Performance work is separate from 7B.
-- **Measure on the deployed server**, not just the agent environment (no GPU / real disk / real file
-  sizes locally). Agent-env timings are directional at best.
-- **Correctness invariants that must survive any optimization:** frame **naming/indexing**
-  (`frame_%06d.png`, 1-indexed, matching the ffmpeg image2 muxer — the DICOM fix depends on this and
-  so does the manifest co-indexing from Phase 6); the **masked-first/raw-fallback** resolution; and
-  the Phase 6 co-indexing invariant (`frames[].frame_number == mask_<i> == overlay_<i> ==
-  images/frame_%06d(i)`). An extraction change that breaks frame ordering would silently corrupt every
-  downstream manifest.
-
-### Suggested working loop for the new chat (same as always)
-
-1. **Round 1 — instrument only.** Claude Code adds stage timing (upload receipt, ffprobe, background
-   extraction total + per-frame, apply re-extraction, buffer processing) and the operator runs
-   representative files on the deployed server. Output: a wall-clock breakdown table. **No optimization.**
-2. **Round 2 — diagnose.** With real numbers, identify the actual bottleneck(s). Confirm or kill each
-   lead above against the measurements.
-3. **Round 3+ — fix the measured bottleneck**, smallest change first, with the DICOM+MP4 regression
-   guard on every deploy. If "double extraction" is confirmed and the reuse-at-apply fix is chosen,
-   design explicitly around the background-extraction timing race and swept-dir fallback.
-
-### How to open the new chat
-
-Bring this CLAUDE.md. Opening message something like:
-
-> Continuing Masquerade. Backend refactor (Phases 2–6) + 7A hardening are deployed/verified; a DICOM
-> apply-path regression was just fixed. Now working on **performance/UX: upload + frame-extraction is
-> slow.** Per CLAUDE.md's "ACTIVE WORK — PERFORMANCE" section, I want to start with a **measurement
-> round only** — instrument the pipeline stages, run representative files on the deployed server, and
-> get a wall-clock breakdown before optimizing anything. tsc stays 12; A3 frozen; don't regress the
-> DICOM/MP4 extraction paths.
-
-The new Claude Code session reads this file as orientation. Don't dump all the phase reports — this
-file + the two DICOM docs (`docs/refactor/DICOM_REGRESSION_*.md`) are enough for the perf work.
 
 ---
 
@@ -577,13 +588,13 @@ verified.
 9. ~~**Update stale `videoProcessor.ts` comments**~~ — **DONE in Phase 5B (2026-06-25, 5B-2b).** The two stale `temp_processed/{jobId}/` comments were at lines **388 and 698** (backlog's `371`/`643` were stale); both now read `spokes/template_mask/{jobId}/`, matching where `TempFolderManager` actually writes.
 10. ~~**Add `deleteProcessingProgress(jobId)` cleanup on job delete**~~ — **DONE in Phase 5B (2026-06-25, 5B-2c).** Added to `IStorage` + `MemStorage` + `PgStorage`, and folded INTO `deleteVideoJob` so every delete path frees the progress-map entry (Decision 3 — not an explicit call in the route handler).
 11. ~~**`PgStorage` stub maintenance**~~ — **DONE in 5C-1 (2026-06-30).** All 12 throw-stubs replaced with real Postgres-backed implementations (**Option A3**: one `jobs` row as single source of truth; `VideoJob`/`Job` derived in the shim; no `video_job` blob, no `has_job_v2`, no `video_jobs` table; `ai_runs` child). Validated by `scripts/conformance-storage.ts` against the `MemStorage` oracle (35/35). All runtime storage is still `MemStorage`; cutover deferred to 5C-2.
-12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. Either fix the types or silence with `// @ts-expect-error`. → **Phase 7A-5 (PLANNED; sequenced LAST)** — sole item permitted to change the tsc=17 baseline (target 0); ~5 trivial fixes, ~12 need real type-narrowing (do NOT blanket-suppress; may mask latent bugs).
+12. **Fix 17 pre-existing `tsc` errors** — 10 in `frameExtractor.ts`, 7 in `maskWorker.ts`. *(Baseline is now **12**: 5 + 7. `maskWorker.ts` was confirmed dead code in Round 1 — nothing imports it — so deleting it alone takes 12 → 5; also PERF/UX backlog #5.)* Either fix the types or silence with `// @ts-expect-error`. → **Phase 7A-5 (PLANNED; sequenced LAST)** — sole item permitted to change the tsc=17 baseline (target 0); ~5 trivial fixes, ~12 need real type-narrowing (do NOT blanket-suppress; may mask latent bugs).
 13. **Address chunks-larger-than-500-kB Vite warning** — code splitting in `landing.tsx` or main bundle to reduce initial load size. → **Phase 7A-6 (PLANNED; low-risk only)** — 661KB single bundle; route-level `React.lazy` for AiSpokePage + TemplateMaskSpokePage, else defer.
 14. ~~**Delete `home.tsx` and any other legacy step containers in 4d**~~ — **DONE in Phase 4d-2 (2026-06-20).** `home.tsx` + `FileUpload.tsx` (home-only) deleted; `/app` route + `Home` import removed from `App.tsx`; `landing.tsx` CTA `/app`→`/upload`.
 16. **Remove dead `POST /api/videos/:jobId/process`** — examined during Phase 4d-2: zero client callers (no constructor in `client/src`; the canonical processing path used by all spokes is `POST /api/jobs/:jobId/template-mask/apply`). It matches `/api/videos/`, so the empty live legacy sweep confirms no caller. Left in 4d-2 (not on the alias removal list) but it is dead legacy and can be deleted. → **Phase 7B-1 (gated; plan-only)** — current `routes.ts:437`; Phase 7 static sweep re-confirmed ZERO callers, but removal awaits a live-log no-hit gate across the testing period (HTTP 200 ≠ removal proof — SPA catch-all).
 15. **Download/ZIP handler has same masked-vs-raw asymmetry** — the `GET /api/jobs/:jobId/template-mask/download` handler reads from `SPOKE_TEMPLATE_MASK_DIR` only. If no template mask was applied, it returns 404. Same pattern as the AI inference handler before hotfix 4 added the raw-frame fallback. Decide whether downloads should also fall back to raw extracted frames (exporting unmasked frames) or whether "no mask applied → no download" is correct UX. → **Phase 7B-4 (operator decision)** — whole-job 404 at `routes.ts:552–554`; options: unify raw fallback vs leave documented (proposal recommends leaving documented).
 17. **Socket.IO CORS is wide open** — `routes.ts:100–102` initializes the Socket.IO server with `cors: { origin: "*" }`. Tighten to the known frontend origin(s) before/at commercial launch. (Logged during Phase 5B; not in 5B Deploy 1 scope.) → **Phase 7A-1 (PLANNED)** — env-driven allow-list, prod default `https://masqueradeimage.com`; ⚠️ smoke test = real upload w/ live progress from prod domain.
-18. **Restart mid-extraction leaves a silent dead-end job** — surfaced by Round 2A (frame-0 unblock), **ACCEPTED AS-IS by operator decision 2026-08-30**, logged here rather than fixed. `temp_extracted/` is not purged at boot (only `uploads/` and `temp_processed/` are — `index.ts:125-126`), job status is durable in Postgres since 5C-2, and nothing reconciles stale `'extracting'` jobs at startup. So if the server restarts mid-extraction *after* at least one 15-frame batch landed (the common case), the Round 2A frames endpoint correctly serves `frame_000001.png` (`routes.ts:1623-1643`) — the hub tile is open, the canvas paints, the user can draw — but `status` never reaches `'ready'`, so Apply stays disabled forever behind "Extracting frames…" with no error. **Not a regression:** `uploads/` was purged at boot, so that job could never have applied either way; before 2A the hub tile was simply locked, so the user never got in. If the restart landed *before* the first batch, the spoke's 120 s poll cap fires and shows the existing error state — that sub-case is already handled. → **Future pass (not scheduled).** Two candidate fixes, both outside Round 2A's scope: (a) a startup reconciliation pass marking stale `'extracting'` jobs `'failed'` — touches status semantics, so A3-adjacent and needs its own gate; (b) a client-side staleness timeout in the spoke that surfaces "extraction stalled" when `status` hasn't moved for N minutes — client-only, cheaper, but cosmetic. See `docs/refactor/ROUND2A_REPORT.md` §3.
+18. **Restart mid-extraction leaves a silent dead-end job** *(= PERF/UX backlog #3)* — surfaced by Round 2A (frame-0 unblock), **ACCEPTED AS-IS by operator decision 2026-08-30**, logged here rather than fixed. `temp_extracted/` is not purged at boot (only `uploads/` and `temp_processed/` are — `index.ts:125-126`), job status is durable in Postgres since 5C-2, and nothing reconciles stale `'extracting'` jobs at startup. So if the server restarts mid-extraction *after* at least one 15-frame batch landed (the common case), the Round 2A frames endpoint correctly serves `frame_000001.png` (`routes.ts:1623-1643`) — the hub tile is open, the canvas paints, the user can draw — but `status` never reaches `'ready'`, so Apply stays disabled forever behind "Extracting frames…" with no error. **Not a regression:** `uploads/` was purged at boot, so that job could never have applied either way; before 2A the hub tile was simply locked, so the user never got in. If the restart landed *before* the first batch, the spoke's 120 s poll cap fires and shows the existing error state — that sub-case is already handled. → **Future pass (not scheduled).** Two candidate fixes, both outside Round 2A's scope: (a) a startup reconciliation pass marking stale `'extracting'` jobs `'failed'` — touches status semantics, so A3-adjacent and needs its own gate; (b) a client-side staleness timeout in the spoke that surfaces "extraction stalled" when `status` hasn't moved for N minutes — client-only, cheaper, but cosmetic. See `docs/refactor/ROUND2A_REPORT.md` §3.
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0
 
