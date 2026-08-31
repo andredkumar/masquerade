@@ -19,6 +19,22 @@ interface TransformationMatrix {
   offsetY: number;
 }
 
+/**
+ * The per-apply mask, built once (2B-3a).
+ *
+ * `blackOverlay` is the form the per-frame libvips composite consumes: pure
+ * black RGB with the mask's alpha, so `composite(blend:'over')` blacks out
+ * exactly the pixels the old JS loop zeroed. `maskRgba` is retained because the
+ * per-stack fallback path still expects the original RGBA raster.
+ */
+interface ApplyMask {
+  width: number;
+  height: number;
+  maskRgba: Buffer;
+  blackOverlay: Buffer;
+  maskedPixels: number;
+}
+
 interface CoordinateTransformParams {
   maskData: MaskData;
   frameWidth: number;
@@ -418,6 +434,16 @@ export class VideoProcessor {
         totalFrames: extractedCount
       });
 
+      // ── 2B-3a: build the mask ONCE per apply ─────────────────────────
+      // It used to be rebuilt inside every processFrameBatch call — 58 times
+      // for this clip — and each build runs a synchronous ~1.2M-iteration JS
+      // loop (createMaskFromBase64's red-dominance detection). That is what made
+      // `mask_build_ms` climb linearly with stack index (734 ms → 5788 ms): 58
+      // stacks queueing on the one thread that matters. The mask is a static
+      // shape and every frame in an apply shares the source dimensions, so one
+      // build serves the whole run.
+      const prebuiltMask = await this.buildApplyMask(jobId, extractedBuffers[0], maskData);
+
       // Create frame batches OVER the already-extracted frame list
       const batchSize = outputSettings.batchSize || 12;
       const batches = this.createFrameBatches(extractedCount, batchSize);
@@ -440,7 +466,8 @@ export class VideoProcessor {
         extractedBuffers,
         batches,
         maskData,
-        outputSettings
+        outputSettings,
+        prebuiltMask
       );
 
       await this.updateProgress(jobId, { stage: 'exporting', progress: 90 });
@@ -557,6 +584,55 @@ export class VideoProcessor {
           console.warn(`⚠️  Failed to clean up apply staging dir ${extractedFramesDir}:`, cleanupErr);
         }
       }
+    }
+  }
+
+  /**
+   * 2B-3a — build the apply's mask raster once, from frame 0's dimensions.
+   *
+   * Returns null (rather than throwing) if anything goes wrong; the caller then
+   * falls back to the pre-2B-3a per-stack build, so a mask-prebuild failure can
+   * never fail an apply that would otherwise have worked.
+   */
+  private async buildApplyMask(
+    jobId: string,
+    firstFrame: Buffer,
+    maskData: MaskData,
+  ): Promise<ApplyMask | null> {
+    const end = perfSpan(jobId, 'apply.mask_build');
+    try {
+      const meta = await Sharp(firstFrame).metadata();
+      const width = meta.width || 0;
+      const height = meta.height || 0;
+      if (width <= 0 || height <= 0) {
+        end({ ok: false, reason: 'no_dimensions' });
+        return null;
+      }
+
+      const maskRgba = await this.createMaskRgbaBuffer(maskData, width, height);
+
+      // Pure black with the mask's alpha. `composite(blend:'over')` with this
+      // overlay is byte-for-byte the old loop's `if (alpha > 0) rgb = 0`
+      // (verified: max abs diff 0 over 3,048,516 bytes — see ROUND2B3A_REPORT).
+      const pixels = width * height;
+      const blackOverlay = Buffer.alloc(pixels * 4);
+      let maskedPixels = 0;
+      for (let i = 0; i < pixels; i++) {
+        const a = maskRgba[i * 4 + 3];
+        if (a > 0) {
+          // The old loop was a binary test on `alpha > 0`, so the overlay is
+          // binary too — never a partial alpha that would blend instead of black.
+          blackOverlay[i * 4 + 3] = 255;
+          maskedPixels++;
+        }
+      }
+
+      end({ ok: true, w: width, h: height, masked_px: maskedPixels, total_px: pixels });
+      console.log(`🎭 Mask built once for this apply: ${width}x${height}, ${maskedPixels}/${pixels} px masked (${((maskedPixels / pixels) * 100).toFixed(2)}%)`);
+      return { width, height, maskRgba, blackOverlay, maskedPixels };
+    } catch (err) {
+      end({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+      return null;
     }
   }
 
@@ -1133,7 +1209,8 @@ export class VideoProcessor {
     extractedBuffers: Buffer[],
     batches: Array<{ start: number; end: number }>,
     maskData: MaskData,
-    outputSettings: OutputSettings
+    outputSettings: OutputSettings,
+    prebuiltMask: ApplyMask | null = null,
   ): Promise<Array<{ frameNumber: number; buffer: Buffer }>> {
     console.log(`=== PROCESSING ${extractedBuffers.length} PRE-EXTRACTED FRAMES IN ${batches.length} BATCH(ES) ===`);
 
@@ -1185,7 +1262,7 @@ export class VideoProcessor {
           jobId,
           stackIdx: perfStackIdx++,
           batchIdx: batchIndex,
-        });
+        }, prebuiltMask);
 
         if (global.gc) global.gc();
 
@@ -1383,6 +1460,9 @@ export class VideoProcessor {
   // path (processFrameBuffersInParallel) passes it, so the images/legacy call
   // sites are unchanged and emit nothing.
   perf?: { jobId: string; stackIdx: number; batchIdx: number },
+  // 2B-3a: the mask built once per apply. Null (or a dimension mismatch) falls
+  // back to the pre-2B-3a per-stack build below.
+  prebuiltMask: ApplyMask | null = null,
   ): Promise<Array<{ success: boolean; processedBuffer: Buffer; error?: string; frameNumber: number }>> {
     const endStack = perf
       ? perfSpan(perf.jobId, 'apply.stack', {
@@ -1441,11 +1521,28 @@ export class VideoProcessor {
       const volumeHeight = frameMetadata[0].height;
       const volumeDepth = tasks.length;
       
-      console.log('🎭 Creating volumetric mask for entire batch...');
-      const tMaskBuild = process.hrtime.bigint();
-      const maskRgba = await this.createMaskRgbaBuffer(firstTask.maskData, volumeWidth, volumeHeight);
-      const maskBuildMs = Number(process.hrtime.bigint() - tMaskBuild) / 1e6;
-      console.log(`🎭 Mask created: ${maskRgba.length} bytes, will be applied to ${volumeDepth} layers`);
+      // 2B-3a: normally the mask arrives prebuilt (one build per apply). The
+      // per-stack build survives only as the fallback for a stack whose frames
+      // don't match frame 0's dimensions, or if the prebuild failed.
+      const maskFits = !!prebuiltMask
+        && prebuiltMask.width === volumeWidth
+        && prebuiltMask.height === volumeHeight;
+      let maskRgba: Buffer;
+      let blackOverlay: Buffer | null = null;
+      let maskedPixelsTotal: number;
+      let maskBuildMs = 0;
+      if (maskFits && prebuiltMask) {
+        maskRgba = prebuiltMask.maskRgba;
+        blackOverlay = prebuiltMask.blackOverlay;
+        maskedPixelsTotal = prebuiltMask.maskedPixels;
+      } else {
+        console.log('🎭 Creating volumetric mask for entire batch (fallback — no usable prebuilt mask)...');
+        const tMaskBuild = process.hrtime.bigint();
+        maskRgba = await this.createMaskRgbaBuffer(firstTask.maskData, volumeWidth, volumeHeight);
+        maskBuildMs = Number(process.hrtime.bigint() - tMaskBuild) / 1e6;
+        maskedPixelsTotal = -1; // counted per frame by the JS loop below
+      }
+      console.log(`🎭 Mask ${maskFits ? 'reused (prebuilt once per apply)' : 'rebuilt for this stack'}: ${maskRgba.length} bytes, applied to ${volumeDepth} layers`);
       
       // Step 3: Apply mask transformation to entire 3D volume simultaneously  
       console.log('⚡ Applying volumetric mask transformation...');
@@ -1456,30 +1553,46 @@ export class VideoProcessor {
       // Process all frames in parallel using the same mask
       const volumeProcessingPromises = frameBuffers.map(async (framePixels, frameIndex) => {
         const frameNumber = tasks[frameIndex].frameNumber;
-        let maskedPixels = 0;
+        // 2B-3a: the masking itself moves off the Node main thread. The loop
+        // below ran ~1.2M iterations per frame — ~10 ms x 348 frames of
+        // JavaScript that no amount of libvips concurrency could touch.
+        // `composite(blend:'over')` with a pure-black overlay carrying the
+        // mask's alpha is byte-for-byte identical (verified: max abs diff 0
+        // over 3,048,516 bytes — see ROUND2B3A_REPORT.md) and runs inside
+        // libvips' own threads.
+        //
+        // The JS loop is kept for the one case the composite cannot reproduce
+        // exactly: a frame WITH an alpha channel, where the old loop zeroed RGB
+        // but left A untouched. Extracted frames are RGB (ffmpeg -pix_fmt
+        // rgb24; the DICOM writer emits 3-channel), so this is a guard against
+        // an unexpected input, not a live path.
+        const useVips = blackOverlay !== null && imageChannels === 3;
+        let maskedPixels = maskedPixelsTotal;
         const tMask = process.hrtime.bigint();
+        if (!useVips) {
+          maskedPixels = 0;
+          // Apply the same mask to this frame layer
+          for (let i = 0; i < pixelsPerFrame; i++) {
+            const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha
 
-        // Apply the same mask to this frame layer
-        for (let i = 0; i < pixelsPerFrame; i++) {
-          const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha
-          
-          if (maskAlpha > 0) {
-            const pixelIndex = i * imageChannels;
-            framePixels[pixelIndex] = 0;     // Red = 0 (black)
-            framePixels[pixelIndex + 1] = 0; // Green = 0 (black) 
-            framePixels[pixelIndex + 2] = 0; // Blue = 0 (black)
-            maskedPixels++;
+            if (maskAlpha > 0) {
+              const pixelIndex = i * imageChannels;
+              framePixels[pixelIndex] = 0;     // Red = 0 (black)
+              framePixels[pixelIndex + 1] = 0; // Green = 0 (black)
+              framePixels[pixelIndex + 2] = 0; // Blue = 0 (black)
+              maskedPixels++;
+            }
           }
         }
-        
+
         const maskMs = Number(process.hrtime.bigint() - tMask) / 1e6;
 
-        console.log(`🎯 Frame ${frameNumber}: ${maskedPixels}/${pixelsPerFrame} pixels masked (${((maskedPixels/pixelsPerFrame)*100).toFixed(2)}%)`);
-        
+        console.log(`\u{1F3AF} Frame ${frameNumber}: ${maskedPixels}/${pixelsPerFrame} pixels masked (${((maskedPixels/pixelsPerFrame)*100).toFixed(2)}%) [${useVips ? 'vips' : 'js'}]`);
+
         // Step 4: Use Sharp pipeline for optimized output generation
         const outputSettings = tasks[frameIndex].outputSettings;
         const outputSize = tasks[frameIndex].outputSize;
-        
+
         let processedImage = Sharp(framePixels, {
           raw: {
             width: volumeWidth,
@@ -1487,6 +1600,18 @@ export class VideoProcessor {
             channels: imageChannels as 1 | 2 | 3 | 4
           }
         });
+
+        if (useVips && blackOverlay) {
+          processedImage = processedImage
+            .composite([{
+              input: blackOverlay,
+              raw: { width: volumeWidth, height: volumeHeight, channels: 4 },
+              blend: 'over',
+            }])
+            // `over` with an alpha-carrying overlay promotes the frame to RGBA;
+            // the old loop returned 3 channels, so drop it back.
+            .removeAlpha();
+        }
         
         // CORRECTED 3D PIPELINE: Apply aspect ratio first, then output size
         // OUTPUT SETTINGS TAKE ABSOLUTE PRIORITY over mask data
@@ -1545,6 +1670,7 @@ export class VideoProcessor {
             stackIdx: perf.stackIdx,
             decode_ms: +(decodeMs[frameIndex] ?? 0).toFixed(1),
             mask_ms: +maskMs.toFixed(1),
+            mask_mode: useVips ? 'vips' : 'js',
             encode_ms: +encodeMs.toFixed(1),
             fmt: outFormat,
             w: volumeWidth,
@@ -1569,7 +1695,10 @@ export class VideoProcessor {
 
       endStack?.({
         decode_ms: +decodeMs.reduce((a, b) => a + b, 0).toFixed(1),
-        mask_build_ms: +maskBuildMs.toFixed(1),
+        // §2B-3a.1: the mask is built once per apply now (`apply.mask_build`),
+        // so this only appears when the per-stack fallback fired.
+        mask_source: maskFits ? 'prebuilt' : 'per_stack',
+        ...(maskFits ? {} : { mask_build_ms: +maskBuildMs.toFixed(1) }),
         outcome: 'ok',
       });
       return results;
