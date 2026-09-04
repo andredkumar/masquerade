@@ -73,16 +73,19 @@ export class TempFolderManager {
     jobId: string, 
     imageIndex: number, 
     imageBuffer: Buffer, 
-    originalName: string
+    originalName: string,
+    outputFormat: 'png' | 'jpg'
   ): Promise<string> {
     const folderPath = this.getJobTempFolder(jobId);
     
     // Ensure folder exists
     await fs.mkdir(folderPath, { recursive: true });
     
-    // Create filename with index and original name
-    const extension = path.extname(originalName) || '.png';
-    const filename = `image_${String(imageIndex + 1).padStart(3, '0')}_${path.basename(originalName, extension)}${extension}`;
+    // Backlog 22 — the extension follows the *encoder*, not the upload. Before this,
+    // a JPEG-encoded photo.png was saved as `.png`. Basename still comes from the
+    // upload. Mirrors the video path's `ext` at videoProcessor.ts:516.
+    const extension = outputFormat === 'png' ? '.png' : '.jpg';
+    const filename = `image_${String(imageIndex + 1).padStart(3, '0')}_${path.basename(originalName, path.extname(originalName))}${extension}`;
     const filePath = path.join(folderPath, filename);
     
     await fs.writeFile(filePath, imageBuffer);

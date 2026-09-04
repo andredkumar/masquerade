@@ -817,6 +817,9 @@ export class VideoProcessor {
         outputSize = { width: 512, height: 512 };
       }
       
+      // Extension follows the encoder, not the upload (backlog 22).
+      const outputExt: 'png' | 'jpg' = outputSettings.format === 'png' ? 'png' : 'jpg';
+
       // OPTIMIZED BATCH PROCESSING: Reduced batch size for better memory management
       const VOLUME_BATCH_SIZE = 8; // Reduced from 20 to 8 for better performance
       const startTime = Date.now();
@@ -866,7 +869,8 @@ export class VideoProcessor {
                 jobId,
                 globalIndex,
                 result.processedBuffer,
-                originalName
+                originalName,
+                outputExt
               );
               
               // Collect processed image data for CSV generation
@@ -926,7 +930,7 @@ export class VideoProcessor {
                 const fileList = job.fileList as any[];
                 const originalName = fileList[i]?.originalName || `image_${i + 1}.png`;
                 
-                await TempFolderManager.saveProcessedImage(jobId, i, result.processedBuffer, originalName);
+                await TempFolderManager.saveProcessedImage(jobId, i, result.processedBuffer, originalName, outputExt);
                 processedImages.push({ imageNumber: i, buffer: result.processedBuffer, originalName });
                 processedCount++;
                 
@@ -2054,9 +2058,14 @@ export class VideoProcessor {
         console.log('⚡ Pipeline: Original size - no resize needed');
       }
 
-      // PIPELINE STEP 3: Convert to PNG and output
-      console.log('⚡ Pipeline final step: Converting to PNG buffer');
-      const processedBuffer = await processedImage.png().toBuffer();
+      // PIPELINE STEP 3: encode to the requested output format (backlog 22).
+      // Same constants as the batch encoder at :1783 — JPEG q90 default,
+      // PNG compressionLevel 3 / no adaptive filtering when the user picks PNG.
+      const outFormat: 'png' | 'jpeg' = outputSettings.format === 'png' ? 'png' : 'jpeg';
+      console.log(`⚡ Pipeline final step: Converting to ${outFormat} buffer`);
+      const processedBuffer = outFormat === 'png'
+        ? await processedImage.png({ compressionLevel: 3, adaptiveFiltering: false }).toBuffer()
+        : await processedImage.jpeg({ quality: 90 }).toBuffer();
       
       // DEBUGGING: Export processed frame #1 for comparison
       if (frameNumber === 0) {
