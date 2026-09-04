@@ -11,6 +11,9 @@ import type { MaskData, OutputSettings } from "@shared/schema";
 
 type FrameStatus = "loading" | "ready" | "extracting" | "not_found" | "gone" | "error";
 
+/** `reason` from the frames endpoint's 410 body (routes.ts, item 28). */
+type GoneReason = "uploads_swept" | "frames_swept" | null;
+
 // Round 2A: how long the spoke waits for frame 1 to appear before giving up.
 // Only reachable if the user opens the spoke faster than the first extraction
 // batch lands, or if extraction died without updating status (see §4 of
@@ -25,6 +28,10 @@ export default function TemplateMaskSpokePage() {
   // Local state
   const [firstFrame, setFirstFrame] = useState<string | null>(null);
   const [frameStatus, setFrameStatus] = useState<FrameStatus>("loading");
+  // Item 28: the 410 body now carries a `reason` so the panel can say which
+  // retention window elapsed. Absent (older server, or an unexpected 410) →
+  // null → the generic copy.
+  const [goneReason, setGoneReason] = useState<GoneReason>(null);
   const [maskData, setMaskData] = useState<MaskData | null>(null);
   const [selectedTool, setSelectedTool] = useState<string>("rectangle");
   const [canvasZoom, setCanvasZoom] = useState(75);
@@ -78,6 +85,20 @@ export default function TemplateMaskSpokePage() {
       } else if (res.status === 404) {
         setFrameStatus("not_found");
       } else if (res.status === 410) {
+        // Item 28: read the cause rather than asserting a restart. The old
+        // hardcoded "the server may have restarted" was shown for every 410,
+        // including image batches where nothing had restarted and nothing had
+        // been swept — it cost an hour of live misdiagnosis on 2026-09-04.
+        let reason: GoneReason = null;
+        try {
+          const body = await res.json();
+          if (body?.reason === "uploads_swept" || body?.reason === "frames_swept") {
+            reason = body.reason;
+          }
+        } catch {
+          /* body is advisory only — a parse failure falls back to generic copy */
+        }
+        setGoneReason(reason);
         setFrameStatus("gone");
       } else {
         setFrameStatus("error");
@@ -203,9 +224,17 @@ export default function TemplateMaskSpokePage() {
       <div className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center space-y-3 max-w-sm">
           <AlertCircle className="mx-auto text-destructive" size={32} />
-          <p className="text-sm font-medium">Frames are no longer available</p>
+          <p className="text-sm font-medium">
+            {goneReason === "uploads_swept"
+              ? "Your uploaded images are no longer on the server"
+              : "Frames are no longer available"}
+          </p>
           <p className="text-xs text-muted-foreground">
-            The server may have restarted. Please re-upload your file.
+            {goneReason === "uploads_swept"
+              ? "Uploads are kept for 2 hours. Please re-upload your images."
+              : goneReason === "frames_swept"
+                ? "Extracted frames are kept for 6 hours, and are lost if the server restarts mid-extraction. Please re-upload your file."
+                : "The server may have restarted. Please re-upload your file."}
           </p>
           <Button variant="outline" onClick={() => window.location.assign("/upload")}>
             Back to Upload

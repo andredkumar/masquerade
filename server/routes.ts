@@ -27,6 +27,7 @@ import {
   colorForLabelId,
   isCompletePngBuffer,
   mimeForFrameFile,
+  resolveImageBatchFrame,
 } from "./services/frameAccess";
 import { aiRunDir } from "./services/applyPaths";
 import Sharp from "sharp";
@@ -1613,6 +1614,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.send(buffer);
       }
 
+      // ── Image-batch source (originals in uploads/) — item 28 ──────
+      // Image batches have no extraction step, so temp_extracted/<jobId>/ never
+      // exists and the raw branch below would fall through to its trailing 410
+      // for every image job — which is how the entire image feature became
+      // unreachable: the canvas could not paint, so the user could never draw a
+      // mask, so Apply never enabled. Apply itself was always fine
+      // (templateMaskApply.ts:82, reading the same uploads/ files in the same
+      // fileList order); it was sitting behind a door that would not open.
+      //
+      // Detection is the V2 source type. The legacy `jobType` is deliberately
+      // not consulted; the only legacy read is `fileList`, which lives on
+      // VideoJob (schema.ts:130 / jobs.file_list) and has no V2 counterpart —
+      // JobSource carries dimensions and type, not the manifest.
+      //
+      // Ordering note: this sits AFTER the ?source=template_mask branch, so an
+      // applied image job still shows its masked frame there, and BEFORE
+      // listRawFrameFiles, which has nothing to offer these jobs.
+      if (jobV2.source.type === 'image_batch') {
+        const legacyJob = await storage.getVideoJob(jobId);
+        const resolved = await resolveImageBatchFrame(legacyJob?.fileList, frameNumber);
+        if (!resolved.ok) {
+          if (resolved.kind === 'out_of_range') {
+            return res.status(404).json({ error: "Frame not found" });
+          }
+          // The entry exists but the bytes do not: uploads/ has a 2 h retention
+          // and is purged at boot (UPLOADS_MAX_AGE_MS, cleanup.ts:54). Here
+          // "swept" is genuinely true — and Apply, reading the same directory,
+          // would fail for the same reason.
+          return res.status(410).json({
+            reason: 'uploads_swept',
+            error: "The uploaded images are no longer on the server. Uploads are kept for 2 hours; please re-upload.",
+          });
+        }
+        // Original bytes, no re-encode — the canvas only needs pixels.
+        const imageBuffer = await fsPromises.readFile(resolved.absPath);
+        res.set("Content-Type", resolved.contentType);
+        res.set("Cache-Control", "private, max-age=3600");
+        return res.send(imageBuffer);
+      }
+
       // ── Raw source (on-disk extracted frames, Phase 4b-0) ─────────
       // Raw frames live at temp_extracted/<jobId>/frame_NNNNNN.png, written by
       // startBackgroundFrameExtraction. listRawFrameFiles handles
@@ -1655,8 +1696,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!rawFiles.length) {
         // Directory absent or empty: frames were swept (6h retention) or the
         // server restarted before extraction completed.
+        //
+        // Item 28 narrowed this. It used to be a catch-all that also swallowed
+        // every image-batch job — for which nothing had been swept and nothing
+        // had restarted — and the resulting "the server may have restarted"
+        // sent an operator to PM2 for an hour. Image batches now have their own
+        // branch above, so for the video/DICOM jobs that still reach here the
+        // claim is true. `reason` lets the client pick honest copy per cause.
         return res.status(410).json({
-          error: "Frames are no longer available. The server may have restarted.",
+          reason: 'frames_swept',
+          error: "Frames are no longer available. Extracted frames are kept for 6 hours, and are lost if the server restarts mid-extraction.",
         });
       }
       if (frameNumber >= rawFiles.length) {

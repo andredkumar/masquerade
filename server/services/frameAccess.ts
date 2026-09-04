@@ -13,7 +13,7 @@
 
 import path from 'path';
 import { promises as fs } from 'fs';
-import { SPOKE_TEMPLATE_MASK_DIR, TEMP_EXTRACTED_DIR } from './cleanup';
+import { SPOKE_TEMPLATE_MASK_DIR, TEMP_EXTRACTED_DIR, UPLOADS_DIR, resolveWithinRoot } from './cleanup';
 
 /**
  * Resolve the absolute path of a single processed frame and validate it sits
@@ -177,6 +177,102 @@ export function mimeForFrameFile(filenameOrPath: string): string {
   const ext = path.extname(filenameOrPath).toLowerCase();
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
   return 'image/png';
+}
+
+/**
+ * One entry of `VideoJob.fileList`, narrowed from the record's `unknown`.
+ *
+ * Written by `imageUploadHandler` (routes.ts) from multer's per-file metadata:
+ * `filename` is multer's random hash under `uploads/`, `originalName` is what
+ * the user's browser called it, `type` is the browser-supplied mimetype.
+ */
+export interface ImageBatchEntry {
+  filename: string;
+  originalName?: string;
+  type?: string;
+}
+
+/** Outcome of {@link resolveImageBatchFrame}; the caller maps kinds to statuses. */
+export type ImageFrameResolution =
+  | { ok: true; absPath: string; contentType: string }
+  | { ok: false; kind: 'out_of_range' }   // → 404: no such frame in this batch
+  | { ok: false; kind: 'missing_file' };  // → 410: entry exists, bytes are gone
+
+/**
+ * Browser-supplied mimetypes we are willing to echo back as `Content-Type`.
+ *
+ * `imageUpload.fileFilter` (routes.ts) admits a file when the mimetype is
+ * allowed OR the filename ends in .png/.jpg/.jpeg — so `photo.png` uploaded
+ * with `Content-Type: text/html` passes the filter and lands in `fileList`
+ * with `type: 'text/html'`. Reflecting that verbatim would serve attacker
+ * bytes as HTML from this app's own origin. Allowlist, then fall back to the
+ * extension.
+ */
+const SERVABLE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/jpg']);
+
+/**
+ * Content-Type for an image-batch entry: the declared mimetype only if it is a
+ * real image type, otherwise derived from the original filename's extension.
+ */
+function contentTypeForEntry(entry: ImageBatchEntry): string {
+  const declared = typeof entry.type === 'string' ? entry.type.toLowerCase().trim() : '';
+  if (SERVABLE_IMAGE_MIMES.has(declared)) {
+    return declared === 'image/jpg' ? 'image/jpeg' : declared;
+  }
+  return mimeForFrameFile(entry.originalName ?? entry.filename);
+}
+
+/**
+ * Resolve image-batch frame `frameIndex` to its original file in `uploads/`.
+ *
+ * Item 28. Image batches have no extraction step — multer writes
+ * `uploads/<hash>` and `imageUploadHandler` creates the job at `status:'ready'`
+ * — so `temp_extracted/<jobId>/` never exists and the frames endpoint's raw
+ * branch has nothing to read. That is why every image job hit the trailing 410
+ * and the whole image feature was unreachable: the canvas could not paint, so
+ * the user could never draw a mask, so Apply never enabled.
+ *
+ * Indexed STRICTLY by `fileList` order, never by a directory listing.
+ * `uploads/` interleaves every job's files, and `processImages` masks in
+ * `fileList` order (videoProcessor.ts:827-846, `frameNumber = volumeStart + i`),
+ * so `fileList[i]` IS by construction the source of masked output `i`. Sorting
+ * the hashes would silently mis-pair the canvas with the output.
+ *
+ * The original bytes are served as-is: the canvas needs pixels, and a Sharp
+ * round-trip on a 1-physical-core box is exactly the cost this path does not
+ * need.
+ *
+ * `missing_file` is the `uploads/` 2 h retention sweep (UPLOADS_MAX_AGE_MS,
+ * cleanup.ts:54 — the shortest window in the system, because it holds PHI).
+ * Apply already fails the same way for such a job; this makes the canvas agree
+ * with Apply rather than failing at minute zero.
+ */
+export async function resolveImageBatchFrame(
+  fileList: unknown,
+  frameIndex: number,
+): Promise<ImageFrameResolution> {
+  if (!Number.isInteger(frameIndex) || frameIndex < 0) return { ok: false, kind: 'out_of_range' };
+  if (!Array.isArray(fileList)) return { ok: false, kind: 'out_of_range' };
+  if (frameIndex >= fileList.length) return { ok: false, kind: 'out_of_range' };
+
+  const entry = fileList[frameIndex] as ImageBatchEntry | null | undefined;
+  if (!entry || typeof entry.filename !== 'string' || !entry.filename) {
+    return { ok: false, kind: 'out_of_range' };
+  }
+
+  // House rule for every jobId/filename boundary (cleanup.ts, 5B-1a). The
+  // names are multer hashes, but a tampered record must not escape uploads/.
+  // A refusal is "no such frame", not a 500 — never surface the boundary error.
+  let absPath: string;
+  try {
+    absPath = resolveWithinRoot(UPLOADS_DIR, entry.filename);
+  } catch {
+    return { ok: false, kind: 'out_of_range' };
+  }
+
+  if (!(await frameExists(absPath))) return { ok: false, kind: 'missing_file' };
+
+  return { ok: true, absPath, contentType: contentTypeForEntry(entry) };
 }
 
 /**
