@@ -169,7 +169,10 @@ app.use((req, res, next) => {
   server.listen({
     port,
     host: "0.0.0.0",
-    reusePort: true,
+    // SO_REUSEPORT is a Linux feature here; on macOS Node ≥ 23 rejects the option with
+    // ENOTSUP before binding, which made the server unbootable on a dev Mac (sandbox recon,
+    // docs/refactor/AUTOMASK_SANDBOX_RECON.md). Prod (Ubuntu) is unchanged.
+    reusePort: process.platform === "linux",
   }, async () => {
     log(`serving on port ${port}`);
     
