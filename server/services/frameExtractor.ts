@@ -123,7 +123,7 @@ export class FrameExtractor {
         const rows = dataset.Rows || 512;
         const cols = dataset.Columns || 512;
         const bitsAllocated = dataset.BitsAllocated || 16;
-        const expectedBytesPerFrame = rows * cols * (bitsAllocated / 8);
+        const expectedBytesPerFrame = rows * cols * (bitsAllocated / 8) * (dataset.SamplesPerPixel || 1);
         
         let pixelDataSize = 0;
         if (dataset.PixelData instanceof ArrayBuffer) {
@@ -379,6 +379,11 @@ export class FrameExtractor {
       const rows = dataset.Rows || 512;
       const cols = dataset.Columns || 512;
       const bitsAllocated = dataset.BitsAllocated || 16;
+      // Item 5 (docs/refactor/ITEM5_RGB_DICOM_VERIFICATION.md): colour DICOM carries SamplesPerPixel 3, so a
+      // frame is rows × cols × samples bytes. Sizing it by rows × cols alone read one third of the
+      // interleaved RGB and rendered it as mono — every colour-Doppler upload showed a garbled frame.
+      const samplesPerPixel = dataset.SamplesPerPixel || 1;
+      const planarConfiguration = dataset.PlanarConfiguration || 0;
       const totalFrames = this.detectDicomFrameCount(dataset);
       
       if (frameIndex >= totalFrames) {
@@ -393,7 +398,7 @@ export class FrameExtractor {
       }
       
       // Calculate frame offset
-      const bytesPerFrame = rows * cols * (bitsAllocated / 8);
+      const bytesPerFrame = rows * cols * (bitsAllocated / 8) * samplesPerPixel;
       const frameOffset = frameIndex * bytesPerFrame;
       
       console.log(`🗢️ Extracting DICOM frame ${frameIndex}/${totalFrames - 1} (offset: ${frameOffset}, size: ${bytesPerFrame})`);
@@ -530,7 +535,7 @@ export class FrameExtractor {
       console.log(`✅ Successfully extracted ${framePixelData.length} bytes for frame ${frameIndex}`);
       
       // Process the frame data using existing logic from extractDicomImage
-      return this.processDicomPixelDataHelper(dataset, framePixelData, rows, cols, bitsAllocated);
+      return this.processDicomPixelDataHelper(dataset, framePixelData, rows, cols, bitsAllocated, samplesPerPixel, planarConfiguration);
       
     } catch (error) {
       console.error(`Error extracting DICOM frame ${frameIndex}:`, error);
@@ -540,7 +545,7 @@ export class FrameExtractor {
   }
 
   // 🔧 Helper to try raw DICOM pixel data extraction
-  private async tryRawDicomPixelData(dataSet: any, frameIndex: number, rows: number, cols: number, bitsAllocated: number): Promise<Buffer> {
+  private async tryRawDicomPixelData(dataSet: any, frameIndex: number, rows: number, cols: number, bitsAllocated: number, samplesPerPixel: number = 1, planarConfiguration: number = 0): Promise<Buffer> {
     try {
       const rawPixelData = dataSet.dict['7FE00010']; // Pixel Data tag
       if (rawPixelData && rawPixelData.Value) {
@@ -557,8 +562,8 @@ export class FrameExtractor {
           throw new Error('Cannot access raw pixel data');
         }
         
-        // Calculate frame offset and extract
-        const bytesPerFrame = rows * cols * (bitsAllocated / 8);
+        // Calculate frame offset and extract (item 5: samples-aware)
+        const bytesPerFrame = rows * cols * (bitsAllocated / 8) * samplesPerPixel;
         const frameOffset = frameIndex * bytesPerFrame;
         
         if (pixelBuffer.byteLength >= frameOffset + bytesPerFrame) {
@@ -577,7 +582,7 @@ export class FrameExtractor {
             WindowWidth: null
           };
           
-          return this.processDicomPixelDataHelper(mockDataset, framePixelData, rows, cols, bitsAllocated);
+          return this.processDicomPixelDataHelper(mockDataset, framePixelData, rows, cols, bitsAllocated, samplesPerPixel, planarConfiguration);
         }
       }
       
@@ -596,8 +601,28 @@ export class FrameExtractor {
   }
 
   // 🔧 Helper method to process DICOM pixel data
-  private async processDicomPixelDataHelper(dataset: any, pixelDataArray: Uint8Array, rows: number, cols: number, bitsAllocated: number): Promise<Buffer> {
+  private async processDicomPixelDataHelper(dataset: any, pixelDataArray: Uint8Array, rows: number, cols: number, bitsAllocated: number, samplesPerPixel: number = 1, planarConfiguration: number = 0): Promise<Buffer> {
     try {
+      // Item 5 — colour DICOM (SamplesPerPixel 3, 8-bit): emit an RGB PNG. PlanarConfiguration 1
+      // (RRR…GGG…BBB) is de-interleaved first. Mono data (1 sample) falls through to the path below,
+      // which is unchanged byte for byte.
+      if (samplesPerPixel === 3 && bitsAllocated === 8) {
+        const n = rows * cols;
+        let rgb: Uint8Array = pixelDataArray.subarray(0, n * 3);
+        if (planarConfiguration === 1) {
+          const out = new Uint8Array(n * 3);
+          for (let i = 0; i < n; i++) {
+            out[i * 3] = rgb[i];
+            out[i * 3 + 1] = rgb[n + i];
+            out[i * 3 + 2] = rgb[2 * n + i];
+          }
+          rgb = out;
+        }
+        return sharp(Buffer.from(rgb.buffer, rgb.byteOffset, n * 3), {
+          raw: { width: cols, height: rows, channels: 3 }
+        }).png().toBuffer();
+      }
+
       const bitsStored = dataset.BitsStored || bitsAllocated;
       const pixelRepresentation = dataset.PixelRepresentation || 0;
       const modality = dataset.Modality || '';
