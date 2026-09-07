@@ -1,0 +1,366 @@
+{
+ "bfly_z2": {
+  "note": "max-projection over 95 frames, fit at 2x, model=fan",
+  "keep": {
+   "kind": "fan_px",
+   "ax": 295.0,
+   "ay": -294.8,
+   "r_in": 293.1,
+   "r_out": 1127.9,
+   "th_l_deg": -18.94,
+   "th_r_deg": 22.99
+  }
+ },
+ "bfly_z2b": {
+  "note": "max-projection over 295 frames, fit at 2x, model=fan",
+  "keep": {
+   "kind": "fan_px",
+   "ax": 307.7,
+   "ay": -264.9,
+   "r_in": 264.3,
+   "r_out": 1181.5,
+   "th_l_deg": -22.4,
+   "th_r_deg": 23.35
+  }
+ },
+ "bfly_z3": {
+  "note": "max-projection over 124 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     734,
+     1022
+    ],
+    [
+     536,
+     1078
+    ],
+    [
+     0,
+     1026
+    ],
+    [
+     0,
+     450
+    ],
+    [
+     218,
+     0
+    ],
+    [
+     504,
+     0
+    ],
+    [
+     734,
+     444
+    ]
+   ]
+  }
+ },
+ "bfly_z7": {
+  "note": "max-projection over 110 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     628,
+     828
+    ],
+    [
+     432,
+     866
+    ],
+    [
+     80,
+     666
+    ],
+    [
+     58,
+     386
+    ],
+    [
+     188,
+     0
+    ],
+    [
+     432,
+     0
+    ]
+   ]
+  }
+ },
+ "bfly_z9": {
+  "note": "max-projection over 55 frames, fit at 2x, model=fan",
+  "keep": {
+   "kind": "fan_px",
+   "ax": 45.9,
+   "ay": -1058.9,
+   "r_in": 1064.1,
+   "r_out": 1562.5,
+   "th_l_deg": 8.73,
+   "th_r_deg": 19.14
+  }
+ },
+ "dcm_multi_114": {
+  "note": "max-projection over 114 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1052,
+     636
+    ],
+    [
+     670,
+     672
+    ],
+    [
+     0,
+     634
+    ],
+    [
+     0,
+     304
+    ],
+    [
+     174,
+     96
+    ],
+    [
+     876,
+     96
+    ],
+    [
+     1052,
+     388
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 0,
+   "y0": 40,
+   "x1": 1053,
+   "y1": 736
+  }
+ },
+ "dcm_multi_67": {
+  "note": "max-projection over 67 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1052,
+     656
+    ],
+    [
+     882,
+     672
+    ],
+    [
+     2,
+     482
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     704,
+     0
+    ],
+    [
+     872,
+     78
+    ],
+    [
+     1052,
+     432
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 0,
+   "y0": 40,
+   "x1": 1053,
+   "y1": 736
+  }
+ },
+ "dcm_single_mono": {
+  "note": "max-projection over 1 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1060,
+     688
+    ],
+    [
+     768,
+     736
+    ],
+    [
+     0,
+     700
+    ],
+    [
+     0,
+     374
+    ],
+    [
+     182,
+     166
+    ],
+    [
+     876,
+     166
+    ],
+    [
+     1048,
+     462
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 2,
+   "y0": 109,
+   "x1": 1055,
+   "y1": 805
+  }
+ },
+ "dcm_single_rgb": {
+  "note": "max-projection over 1 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1162,
+     134
+    ],
+    [
+     1162,
+     468
+    ],
+    [
+     1048,
+     702
+    ],
+    [
+     0,
+     552
+    ],
+    [
+     0,
+     374
+    ],
+    [
+     176,
+     168
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 2,
+   "y0": 109,
+   "x1": 1057,
+   "y1": 805
+  }
+ },
+ "neg_stairs": {
+  "note": "max-projection over 576 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1278,
+     718
+    ],
+    [
+     0,
+     718
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     1278,
+     0
+    ]
+   ]
+  }
+ },
+ "neg_stock": {
+  "note": "max-projection over 1706 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     638,
+     358
+    ],
+    [
+     0,
+     358
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     638,
+     0
+    ]
+   ]
+  }
+ },
+ "png_still": {
+  "note": "max-projection over 1 frames, fit at 2x, model=fan",
+  "keep": {
+   "kind": "fan_px",
+   "ax": 265.7,
+   "ay": -352.1,
+   "r_in": 348.5,
+   "r_out": 1141.3,
+   "th_l_deg": -14.05,
+   "th_r_deg": 22.84
+  }
+ },
+ "screenrec": {
+  "note": "max-projection over 704 frames, fit at 2x, model=quad",
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     1304,
+     24
+    ],
+    [
+     1206,
+     1078
+    ],
+    [
+     0,
+     1078
+    ],
+    [
+     0,
+     0
+    ]
+   ]
+  }
+ },
+ "sector_mov": {
+  "note": "max-projection over 229 frames, fit at 2x, model=fan",
+  "keep": {
+   "kind": "fan_px",
+   "ax": 490.8,
+   "ay": -208.4,
+   "r_in": 260.0,
+   "r_out": 970.7,
+   "th_l_deg": -24.73,
+   "th_r_deg": 27.75
+  }
+ }
+}

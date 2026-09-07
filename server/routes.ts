@@ -39,6 +39,7 @@ import archiver from "archiver";
 import { applyTemplateMask } from "./handlers/templateMaskApply";
 import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
 import { perfMark, perfSpan } from "./services/perf";
+import { getOrComputeProposal } from "./services/automask";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -484,6 +485,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   };
   app.get("/api/jobs/:jobId", getJobV2Handler);  // canonical — returns Job V2
+
+  // Auto-mask Round 2A — read-only proposal for the template-mask spoke (docs/refactor/AUTOMASK_ROUND2A_PROPOSAL.md
+  // v2 §2.3). Flag AUTOMASK off → {status:'none', reason:'disabled'} and no disk access. Always no-store: the result
+  // is cached on disk by the service (temp_extracted/<jobId>/automask.json) and re-proposed only when that file is
+  // deleted, so an hour of browser caching would only confuse tuning sessions. No UI reads this in 2A (2B does).
+  app.get("/api/jobs/:jobId/template-mask/proposal", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const proposal = await getOrComputeProposal(req.params.jobId);
+      if (!proposal) return res.status(404).json({ error: "Job not found" });
+      return res.json(proposal);
+    } catch (error) {
+      console.error("template-mask/proposal error:", error);
+      return res.json({ version: 2, status: "none", reason: "error", jobId: req.params.jobId, error: (error as Error).message ?? String(error) });
+    }
+  });
 
   // Start video processing with mask data
   app.post("/api/videos/:jobId/process", async (req, res) => {

@@ -1,0 +1,11 @@
+import dcmjs from 'dcmjs';
+import fs from 'fs';
+const f = process.argv[2];
+const buf = fs.readFileSync(f);
+const dataSet = dcmjs.data.DicomMessage.readFile(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+const ds = dcmjs.data.DicomMetaDictionary.naturalizeDataset(dataSet.dict);
+console.log('Rows/Cols', ds.Rows, ds.Columns, 'frames', ds.NumberOfFrames, 'spp', ds.SamplesPerPixel, 'PI', ds.PhotometricInterpretation);
+const seq = ds.SequenceOfUltrasoundRegions;
+console.log('SequenceOfUltrasoundRegions type:', Array.isArray(seq) ? 'array' : typeof seq, 'len', seq?.length);
+if (seq) for (const r of seq) console.log(JSON.stringify({fmt:r.RegionSpatialFormat, dt:r.RegionDataType, flags:r.RegionFlags, x0:r.RegionLocationMinX0, y0:r.RegionLocationMinY0, x1:r.RegionLocationMaxX1, y1:r.RegionLocationMaxY1, physUnitsX:r.PhysicalUnitsXDirection, dX:r.PhysicalDeltaX, dY:r.PhysicalDeltaY, refX:r.ReferencePixelX0, refY:r.ReferencePixelY0}));
+console.log('raw dict has 00186011:', !!dataSet.dict['00186011']);

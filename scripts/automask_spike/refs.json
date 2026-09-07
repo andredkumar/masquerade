@@ -1,0 +1,265 @@
+{
+ "_README": [
+  "REFERENCE keep-regions for the auto-mask spike. These are AGENT-AUTHORED, not Andre's hand-drawn masks:",
+  "no apply artifacts or drawn masks exist on this Mac (uploads/, temp_extracted/ empty). Method: max-intensity",
+  "projection over ALL frames -> same support/fit pipeline at 2x -> visual review on out/_refs/<clip>.png ->",
+  "hand-corrected where the automatic candidate followed echo content instead of the imaging geometry.",
+  "Coordinates are full-resolution frame pixels. fan_px: apex (ax,ay), radii, angles in degrees (0 = straight",
+  "down, + = right). poly_px: closed polygon. clip_to_box: intersect with the DICOM (0018,6011) region box.",
+  "'edited' says what was changed from refs_candidates.json and why. Replace with Andre's masks before sign-off."
+ ],
+ "bfly_z2": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 295.0,
+   "ay": -294.8,
+   "r_in": 293.1,
+   "r_out": 1127.9,
+   "th_l_deg": -18.94,
+   "th_r_deg": 22.99
+  },
+  "note": "candidate accepted (max-proj fan, verified)"
+ },
+ "bfly_z2b": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 307.7,
+   "ay": -264.9,
+   "r_in": 264.3,
+   "r_out": 1181.5,
+   "th_l_deg": -22.4,
+   "th_r_deg": 23.35
+  },
+  "note": "candidate accepted (max-proj fan, verified)"
+ },
+ "bfly_z3": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 356,
+   "ay": -285,
+   "r_in": 0,
+   "r_out": 1370,
+   "th_l_deg": -25.8,
+   "th_r_deg": 27.4
+  },
+  "note": "edited twice: candidate was a 7-vertex quad; cone is a fan clipped by the 736-px frame on both sides and at the top. Apex from the two visible side edges (218,0)-(0,450) and (504,0)-(734,444). FIRST hand version used the frame corners (0,1026)/(734,1022) for the angles (+/-15 deg) \u2014 wrong, those are frame edges not cone sides; the side lines themselves give -25.8/+27.4 deg, which is what the T1 fit had found. Corrected 2026-09-04 after the T1 'leak' on this clip turned out to be reference error."
+ },
+ "bfly_z7": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 291,
+   "ay": -629,
+   "r_in": 700,
+   "r_out": 1490,
+   "th_l_deg": -9.6,
+   "th_r_deg": 11.9
+  },
+  "note": "edited: candidate was a loose hexagon over patchy far-field speckle; fan fitted by hand to the visible side edges in the max projection (171,81)-(72,665) and (441,81)-(549,594), r_out at the deepest visible speckle (~y 863). Least certain reference in the set."
+ },
+ "bfly_z9": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 45.9,
+   "ay": -1058.9,
+   "r_in": 1064.1,
+   "r_out": 1562.5,
+   "th_l_deg": 8.73,
+   "th_r_deg": 19.14
+  },
+  "note": "candidate accepted: only the near field (1-6.5 cm) ever has echoes; a reviewer would draw around the visible content."
+ },
+ "sector_mov": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 490.8,
+   "ay": -208.4,
+   "r_in": 260.0,
+   "r_out": 970.7,
+   "th_l_deg": -24.73,
+   "th_r_deg": 27.75
+  },
+  "note": "candidate accepted (max-proj fan matches the sector edges and bottom arc)"
+ },
+ "png_still": {
+  "keep": {
+   "kind": "fan_px",
+   "ax": 265.7,
+   "ay": -352.1,
+   "r_in": 348.5,
+   "r_out": 1141.3,
+   "th_l_deg": -14.05,
+   "th_r_deg": 22.84
+  },
+  "note": "candidate accepted (single frame)"
+ },
+ "dcm_multi_67": {
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     160,
+     83
+    ],
+    [
+     873,
+     83
+    ],
+    [
+     1053,
+     440
+    ],
+    [
+     1053,
+     650
+    ],
+    [
+     0,
+     650
+    ],
+    [
+     0,
+     347
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 0,
+   "y0": 40,
+   "x1": 1053,
+   "y1": 736
+  },
+  "note": "edited: GE LOGIQ E9 virtual-convex trapezoid; candidate followed the echo-free bottom-left. Top edge at the 0-cm tick (y=83), straight bottom at y=650 (above the RT BT LONG annotation), sides clipped by the frame/region box."
+ },
+ "dcm_multi_114": {
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     174,
+     96
+    ],
+    [
+     876,
+     96
+    ],
+    [
+     1053,
+     400
+    ],
+    [
+     1053,
+     672
+    ],
+    [
+     0,
+     672
+    ],
+    [
+     0,
+     304
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 0,
+   "y0": 40,
+   "x1": 1053,
+   "y1": 736
+  },
+  "note": "edited: as dcm_multi_67 (same device/depth layout; 0-cm tick at y=96, bottom straightened at y=672)."
+ },
+ "dcm_single_mono": {
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     182,
+     166
+    ],
+    [
+     876,
+     166
+    ],
+    [
+     1055,
+     470
+    ],
+    [
+     1055,
+     732
+    ],
+    [
+     0,
+     732
+    ],
+    [
+     0,
+     360
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 2,
+   "y0": 109,
+   "x1": 1055,
+   "y1": 805
+  },
+  "note": "edited: trapezoid geometry; bottom straightened at y=732 (RT BT INJECTION annotation sits below at ~y 777 and is inside the (0018,6011) box but outside the reference)."
+ },
+ "dcm_single_rgb": {
+  "keep": {
+   "kind": "poly_px",
+   "pts": [
+    [
+     182,
+     166
+    ],
+    [
+     876,
+     166
+    ],
+    [
+     1057,
+     470
+    ],
+    [
+     1057,
+     712
+    ],
+    [
+     0,
+     712
+    ],
+    [
+     0,
+     360
+    ]
+   ]
+  },
+  "clip_to_box": {
+   "x0": 2,
+   "y0": 109,
+   "x1": 1057,
+   "y1": 805
+  },
+  "note": "edited: candidate's top edge was dragged to (1162,134) by the dense PDI parameter text right of the box; same trapezoid as dcm_single_mono. Colour-Doppler box is content and stays inside. Bottom raised to y=712: the RT BT LONG annotation sits at y~725-745 in this file (inside the (0018,6011) box)."
+ },
+ "neg_stock": {
+  "keep": {
+   "kind": "none"
+  },
+  "note": "negative control (stock footage): correct output is NO proposal"
+ },
+ "neg_stairs": {
+  "keep": {
+   "kind": "none"
+  },
+  "note": "negative control (phone video): correct output is NO proposal"
+ },
+ "screenrec": {
+  "keep": {
+   "kind": "none"
+  },
+  "note": "out-of-distribution (screen recording of the app UI with a cone inside): correct output is NO proposal"
+ }
+}

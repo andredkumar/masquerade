@@ -1,0 +1,38 @@
+{
+ "clip_id": "frame",
+ "w": 632,
+ "h": 1080,
+ "bound": null,
+ "margin_px": 2,
+ "tier": "T1",
+ "model": "fan_sym",
+ "conf": 0.9826,
+ "withheld": null,
+ "flag": null,
+ "keep": {
+  "kind": "fan",
+  "sym": true,
+  "ax": 315.3896611526923,
+  "ay": -136.9801699716714,
+  "half_angle": 0.5760947268786616,
+  "r_in": 144.0,
+  "r_out": 1088.0,
+  "th_l": -0.5760947268786616,
+  "th_r": 0.5760947268786616
+ },
+ "expected": "propose",
+ "components": {
+  "rin_rule": "coverage",
+  "reseeded": "above_arc",
+  "trap_depth": "refined_along_sides",
+  "top_edge_frac": 0.487,
+  "fit_score": 0.983,
+  "fit_iou": 0.9793,
+  "outside_blob_frac": 0.0008,
+  "masked_frac": 0.2504,
+  "bg_level": 0,
+  "bg_frac": 0.2651,
+  "interior_mean": 71.4,
+  "interior_std": 30.9
+ }
+}

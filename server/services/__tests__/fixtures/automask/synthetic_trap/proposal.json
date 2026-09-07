@@ -1,0 +1,39 @@
+{
+ "clip_id": "frame",
+ "w": 632,
+ "h": 1080,
+ "bound": {
+  "x0": 8,
+  "y0": 100,
+  "x1": 623,
+  "y1": 860
+ },
+ "margin_px": 2,
+ "tier": "T0T1",
+ "model": "trap_sym",
+ "conf": 0.9256,
+ "withheld": null,
+ "flag": null,
+ "keep": {
+  "kind": "trap",
+  "cx": 314.395,
+  "y_top": 168.0,
+  "y_bottom": 808.0,
+  "w_top": 392.3636363636364,
+  "w_bottom": 625.0909090909092,
+  "sym": true
+ },
+ "expected": "propose",
+ "components": {
+  "trap_depth": "refined_along_sides",
+  "top_edge_frac": 0.532,
+  "fit_score": 0.9314,
+  "fit_iou": 0.9107,
+  "outside_blob_frac": 0.0117,
+  "masked_frac": 0.5149,
+  "bg_level": 0,
+  "bg_frac": 0.4533,
+  "interior_mean": 57.6,
+  "interior_std": 25.8
+ }
+}
