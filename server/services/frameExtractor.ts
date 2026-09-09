@@ -5,6 +5,8 @@ import fs from 'fs/promises';
 import sharp from 'sharp';
 import * as dcmjs from 'dcmjs';
 import { perfSpan } from './perf';
+import type { Bound } from '../../shared/automask/types';
+import { boundFromDataset } from './automaskT0';
 
 export interface VideoMetadata {
   duration: number;
@@ -13,6 +15,10 @@ export interface VideoMetadata {
   frameRate: number;
   totalFrames: number;
   isDicom?: boolean;
+  /** Auto-mask 2B-1 (read-only addition): the first (0018,6011) region of a DICOM upload, clipped to the frame, lifted
+   *  from the dataset this method already parses. Persisted by the upload handler as temp_extracted/<jobId>/t0.json.
+   *  undefined when the DICOM metadata parse failed (the catch below). */
+  ultrasoundBound?: Bound | null;
   dicomMetadata?: {
     patientID?: string;
     studyDate?: string;
@@ -60,6 +66,7 @@ export class FrameExtractor {
           frameRate: 1,
           totalFrames,
           isDicom: true,
+          ultrasoundBound: boundFromDataset(dataset, dataset.Columns || 512, dataset.Rows || 512),
           dicomMetadata: {
             patientID: dataset.PatientID,
             studyDate: dataset.StudyDate,

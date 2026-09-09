@@ -10,7 +10,7 @@
  * No DOM, no Node — plain typed arrays, so 2B can run the same code in the browser.
  */
 
-import type { Grid } from './types';
+import type { Grid, Bound } from './types';
 
 export function grid(w: number, h: number, data?: Uint8Array): Grid {
   return { w, h, data: data ?? new Uint8Array(w * h) };
@@ -569,4 +569,11 @@ export function line8(x1: number, y1: number, x2: number, y2: number, set: (x: n
       if (mask) x += 1;
     }
   }
+}
+
+/** The T0 box as a full-res 0/1 grid. 2B-1: shared by the service (contract) and the worker (the fit), so it lives here. */
+export function boundToGrid(b: Bound, w: number, h: number): Grid {
+  const g = grid(w, h);
+  for (let y = b.y0; y <= b.y1; y++) g.data.fill(1, y * w + b.x0, y * w + b.x1 + 1);
+  return g;
 }

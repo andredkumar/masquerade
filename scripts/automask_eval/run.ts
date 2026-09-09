@@ -31,7 +31,8 @@ const has = (k: string) => args.includes(k);
 const outPath = opt('--out');
 const TOL = { half: 1.5, apex: 8, top: 8, w_top: 8, depth: 12 };
 
-interface Row { id: string; family?: string; vendor?: string; model: string | null; conf: number | null; iou: number | null; leak: number | null; over: number | null; leak6: number | null; over6: number | null; tolerant: boolean; controls_only: boolean; beyond: string[]; withheld: string | null; note?: string; ms?: number | null; d?: Record<string, number | null> | null }
+interface Row { id: string; family?: string; vendor?: string; model: string | null; conf: number | null; iou: number | null; leak: number | null; over: number | null; leak6: number | null; over6: number | null; tolerant: boolean; controls_only: boolean; beyond: string[]; withheld: string | null; note?: string; ms?: number | null; d?: Record<string, number | null> | null;
+  computed_by?: string | null; t0_from?: string | null; worker_ms?: number | null }   // 2B-1: ready- vs lazy-triggered, where the T0 box came from
 
 function estimator(iou: number, leak6: number, tol: boolean, d: ReturnType<typeof shapeDeltas>, kindMatch: boolean): { controls_only: boolean; beyond: string[] } {
   const vals: Record<string, number | null> = d ? { half: d.d_half_angle_deg, apex: d.d_apex_px, top: d.d_arc_px, w_top: d.d_top_width_px, depth: d.d_depth_px } : {};
@@ -94,7 +95,9 @@ async function dbMode(): Promise<Row[]> {
     const man = manifest.find((m) => m.filename === job.filename) ?? manifest.find((m) => m.w === job.width && m.h === job.height && m.frames === job.total_frames);
     if (man && man.filename !== job.filename) console.warn(`manifest join for ${job.id}: filename ${job.filename} not found, matched on (w,h,frames) → ${man.clip_id}`);
     const base: Row = { id: `${job.id.slice(0, 8)} ${job.filename ?? ''}`.trim(), family: man?.clip_id, vendor: man?.vendor, model: prop?.model ?? null, conf: prop?.confidence ?? null, iou: null, leak: null, over: null, leak6: null, over6: null,
-      tolerant: false, controls_only: false, beyond: [], withheld: prop ? (prop.status === 'ready' ? null : (prop.withheld ?? (prop.reason ? `${prop.reason}` : `status ${prop.status}`))) : 'no proposal', ms: prop?.ms?.total ?? null, note: prop?.grade ?? '' };
+      tolerant: false, controls_only: false, beyond: [], withheld: prop ? (prop.status === 'ready' ? null : (prop.withheld ?? (prop.reason ? `${prop.reason}` : `status ${prop.status}`))) : 'no proposal', ms: prop?.ms?.total ?? null,
+      computed_by: prop?.computed_by ?? null, t0_from: (prop?.info?.t0_from as string | undefined) ?? null, worker_ms: prop?.ms?.worker ?? null,
+      note: [prop?.grade, prop?.computed_by ? `by:${prop.computed_by}` : null, prop?.info?.t0_from ? `t0:${prop.info.t0_from}` : null].filter(Boolean).join(' · ') };
     const md = job.mask_data as { canvasDataUrl?: string } | null;
     if (!prop || prop.status !== 'ready' || !prop.keep || !md?.canvasDataUrl || !job.width || !job.height) { base.beyond = [prop && prop.status === 'ready' ? 'no applied mask' : 'no proposal']; rows.push(base); continue; }
     const png = Buffer.from(md.canvasDataUrl.replace(/^data:image\/\w+;base64,/, ''), 'base64');

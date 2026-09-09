@@ -11,6 +11,7 @@ import { rawFramesDir, applyStagingDir, cleanupApplyStaging, prepareCleanApplySt
 import { listRawFrameFiles, isCompletePngBuffer } from './frameAccess';
 import os from 'os';
 import { perfMark, perfSpan } from './perf';
+import { enqueueProposalAtReady } from './automask';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -1566,6 +1567,12 @@ export class VideoProcessor {
         extractionProgress: 100,
         status: `Ready for masking - ${extractedFrames} frames extracted`
       });
+
+      // Auto-mask 2B-1 (AUTOMASK_ROUND2B_RECON_PROPOSAL.md §1.2): propose frame 1 now that every frame is on disk.
+      // After the `ready` write and emit, so `ready` is never delayed and the status machine (A3) never learns this
+      // exists; both the DICOM batch path and the ffmpeg single pass converge here. Fire-and-forget: the helper never
+      // rejects and is a no-op with AUTOMASK off.
+      void enqueueProposalAtReady(jobId);
       
     } catch (error) {
       console.error(`❌ Background extraction failed for job ${jobId}:`, error);

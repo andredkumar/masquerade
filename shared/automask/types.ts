@@ -77,7 +77,8 @@ export interface ProposalJson {
   grade: 'proposed' | 'check_depth' | null;
   rules: Record<string, boolean>;
   info: Info;
-  ms: { decode: number; propose: number; total: number };
+  ms: { decode: number; propose: number; total: number; worker?: number; queue?: number };   // 2B-1: propose = round trip; worker = in-thread; queue = waited behind another job
   createdAt: string;
   error?: string;
+  computed_by?: 'ready' | 'lazy';   // 2B-1: what triggered the compute that produced this body
 }

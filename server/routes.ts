@@ -39,7 +39,8 @@ import archiver from "archiver";
 import { applyTemplateMask } from "./handlers/templateMaskApply";
 import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
 import { perfMark, perfSpan } from "./services/perf";
-import { getOrComputeProposal } from "./services/automask";
+import { getOrComputeProposal, enqueueProposalAtReady } from "./services/automask";
+import { captureT0AtUpload } from "./services/automaskT0";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -225,6 +226,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         perfMark(job.id, 'upload.job_created', { uploadRef, path: 'dicom' });
 
+        // Auto-mask 2B-1 (AUTOMASK_ROUND2B_RECON_PROPOSAL.md §1.3): the (0018,6011) box comes from the dataset
+        // extractVideoMetadata already parsed and is persisted beside the frames — the upload is purged on restart
+        // and by the 2 h sweep, the frames live 6 h. Flag-gated; never fails the upload.
+        await captureT0AtUpload(job.id, quickMetadata, true);
+
         // STEP 3: Return first frame immediately to user for fast display
         perfMark(job.id, 'upload.response_sent', { uploadRef });
         res.json({
@@ -290,6 +296,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const job = await storage.createVideoJob(jobData);
       perfMark(job.id, 'upload.job_created', { uploadRef, path: 'ffmpeg' });
+      await captureT0AtUpload(job.id, metadata, false);   // auto-mask 2B-1: records `not_dicom` so the proposer never re-reads the upload
 
       // Phase 3d: create hub-and-spoke Job record eagerly
       const extractionRate = typeof req.body.samplingFps === 'number' && req.body.samplingFps > 0
@@ -456,6 +463,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         },
         firstFrame: `data:image/png;base64,${firstImageBuffer.toString('base64')}`
       });
+
+      // Auto-mask 2B-1 (AUTOMASK_ROUND2B_RECON_PROPOSAL.md §1.2): image batches are `ready` at upload (no extraction),
+      // so the proposal is computed now. Fire-and-forget; the helper never rejects and is a no-op with AUTOMASK off.
+      void enqueueProposalAtReady(job.id);
 
     } catch (error) {
       console.error("Image upload error:", error);
