@@ -10,3 +10,13 @@ export const AUTOMASK_FLAG_ENV = 'AUTOMASK';
 export function automaskEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|on|yes)$/i.test(env[AUTOMASK_FLAG_ENV] ?? '');
 }
+
+/**
+ * 2B-2: the spoke's UI flag. Same regex, same pm2-only plumbing (`AUTOMASK_UI=1 pm2 restart masquerade --update-env`).
+ * Surfaced to the client as `ui_enabled` on every proposal body; gates the outcome POST together with `AUTOMASK`.
+ */
+export const AUTOMASK_UI_FLAG_ENV = 'AUTOMASK_UI';
+
+export function automaskUiEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|on|yes)$/i.test(env[AUTOMASK_UI_FLAG_ENV] ?? '');
+}

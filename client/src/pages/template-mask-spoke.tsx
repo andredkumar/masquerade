@@ -1,13 +1,16 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useReducer, useMemo } from "react";
 import { useLocation } from "wouter";
 import { useJob } from "@/contexts/JobContext";
-import MaskingCanvas from "@/components/MaskingCanvas";
+import MaskingCanvas, { type ProposalEvent, type ProposalLayerProps } from "@/components/MaskingCanvas";
+import AutomaskProposalBar from "@/components/AutomaskProposalBar";
 import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
 import ProcessingStatus from "@/components/ProcessingStatus";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, FileVideo, Loader2, AlertCircle } from "lucide-react";
 import type { MaskData, OutputSettings } from "@shared/schema";
+import { useAutomaskProposal, sessionReducer, buildOutcome, decideOutcome, postOutcome, type ProposalSession } from "@/hooks/useAutomaskProposal";
+import type { ControlId, ShapeKind } from "@shared/automask/shape";
 
 type FrameStatus = "loading" | "ready" | "extracting" | "not_found" | "gone" | "error";
 
@@ -43,6 +46,50 @@ export default function TemplateMaskSpokePage() {
   const [framesReady, setFramesReady] = useState<number | null>(null);
 
   const jobId = job?.id ?? "";
+
+  // ---- Auto-mask Round 2B-2: the proposal session (docs/refactor/AUTOMASK_ROUND2B2_PLAN.md §1) ---------------------
+  // Fetched once frame 1 is on screen; null = today's spoke exactly (flag off / withheld / error / timeout). The spoke
+  // owns every parameter; MaskingCanvas draws `canvasProposal` and reports handle drags, removals and the accept hand-off.
+  const proposalBody = useAutomaskProposal(jobId, frameStatus === "ready");
+  const [session, dispatch] = useReducer(sessionReducer, null);
+  const expectAcceptUpdate = useRef(false);
+  useEffect(() => {
+    if (proposalBody && !session) {
+      dispatch({ type: "init", body: proposalBody });
+      // Kickoff §3.3: no drawing tool while the proposal shows, so a stray click-drag cannot draw a rectangle and cost
+      // the user the proposal. Draw from scratch restores "rectangle".
+      setSelectedTool("select");
+    }
+  }, [proposalBody, session]);
+  const canvasProposal = useMemo<ProposalLayerProps | null>(
+    () => (session && !session.dismissed ? { shape: session.current, bound: session.body.bound, margin: session.body.margin_px, mode: session.mode } : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [session?.current, session?.body, session?.mode, session?.dismissed],
+  );
+  const frame = useMemo(() => ({ w: session?.body.width ?? 0, h: session?.body.height ?? 0 }), [session?.body]);
+  const postOnce = useCallback((s: ProposalSession, outcome: "accept" | "edit" | "draw_from_scratch") => {
+    if (s.posted || !jobId) return;                 // one line per job per spoke session (kickoff §3.8)
+    postOutcome(jobId, buildOutcome(s, outcome, performance.now()));
+    dispatch({ type: "posted" });
+  }, [jobId]);
+  const handleProposalEvent = (e: ProposalEvent) => {
+    switch (e.kind) {
+      case "rendered": dispatch({ type: "rendered", t: performance.now() }); break;
+      case "drag": dispatch({ type: "nudge", dx: e.dx, dy: e.dy }); break;
+      case "accepted": expectAcceptUpdate.current = true; break;
+      case "removed":
+        // A stroke (proposal mode) or Clear / Erase All (either mode) took the layer away: the user draws by hand.
+        if (session && !session.dismissed) { postOnce(session, "draw_from_scratch"); dispatch({ type: "dismiss" }); }
+        break;
+    }
+  };
+  const handleAccept = () => dispatch({ type: "accept" });
+  const handleAdjust = () => { dispatch({ type: "adjust" }); setMaskData(null); };
+  const handleDrawFromScratch = () => {
+    if (session && !session.dismissed) { postOnce(session, "draw_from_scratch"); dispatch({ type: "dismiss" }); }
+    setMaskData(null);
+    setSelectedTool("rectangle");
+  };
 
   // Build videoMetadata from Job V2 source
   const videoMetadata = job
@@ -183,12 +230,22 @@ export default function TemplateMaskSpokePage() {
       ? `Extracting frames… ${extractedSoFar} / ${totalFrames}`
       : "Extracting frames…";
 
-  const handleMaskUpdate = (newMaskData: MaskData) => setMaskData(newMaskData);
+  const handleMaskUpdate = (newMaskData: MaskData) => {
+    setMaskData(newMaskData);
+    // 2B-2: in accepted mode the canvas reports one update for the accept hand-off (flagged by the 'accepted' event just
+    // before it); any other update is a hand stroke unioned with the cone (sign-off §10-E) → the outcome becomes `edit`.
+    if (session && !session.dismissed && session.mode === "accepted") {
+      if (expectAcceptUpdate.current) expectAcceptUpdate.current = false;
+      else dispatch({ type: "freehand" });
+    }
+  };
 
   const handleStartProcessing = (outputSettings: OutputSettings) => {
     if (!jobId || !maskData) return;
     setIsProcessing(true);
     setLastProcessedSettings(outputSettings);
+    // 2B-2: the one outcome line per job fires on Apply — the committed moment — fire-and-forget, never gating Apply.
+    if (session && !session.dismissed && session.mode === "accepted") postOnce(session, decideOutcome(session));
     // Refetch Job V2 so the hub tile reflects "applying" status immediately
     refetch();
   };
@@ -327,6 +384,23 @@ export default function TemplateMaskSpokePage() {
 
         {/* Main canvas area */}
         <main className="flex-1 flex flex-col">
+          {session && !session.dismissed && (
+            <div className="px-6 pt-4">
+              <AutomaskProposalBar
+                fitted={session.fitted}
+                current={session.current}
+                mode={session.mode}
+                grade={session.body.grade}
+                frame={frame}
+                onControl={(id: ControlId, value: number) => dispatch({ type: "control", id, value })}
+                onNudge={(dx, dy) => dispatch({ type: "nudge", dx, dy })}
+                onSwitch={(kind: ShapeKind) => dispatch({ type: "switch", kind })}
+                onAccept={handleAccept}
+                onAdjust={handleAdjust}
+                onDrawFromScratch={handleDrawFromScratch}
+              />
+            </div>
+          )}
           <div className="flex-1 p-6 relative">
             {frameStatus === "loading" ? (
               <div className="flex items-center justify-center h-full">
@@ -340,6 +414,8 @@ export default function TemplateMaskSpokePage() {
                 zoom={canvasZoom}
                 onZoomChange={setCanvasZoom}
                 maskData={maskData}
+                proposal={canvasProposal}
+                onProposalEvent={handleProposalEvent}
               />
             )}
 

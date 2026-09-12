@@ -3,3 +3,12 @@ dist/
 
 # macOS junk
 .DS_Store
+
+# local auto-mask sandbox lives beside the repo; never inside it
+/sandbox/
+uploads/
+temp_extracted/
+spokes/
+uploads/
+temp_extracted/
+spokes/

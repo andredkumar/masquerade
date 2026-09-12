@@ -40,6 +40,8 @@ import { applyTemplateMask } from "./handlers/templateMaskApply";
 import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
 import { perfMark, perfSpan } from "./services/perf";
 import { getOrComputeProposal, enqueueProposalAtReady } from "./services/automask";
+import { automaskUiEnabled } from "./services/automaskFlag";
+import { handleOutcome } from "./services/automaskOutcome";
 import { captureT0AtUpload } from "./services/automaskT0";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
@@ -506,10 +508,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const proposal = await getOrComputeProposal(req.params.jobId);
       if (!proposal) return res.status(404).json({ error: "Job not found" });
-      return res.json(proposal);
+      // 2B-2: the UI flag rides every body, stamped at serve time (never written into automask.json) so a pm2 flag flip
+      // is live on the next GET.
+      return res.json({ ...proposal, ui_enabled: automaskUiEnabled() });
     } catch (error) {
       console.error("template-mask/proposal error:", error);
-      return res.json({ version: 2, status: "none", reason: "error", jobId: req.params.jobId, error: (error as Error).message ?? String(error) });
+      return res.json({ version: 2, status: "none", reason: "error", jobId: req.params.jobId, error: (error as Error).message ?? String(error), ui_enabled: automaskUiEnabled() });
+    }
+  });
+
+  // Auto-mask Round 2B-2 — the spoke's one outcome report per job (requirement B5; docs/refactor/AUTOMASK_ROUND2B2_PLAN.md
+  // §6). Gated by AUTOMASK and AUTOMASK_UI (either off → the GET's disabled shape, no log); zod-validated; exactly one
+  // [PERF] automask.outcome line; nothing stored. Fire-and-forget from the client — it must never delay or gate Apply.
+  app.post("/api/jobs/:jobId/template-mask/proposal/outcome", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const r = await handleOutcome(req.params.jobId, req.body, { getJobV2: (id) => storage.getJobV2(id), env: process.env, log: perfMark });
+      if (r.status === 204) return res.status(204).end();
+      return res.status(r.status).json(r.body);
+    } catch (error) {
+      console.error("template-mask/proposal/outcome error:", error);
+      return res.status(500).json({ error: "outcome failed" });
     }
   });
 

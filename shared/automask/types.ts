@@ -81,4 +81,5 @@ export interface ProposalJson {
   createdAt: string;
   error?: string;
   computed_by?: 'ready' | 'lazy';   // 2B-1: what triggered the compute that produced this body
+  ui_enabled?: boolean;             // 2B-2: AUTOMASK_UI as seen by the server at serve time (stamped by the route, never cached)
 }

@@ -1,5 +1,94 @@
 # Masquerade
 
+## Status — Auto-mask Round 2B-2 BUILT (2026-09-11, uncommitted — awaiting the runbook)
+
+The template-mask spoke's **proposal UI** is built behind a second flag **`AUTOMASK_UI`** (default off; `ui_enabled` stamped
+on every proposal body at serve time, never into `automask.json`): on open, frame 1 with the proposed cone drawn as one
+`fabric.Path` (`fillRule:'evenodd'`, frame pixels, tagged `_automask`), a bar with the grade words, the model switch
+**fan / trapezoid / rectangle** (re-seed from the current shape), the bench-v4 controls with `fitted → now (Δ)`, arrow
+buttons + keyboard arrows (tap 1 px, hold 400 ms → 10/s → 40/s after 1.5 s, Shift ×10), a drag handle, **Accept** (sets the
+mask through the existing `updateMaskFromCanvas`; Apply stays the user's click; **Adjust** reverses it until Apply) and
+**Draw from scratch**. Drawing anything, Clear Mask or Erase All removes the proposal. One
+`POST /api/jobs/:jobId/template-mask/proposal/outcome` per job per spoke session → one **`[PERF] automask.outcome`**
+line (`accept | edit | draw_from_scratch`, `controls_used`, `deltas`, `model_switch`, `final_keep`, `grade_shown`,
+`tier`, `ms_to_decision`; `fingerprint`/`template` null until 2C), zod-validated, stored nowhere, gated by both flags.
+
+**Sandbox results:** Accept-untouched → Apply IoU vs the proposal **0.9951 / 0.9944 / 0.9952** (fan / trap + T0 / rect + T0;
+the residual is a 1 px fail-closed ring from the export's forced 1 px stroke — fail-open 0 px against the raw keep, report §0.1); exactly one outcome line per job on nine jobs; flag off = today's DOM (worktree diff);
+hold schedule proven with real timers (first repeat 401 ms, 39 steps/s after 1.5 s). Shape math is pure in
+`shared/automask/shape.ts` (`controlSpecs`, `readouts`, `withControl`, `reseed`, `keepPolygon`, `keepPathData`); tests
+`automaskShape` 6, `automaskOutcome` 4, `automaskHold` 2; `tsc` 12; both `dist/` files; bench 39/50 unchanged.
+
+**Deviations Andre must strike or keep (report §5):** trap → fan re-seed falls back to the 30° rule when the side-line
+apex would leave the position range; `shapeDeltas` now null only across fan ↔ non-fan (it *was* null for trap ↔ rect);
+`sonosite_011_clip10` is the B7 case, not a withheld clip. **Traps for the next session:** killing the dev server
+sweeps all of `temp_extracted/`; the Browser pane is a hidden tab (throttled timers); `uploads/`, `temp_extracted/`,
+`spokes/` are not gitignored — commit by the report's §7 path list. Docs: `docs/refactor/AUTOMASK_ROUND2B2_KICKOFF.md`,
+`_PLAN.md`, `_SIGNOFF.md`, `_REPORT.md`. Rollback: one `git revert`. Next: runbook → deploy → Andre's display row →
+flag decision → 2C (B4 template library, B6 temporal).
+
+---
+
+## Status — Auto-mask Round 2B-1 DEPLOYED (2026-09-08, `74ed76b`)
+
+The auto-mask feature (a cone/trapezoid proposer for the template-mask spoke) is live on prod behind
+`AUTOMASK=1` (pm2 env, not `.env`) — **server-only, no UI yet**. How it got here: the Python spike and tuning
+passes 1–3 froze the proposer (`scripts/automask_spike/CONSTANTS.md`, FROZEN 2026-09-06, 34/50 tolerant on
+Andre's references, 39/50 after re-review); Round 2A (`a98a03c`) ported it to TypeScript (`shared/automask/`,
+54/54 fixtures exact) behind `GET /api/jobs/:jobId/template-mask/proposal`, cached once as
+`temp_extracted/<jobId>/automask.json`; 2B-1 (`74ed76b`) is the server half of "the proposal becomes the
+template-mask entry":
+
+- **Proposer runs in `dist/automaskWorker.js`** — a second esbuild entry in `npm run build`; under tsx (dev,
+  sandbox, tests) the client spawns the bootstrap `server/workers/automaskWorker.boot.mjs` instead (a worker
+  thread does not inherit tsx's loader). One lazy worker per process, FIFO, 20 s timeout, terminate + respawn
+  on failure (`server/services/automaskWorkerClient.ts`). `maskWorker.ts` is still dead code and uninvolved —
+  it has no build path and its self-file spawn would boot the whole server inside the thread (recon §1.1).
+- **Computed at `ready`** (`enqueueProposalAtReady`, the line after the ready write + socket emit in
+  `videoProcessor.startBackgroundFrameExtraction`, and from the image upload handler) → `computed_by:"ready"`,
+  **14 ms after `bg_extract.done`** on prod; the first-GET compute stays as the lazy fallback for pre-2B jobs.
+- **DICOM region box captured at upload** into `temp_extracted/<job>/t0.json` (`server/services/automaskT0.ts`,
+  read-only addition `ultrasoundBound` in `frameExtractor.extractVideoMetadata`) and **surviving the `uploads/`
+  purge** (restart, 2 h sweep) — the prod degradation trapezoid → rectangle (`bound_source: unavailable`, job
+  `438a9d4f`) cannot recur for jobs uploaded after 2B-1.
+
+**Prod numbers (t3.large, one physical core):**
+
+| measurement | prod |
+|---|---|
+| main-thread stall across a 1698 ms 1080p proposal (20 Hz `GET /api/jobs/:id`) | **max 133 ms / p50 2 ms** (2A blocked the loop ≈ 1463 ms) |
+| `ms_propose` / `worker_ms`, cold, 1080p | 1424.7 / 1371.9 ms |
+| `ms_propose` / `worker_ms`, 1054×802 | 796 / 794.5 ms |
+| cold worker spawn · warm thread-hop | ≈ 53 ms · 0.1 ms |
+| Apply immediately after `ready` (reference clip) | 8527.8 ms (baseline 8.7 s) |
+
+**Invariants added:** `npm run build` **must produce both `dist/index.js` and `dist/automaskWorker.js`**
+(`ls dist/` is a deploy-runbook step; the bundle resolves the worker as `./automaskWorker.js` beside itself).
+tsc stays **12** (the same 12). The two `.json` files per job in `temp_extracted/<job>/` are invisible to the
+apply reuse guard (it matches image extensions) and are swept with the frames. Flag off = 2A/pre-2A behaviour
+byte for byte (no `t0.json`, no `[PERF] automask.*`, endpoint answers `{status:'none', reason:'disabled'}`).
+
+**Contract (v2, additive fields in 2B-1):** `computed_by`, `ms.worker`, `ms.queue`, `info.t0_from`; PERF
+`automask.start/done/skipped/served` carry `trigger`, `worker_ms`, `queue_ms`, `worker_spawned`, `t0_from`;
+new stages `automask.t0_captured`, `worker_spawned`, `worker_failed`. Eval: `scripts/automask_eval/run.ts`
+(`--bench` vs `sandbox/bench/reviews_freeze.json`, `--db --server` vs applied masks; D5 = 4/7 tolerant on the
+kickoff clips, equal to the bench).
+
+**Next: 2B-2 — the spoke.** B1–B3 + B7 (proposal layer as a `fabric.Path` with `fillRule:'evenodd'` — proven on
+fabric 5.3.0, the CDN build the canvas actually uses; Accept sets the mask, Apply stays the user's click; model
+switch fan/trap/rect; controls with `fitted → now (Δ)`; nudge ergonomics) behind a second flag **`AUTOMASK_UI`**
+(default off, `ui_enabled` on the proposal body), telemetry B5 as one server `[PERF] automask.outcome` line via a
+gated POST. Out of scope until 2C: template library (B4), temporal support (B6), accounts.
+
+**Docs:** `docs/refactor/AUTOMASK_ROUND2B_KICKOFF.md`, `AUTOMASK_ROUND2B_RECON_PROPOSAL.md` (recon Q1–Q7 with
+file:line, D5 table, the 2B-1/2B-2 proposal), `AUTOMASK_ROUND2B_SIGNOFF.md`, `AUTOMASK_ROUND2B1_REPORT.md`;
+earlier rounds `AUTOMASK_ROUND2A_PROPOSAL.md` (v2), `AUTOMASK_ROUND2A_REPORT.md`, `AUTOMASK_PASS3_REPORT.md`,
+`AUTOMASK_ROUND2B_2C_KICKOFF_DRAFT.md` (requirements B1–B7 verbatim). Sandbox for all of it:
+`scripts/sandbox/up.sh` (Postgres 5433, server 5001, `AUTOMASK=1` in `sandbox/.env.sandbox` — comment that line
+to test flag-off, `up.sh` re-sources the file). Rollback: `git revert 74ed76b`.
+
+---
+
 ## Status — PERF / UX round COMPLETE (deployed + verified 2026-08-30)
 
 Verified on prod (`t3.large`, 2 vCPU) against one reference clip: `Normal Lung sliding 2.mp4`,
@@ -641,6 +730,7 @@ round's own first entry — item 21 below is a pointer to it rather than a dupli
 27. **Manifest filenames don't resolve inside the export ZIP.** `buildPerFrameManifestAndCsv` emits `frame_%04d.<fmt>` (`frameManifest.ts:72`) while the ZIP writes `images/frame_%06d.<ext>` (`routes.ts:803`) — wrong zero-pad width and no `images/` prefix, in both `manifest.json` and `metadata.csv`. Affects both download paths (whole-job `:687`, per-run `:1815`). Changes manifest bytes, so it breaks the Phase 6 D1 byte-identical guarantee deliberately and needs its own commit. Found during item 22 recon (`docs/refactor/ITEM22_RECON.md` §6.3) and deliberately kept out of that commit.
 28. ~~**Image-batch jobs 410 at the template-mask canvas — the image feature is unreachable**~~ — **DONE (2026-09-04).** The spoke painted from `GET /api/jobs/:id/frames/0` (raw branch), which reads only `temp_extracted/<jobId>/`; image batches never populate it (no extraction — multer writes `uploads/<hash>`, job goes straight to `ready`), so every image job hit the trailing 410 and showed "Frames are no longer available. The server may have restarted." — false on both counts. The canvas could not paint, so no mask could be drawn, so **Apply was unreachable through the UI for every image batch**, `.jpg` and `.png` alike; Apply itself was always fine (`templateMaskApply.ts:82`), sitting behind a door that would not open. Broken since Phase 4b (`c66ca4e`), when the spoke stopped using the upload response's base64 `firstFrame` (= why item 25 lists that field as dead). Confirmed in prod on job `e5ed44ed` 2026-09-04. **Fix:** an image-batch branch in the raw path of the frames endpoint (`routes.ts:1626`) serving frame *n* from `uploads/<fileList[n].filename>`, detected via `jobV2.source.type === 'image_batch'` (never the legacy `jobType`), resolved by the new pure `resolveImageBatchFrame` (`frameAccess.ts:172`) through `resolveWithinRoot(UPLOADS_DIR, …)`, 404 past the end, 410 for a missing file, original bytes with no re-encode. Indexed **strictly by `fileList` order** — the same order `processImages` masks in (`videoProcessor.ts:827-846`), so canvas frame *i* is provably the source of masked output *i*; a sorted directory listing would silently mis-pair them, and the regression test is built to fail that implementation. Declared mimetypes are allowlisted rather than reflected (`fileFilter` admits a `.png` declared `text/html`, which would be stored XSS from the app's own origin). Both 410s now carry a `reason` (`uploads_swept` | `frames_swept`) and the spoke renders copy per cause, so "the server may have restarted" is only claimed when that is a live possibility. `uploads/`'s 2 h retention is unchanged: an image job older than that still fails, but now the canvas fails the same way Apply already does instead of at minute zero. Tests: `server/services/__tests__/imageBatchFrames.test.ts` (6 cases, `npx tsx`, no DB). Plan: `docs/refactor/ITEM28_IMAGE_BATCH_FRAMES_PLAN.md`; report: `docs/refactor/ITEM28_REPORT.md`. **Unblocks the item 22 deploy runbook §5, rows I1-I8.**
 29. **Mixed-dimension image batches mask the wrong region on every frame but the first.** The template mask is one set of absolute pixel coordinates, drawn against image 0 and applied unchanged to every frame (`videoProcessor.ts:1895` — "ABSOLUTE PIXEL COORDINATES - No transformation required"). In a batch whose images differ in size the rectangle lands somewhere else on each one: possibly off the burned-in identifier it was drawn over, possibly off the canvas entirely. **PHI-leak shape, not cosmetic.** Latent since the absolute-coordinate rewrite and unreachable until item 28 made the canvas paint. Needs either a per-image coordinate transform or a uniform-dimension guard at upload. Until it is fixed, use a **uniform-dimension** batch for item 22's runbook rows I1-I8 or they measure two bugs at once. Found 2026-09-04 while verifying item 28 (`docs/refactor/ITEM28_REPORT.md` §4).
+30. **Image jobs cannot be re-opened after Apply — the canvas 410s once the originals are reclaimed.** `processImages` deletes the uploaded originals in its `finally` on reaching a terminal state (`uploadPathsToReclaim`, `videoProcessor.ts:756` → `deleteUploadFile` `:1024`), so the moment Apply succeeds the files item 28 serves from are gone and `GET /api/jobs/:id/frames/:n` returns 410 `uploads_swept`. The user cannot adjust the mask and re-apply, and revisiting the spoke says the uploads are gone even though the masked output is on disk. **Video has no equivalent problem** — its canvas paints from `temp_extracted/`, retained 6 h, which is what makes the 2B redo loop work; image batches have no unmasked copy once uploads are reclaimed. Not a regression from item 28 (before it the canvas never painted at all) — the next layer of the same gap, newly visible. Two candidate fixes, probably both: (a) stop eagerly reclaiming image uploads and let the 2 h sweep take them, giving a redo window — note the video path already retains unmasked raw frames for **6 h**, so this is strictly less PHI exposure than what is already accepted; (b) have the spoke fall back to `?source=template_mask` when the raw source is gone but masked frames exist (= backlog item 20, now more valuable than when it was ranked). Found 2026-09-04 verifying items 22/28 on prod job `77c6389f` (uploaded 22:45, 410 within minutes — not the 2 h sweep).
 
 
 ### Raw frames live in-memory, not on disk (`global.extractedFrames`) — RESOLVED in Phase 4b-0

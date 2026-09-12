@@ -4,6 +4,23 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { ZoomIn, ZoomOut, Maximize, MousePointer, Hand, PaintbrushVertical } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { MaskData } from "@shared/schema";
+import { keepPathData } from "@shared/automask/shape";
+import type { KeepShape, Bound } from "@shared/automask/types";
+
+/** 2B-2: the proposal layer the spoke asks the canvas to draw (docs/refactor/AUTOMASK_ROUND2B2_PLAN.md §1). */
+export interface ProposalLayerProps {
+  shape: KeepShape;
+  bound: Bound | null;
+  margin: number;
+  mode: 'proposal' | 'accepted';
+}
+
+/** 2B-2: what the canvas reports back — it never owns the parameters. */
+export type ProposalEvent =
+  | { kind: 'rendered' }                              // the layer's path was first added (ms_to_decision starts here)
+  | { kind: 'drag'; dx: number; dy: number }          // the handle moved, in canvas pixels
+  | { kind: 'removed'; by: 'stroke' | 'clear' }       // a tool stroke, Clear or Erase All took the layer away
+  | { kind: 'accepted' };                             // the accepted path is about to reach updateMaskFromCanvas
 
 interface MaskingCanvasProps {
   firstFrame: string | null;
@@ -12,6 +29,18 @@ interface MaskingCanvasProps {
   zoom: number;
   onZoomChange: (zoom: number) => void;
   maskData?: MaskData | null;
+  proposal?: ProposalLayerProps | null;
+  onProposalEvent?: (e: ProposalEvent) => void;
+}
+
+const HANDLE_R = 8;
+
+/** Where the drag handle sits, in canvas pixels: the apex (fan; on the top edge when the apex is above the frame) or the top-edge midpoint (trap / rect). */
+function handlePosition(shape: KeepShape, w: number, h: number): [number, number] {
+  if (shape.kind === 'fan') {
+    return [Math.min(w - HANDLE_R, Math.max(HANDLE_R, shape.ax + 0.5)), shape.ay >= 0 ? Math.min(h - HANDLE_R, shape.ay + 0.5) : HANDLE_R];
+  }
+  return [Math.min(w - HANDLE_R, Math.max(HANDLE_R, shape.cx + 0.5)), Math.min(h - HANDLE_R, Math.max(HANDLE_R, shape.y_top + 0.5))];
 }
 
 declare global {
@@ -26,7 +55,9 @@ export default function MaskingCanvas({
   onMaskUpdate,
   zoom,
   onZoomChange,
-  maskData: externalMaskData
+  maskData: externalMaskData,
+  proposal = null,
+  onProposalEvent
 }: MaskingCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -41,6 +72,33 @@ export default function MaskingCanvas({
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [currentBrushSize, setCurrentBrushSize] = useState(36);
+
+  // ---- 2B-2 proposal-layer bookkeeping (plan §1) ------------------------------------------------------------------
+  // The fabric handlers below are registered once (the init effect), so they read the latest prop / callback through
+  // refs. `internalRemovalRef` marks our own canvas.remove / canvas.clear calls (and, per sign-off §1.3, every wholesale
+  // clear in this file) so the object:removed hook reports only removals the user caused — Clear, Erase All.
+  const proposalRef = useRef<ProposalLayerProps | null>(proposal);
+  proposalRef.current = proposal;
+  const onProposalEventRef = useRef(onProposalEvent);
+  onProposalEventRef.current = onProposalEvent;
+  const internalRemovalRef = useRef(false);
+  const layerPathRef = useRef<any>(null);       // the 'proposal' or 'mask' fabric.Path
+  const handleRef = useRef<any>(null);          // the drag handle, created once per layer lifetime
+  const draggingRef = useRef(false);            // fabric is transforming the handle: never reposition it
+  const layerRenderedRef = useRef(false);
+  const [frameLoaded, setFrameLoaded] = useState(0);
+
+  const internalRemoval = (fn: () => void) => {
+    internalRemovalRef.current = true;
+    try { fn(); } finally { internalRemovalRef.current = false; }
+  };
+  const removeProposalObjects = (canvas: any) => {
+    internalRemoval(() => canvas.getObjects().filter((o: any) => o._automask || o._aiOverlay).forEach((o: any) => canvas.remove(o)));
+    layerPathRef.current = null;
+    handleRef.current = null;
+    draggingRef.current = false;
+    layerRenderedRef.current = false;
+  };
 
   // Initialize Fabric.js canvas
   useEffect(() => {
@@ -62,8 +120,9 @@ export default function MaskingCanvas({
     });
 
     canvas.on('object:added', (e: any) => {
-      // Make new objects red instantly for mask visibility
       const obj = e.target;
+      if (obj && obj._automask) return;   // 2B-2: the proposal layer and its handle keep their own colours
+      // Make new objects red instantly for mask visibility
       if (obj && obj.type !== 'image') {
         obj.set({
           fill: 'red',
@@ -72,11 +131,47 @@ export default function MaskingCanvas({
         canvas.renderAll();
       }
       // Don't update mask on initial creation - wait for object:modified or mouse:up
+      // 2B-2 removal rule (plan §1; sign-off §1.2): the first user object while the PROPOSAL shows takes the layer
+      // away — every tool reaches here through canvas.add. After Accept the mask stays and the stroke unions with it.
+      if (obj && obj.type !== 'image' && proposalRef.current?.mode === 'proposal' && (layerPathRef.current || handleRef.current)) {
+        removeProposalObjects(canvas);
+        onProposalEventRef.current?.({ kind: 'removed', by: 'stroke' });
+      }
     });
 
     canvas.on('object:modified', (e: any) => {
+      if (e.target?._automask) {
+        // 2B-2: a handle drag end is not a mask edit; settle the handle on the shape it now describes.
+        if (e.target._automask === 'handle') {
+          draggingRef.current = false;
+          const p = proposalRef.current;
+          if (p && handleRef.current === e.target) {
+            const [hx, hy] = handlePosition(p.shape, canvas.width, canvas.height);
+            e.target.set({ left: hx, top: hy });
+            e.target.setCoords();
+            e.target._last = { x: hx, y: hy };
+            canvas.renderAll();
+          }
+        }
+        return;
+      }
       // Update mask when object is moved, scaled, or rotated
       updateMaskFromCanvas(e.target);
+    });
+
+    // 2B-2: Clear (MaskingTools → the 'clearMask' event below) and Erase All remove every non-image object one by one;
+    // the first of ours that goes without internalRemoval set is the user dismissing the proposal (or the accepted cone).
+    canvas.on('object:removed', (e: any) => {
+      const t = e.target;
+      if (!t?._automask || internalRemovalRef.current) return;
+      const hadLayer = !!(layerPathRef.current || handleRef.current);
+      layerPathRef.current = null;
+      handleRef.current = null;
+      draggingRef.current = false;
+      if (hadLayer) {
+        removeProposalObjects(canvas);
+        onProposalEventRef.current?.({ kind: 'removed', by: 'clear' });
+      }
     });
 
     // Listen for custom events from MaskingTools
@@ -128,8 +223,13 @@ export default function MaskingCanvas({
         // Disable pan control during undo operation
         setPanOffset({ x: 0, y: 0 });
         
-        // Clear current canvas completely
+        // Clear current canvas completely (2B-2 sign-off §1.3: a wholesale clear is never a user dismissal)
+        internalRemovalRef.current = true;
         canvas.clear();
+        internalRemovalRef.current = false;
+        layerPathRef.current = null;
+        handleRef.current = null;
+        draggingRef.current = false;
         
         // First, restore the background image at the back layer
         if (backgroundImageData) {
@@ -249,10 +349,17 @@ export default function MaskingCanvas({
       
       console.log(`✅ Canvas now matches frame: ${imgWidth}x${imgHeight} - Direct pixel coordinates!`);
       
+      internalRemovalRef.current = true;   // 2B-2 sign-off §1.3
       canvas.clear();
+      internalRemovalRef.current = false;
+      layerPathRef.current = null;
+      handleRef.current = null;
+      draggingRef.current = false;
+      layerRenderedRef.current = false;
       canvas.add(img);
       canvas.sendToBack(img);
       canvas.renderAll();
+      setFrameLoaded((n) => n + 1);        // 2B-2: the proposal layer is (re)added after the frame
     });
   }, [firstFrame]);
 
@@ -282,6 +389,87 @@ export default function MaskingCanvas({
       canvas.renderAll();
     });
   }, [externalMaskData]);
+
+  // ---- 2B-2: the proposal layer (docs/refactor/AUTOMASK_ROUND2B2_PLAN.md §1–§2; sign-off §1) -----------------------
+  // One fabric.Path — the frame rectangle plus the keep polygon, fillRule 'evenodd' — replaced on every parameter
+  // change, in frame pixels (the canvas IS the frame; zoom is the CSS transform below). The drag handle is created once
+  // per layer lifetime and repositioned in place, never while fabric is transforming it. Accept swaps the path for its
+  // exportable twin and hands it to the EXISTING updateMaskFromCanvas; Adjust swaps back. updateMaskFromCanvas itself
+  // is untouched.
+  useEffect(() => {
+    const canvas = fabricCanvasRef.current;
+    if (!canvas || frameLoaded === 0) return;
+    const p = proposal;
+    if (!p) {
+      if (layerPathRef.current || handleRef.current) removeProposalObjects(canvas);
+      internalRemoval(() => canvas.getObjects().filter((o: any) => o._aiOverlay).forEach((o: any) => canvas.remove(o)));
+      layerRenderedRef.current = false;
+      canvas.renderAll();
+      return;
+    }
+    const w = canvas.width, h = canvas.height;
+    const accepted = p.mode === 'accepted';
+    internalRemoval(() => { if (layerPathRef.current) canvas.remove(layerPathRef.current); });
+    layerPathRef.current = null;
+    const d = keepPathData(p.shape, w, h, p.bound, p.margin);
+    if (!d) { canvas.renderAll(); return; }   // clipped away entirely; the controls can bring it back
+    const path = new window.fabric.Path(d, {
+      fill: 'rgba(255,0,0,0.35)',
+      stroke: 'red',
+      strokeWidth: accepted ? 1 : 2,          // the export forces `strokeWidth: obj.strokeWidth || 36` on paths — never 0
+      fillRule: 'evenodd',
+      selectable: false,
+      evented: false,
+      objectCaching: false,
+      excludeFromExport: !accepted,           // the tools' Undo snapshots (toJSON) skip the proposal; the accepted mask is an ordinary object
+    });
+    path._automask = accepted ? 'mask' : 'proposal';
+    canvas.add(path);
+    layerPathRef.current = path;
+    if (accepted) {
+      internalRemoval(() => { if (handleRef.current) canvas.remove(handleRef.current); });
+      handleRef.current = null;
+      draggingRef.current = false;
+      canvas.renderAll();
+      onProposalEventRef.current?.({ kind: 'accepted' });
+      updateMaskFromCanvas(path);
+      return;
+    }
+    // Adjust: the 50 % overlay of the accepted PNG (the effect above) goes with the mask
+    internalRemoval(() => canvas.getObjects().filter((o: any) => o._aiOverlay).forEach((o: any) => canvas.remove(o)));
+    const [hx, hy] = handlePosition(p.shape, w, h);
+    let handle = handleRef.current;
+    if (!handle) {
+      handle = new window.fabric.Circle({
+        left: hx, top: hy, radius: HANDLE_R, originX: 'center', originY: 'center',
+        fill: '#f5c542', stroke: '#7a5a00', strokeWidth: 2,
+        selectable: true, evented: true, hasControls: false, hasBorders: false,
+        lockScalingX: true, lockScalingY: true, lockRotation: true, hoverCursor: 'move', moveCursor: 'move',
+        excludeFromExport: true, objectCaching: false
+      });
+      handle._automask = 'handle';
+      handle._last = { x: hx, y: hy };
+      handle.on('mousedown', () => { handle._last = { x: handle.left, y: handle.top }; });
+      handle.on('moving', () => {
+        draggingRef.current = true;
+        const dx = handle.left - handle._last.x, dy = handle.top - handle._last.y;
+        handle._last = { x: handle.left, y: handle.top };
+        if (dx || dy) onProposalEventRef.current?.({ kind: 'drag', dx, dy });
+      });
+      canvas.add(handle);
+      handleRef.current = handle;
+    } else if (!draggingRef.current) {
+      handle.set({ left: hx, top: hy });
+      handle.setCoords();
+      handle._last = { x: hx, y: hy };
+    }
+    canvas.bringToFront(handle);
+    canvas.renderAll();
+    if (!layerRenderedRef.current) {
+      layerRenderedRef.current = true;
+      onProposalEventRef.current?.({ kind: 'rendered' });
+    }
+  }, [proposal, frameLoaded]);
 
   // Handle tool changes
   useEffect(() => {
