@@ -70,16 +70,16 @@ export default function MaskingTools({
           aria-label="Mask mode"
           data-testid="mask-mode"
         >
-          <ToggleGroupItem value="exclude" className="flex-1" data-testid="mask-mode-exclude">Blanked</ToggleGroupItem>
-          <ToggleGroupItem value="keep" className="flex-1" data-testid="mask-mode-keep">Kept</ToggleGroupItem>
+          <ToggleGroupItem value="exclude" className="flex-1" data-testid="mask-mode-exclude">Remove</ToggleGroupItem>
+          <ToggleGroupItem value="keep" className="flex-1" data-testid="mask-mode-keep">Keep</ToggleGroupItem>
         </ToggleGroup>
         <p className="mt-1 text-xs text-muted-foreground" data-testid="mask-mode-hint">
           {maskModeLocked ? (
             <span className="inline-flex items-center gap-1"><Lock size={12} /> Auto-mask active — the drawn region is blanked.</span>
           ) : maskMode === 'keep' ? (
-            'Everything outside what you draw is blanked.'
+            'Drawn areas are kept; everything else is removed.'
           ) : (
-            'What you draw is blanked; everything else stays.'
+            'Drawn areas are removed; everything else stays.'
           )}
         </p>
       </div>

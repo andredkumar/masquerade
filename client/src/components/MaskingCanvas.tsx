@@ -375,14 +375,19 @@ export default function MaskingCanvas({
   }, [firstFrame]);
 
   // Render AI-generated mask overlay when externalMaskData has a canvasDataUrl
+  // Output Round 1a: the previous preview goes the moment the mask changes (before the early return, so Clear Mask /
+  // Erase All — which leave no PNG — clear it too), and a load that finishes after a newer mask arrived does nothing.
+  // Before, both the removal and the add ran inside the async callback, so an earlier load completing last replaced the
+  // current preview with a stale one (rapid Keep / Remove flips, rapid brush strokes).
   useEffect(() => {
     const canvas = fabricCanvasRef.current;
-    if (!canvas || !externalMaskData?.canvasDataUrl) return;
+    if (!canvas) return;
+    internalRemoval(() => canvas.getObjects().filter((o: any) => o._aiOverlay).forEach((o: any) => canvas.remove(o)));
+    if (!externalMaskData?.canvasDataUrl) { canvas.renderAll(); return; }
 
+    let cancelled = false;
     window.fabric.Image.fromURL(externalMaskData.canvasDataUrl, (img: any) => {
-      // Remove any previous AI overlay (tagged objects)
-      const existing = canvas.getObjects().filter((o: any) => o._aiOverlay);
-      existing.forEach((o: any) => canvas.remove(o));
+      if (cancelled) return;
 
       // Scale the mask image to match the canvas dimensions
       img.set({
@@ -399,6 +404,7 @@ export default function MaskingCanvas({
       canvas.add(img);
       canvas.renderAll();
     });
+    return () => { cancelled = true; };
   }, [externalMaskData]);
 
   // ---- 2B-2: the proposal layer (docs/refactor/AUTOMASK_ROUND2B2_PLAN.md §1–§2; sign-off §1) -----------------------
@@ -1162,6 +1168,11 @@ export default function MaskingCanvas({
             strokeWidth: obj.strokeWidth || 1
           });
         }
+        // Output Round 1a: `fabric.util.object.clone` is shallow, so the clone shares the on-canvas object's render cache,
+        // and `set()` only marks it dirty when a value CHANGES. After a Keep export painted that shared cache black, a
+        // Remove export's `set({ fill: 'red' })` changed nothing (the clone copied 'red'), so the clone blitted the stale
+        // black cache and the PNG carried NO red — the server blanked nothing. Always repaint in the export's own ink.
+        clonedObj.dirty = true;
         maskCanvas.add(clonedObj);
       });
       
@@ -1172,6 +1183,10 @@ export default function MaskingCanvas({
       
       // Clean up temporary canvas
       maskCanvas.dispose();
+      // Output Round 1a: the clones just repainted the shared caches in the export's ink; mark the originals dirty so the
+      // canvas repaints them in their own (red) fill instead of showing a Keep export's black.
+      objects.forEach((obj: any) => { obj.dirty = true; });
+      canvas.requestRenderAll();
       
       // Create mask data with absolute pixel coordinates (no scaling)
       console.log('🔧 MASK OBJECT DEBUG:', {
