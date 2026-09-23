@@ -121,6 +121,16 @@ export interface OutcomeBody {
 
 const EDIT_PX = 0.5, EDIT_DEG = 0.5;
 
+/** Output Round 1 (O5): the line carries 2-decimal deltas — an untouched control is exactly 0, never 3.9e-14. */
+const round2 = (v: number | null): number | null => (v === null ? null : Math.round(v * 100) / 100 + 0);
+export function roundDeltas(d: ShapeDeltas | null): ShapeDeltas | null {
+  if (!d) return null;
+  return {
+    d_half_angle_deg: round2(d.d_half_angle_deg), d_apex_px: round2(d.d_apex_px), d_top_px: round2(d.d_top_px),
+    d_arc_px: round2(d.d_arc_px), d_top_width_px: round2(d.d_top_width_px), d_depth_px: round2(d.d_depth_px),
+  };
+}
+
 /** `edit` when the family changed, a hand stroke was added, or any |Δ| exceeds 0.5 px / 0.5° (kickoff §3.5); else `accept`. */
 export function decideOutcome(s: ProposalSession): "accept" | "edit" {
   if (s.freehand || s.fitted.kind !== s.current.kind) return "edit";
@@ -136,7 +146,7 @@ export function buildOutcome(s: ProposalSession, outcome: OutcomeBody["outcome"]
   return {
     outcome,
     controls_used: s.freehand ? used(s.controlsUsed, "freehand") : s.controlsUsed,
-    deltas: shapeDeltas(s.fitted, s.current),                       // null across fan ↔ trap/rect, kept for trap ↔ rect
+    deltas: roundDeltas(shapeDeltas(s.fitted, s.current)),          // null across fan ↔ trap/rect, kept for trap ↔ rect; 2 decimals (O5)
     model_switch: from !== to ? { from, to } : null,                 // sign-off §2 I: every family change, trap ↔ rect included
     final_keep: outcome === "draw_from_scratch" ? null : s.current,
     fingerprint: null,

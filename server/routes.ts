@@ -43,6 +43,7 @@ import { getOrComputeProposal, enqueueProposalAtReady } from "./services/automas
 import { automaskUiEnabled } from "./services/automaskFlag";
 import { handleOutcome } from "./services/automaskOutcome";
 import { captureT0AtUpload } from "./services/automaskT0";
+import { readOutputTransform } from "./services/frameAccess";
 
 // ── Helpers for AI run → label lookup ────────────────────────────────────
 
@@ -732,10 +733,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Phase 6 (b)-lite: per-frame frames[] + metadata.csv now come from the
       // shared core. The whole-job wrapper feeds it the same inputs it used
       // inline before, so manifest.json / metadata.csv stay byte-identical (D1).
+      // Output Round 1: the transform the apply recorded beside these frames (null for jobs applied before the round).
+      const outputTransform = await readOutputTransform(job.id);
       const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
         frameCount: frameFiles.length,
         labels: approvedLabels,
         outputFormat,
+        outputTransform,
       });
 
       const manifest: Record<string, any> = {
@@ -745,6 +749,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         source_filename: job.filename,
         total_frames: frameFiles.length,
         output_format: outputFormat,
+        output_transform: outputTransform,
         splits: { train: 0.8, val: 0.1, test: 0.1 },
         ai_labels: labelsForManifest,
         frames: manifestFrames,
@@ -790,9 +795,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `manifest.json`,
         `  Per-frame AI label data including target structure, confidence score,`,
         `  and approval status. This is the primary AI output for programmatic use.`,
+        `  output_transform maps output pixels back to the source frame: every frame was cropped to the`,
+        `  kept region (crop, in source px) and then centred or scaled; x_src = crop.x + (x_out - offset.x) / scale.x.`,
         ``,
         `metadata.csv`,
         `  Tabular summary of all frames and labels. Import into Excel or pandas.`,
+        `  The crop_*/scale_*/offset_*/output_* columns repeat output_transform on every row.`,
       );
 
       const readme = [
@@ -1908,10 +1916,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // never in the core.
       const approvedRunLabels = run.labels.filter(l => l.approved);
       const runOutputFormat = (job as any).outputSettings?.format || 'jpg';
+      // Output Round 1: the run's frames are the masked output only when the run consumed it; raw-frame runs have no
+      // transform (null), which is the correct statement for them.
+      const runOutputTransform = run.inputSource === 'template_mask' ? await readOutputTransform(req.params.jobId) : null;
       const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
         frameCount: maskFiles.length,
         labels: approvedRunLabels,
         outputFormat: runOutputFormat,
+        outputTransform: runOutputTransform,
       });
 
       // §B: payload-only toggle to include the base frames the AI ran on. Does not
@@ -1936,6 +1948,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         })),
         maskCount: maskFiles.length,
         overlayCount: overlayFiles.length,
+        output_transform: runOutputTransform,
         frames: manifestFrames,
       };
 

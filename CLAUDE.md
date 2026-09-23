@@ -1,5 +1,36 @@
 # Masquerade
 
+## Status — Output Round 1 BUILT (2026-09-16, uncommitted — awaiting the runbook)
+
+**Every output now crops to the keep first** (`server/services/outputTransform.ts`: `keepBbox` from the mask raster the
+apply already builds, `planOutputTransform`, `applyOutputTransform` — one plan per apply, shared by the batch path, the
+per-frame fallback and image batches). Letterbox at **Original Size = the keep centred on a black source-sized canvas,
+no resampling** (the trigger is the string `size === 'original'`, never dimension equality); other sizes contain / cover
+with lanczos3; Centre Crop at Original Size is identical to Letterbox; **Stretch is gone from the UI** (a stale
+`'stretch'` is applied as letterbox and logged once). The transform is recorded in a sidecar
+`spokes/template_mask/<jobId>/output_transform.json` (written after the last frame, before `completed`; `.json` is
+invisible to every frame listing) and lands in `manifest.json` as `output_transform` and in `metadata.csv` as ten scalar
+columns (`x_src = crop.x + (x_out − offset.x) / scale.x`); pre-round jobs read `null`. One `[PERF] apply.output` line per
+apply (bbox or `'empty'`, mode, size, output, scale, offset, `warn`). **O2** Keep / Blanked toggle for hand-drawn masks
+(`MaskingTools`), a colour swap at export — Keep = fabric `backgroundColor: 'red'` + black objects; **the export canvas
+background was always transparent, never black** (fabric's `renderAll` wipes the `fillRect`) — locked to Blanked while an
+auto-mask session is active. **O3** the three `output/` debug writes and `outputDir` removed. **O4** sidebar collapse
+fixed (fabric's `div.canvas-container` is laid out at frame px; now a sized wrapper `frame × zoom/100` inside a scroller,
+`aside shrink-0`, `main min-w-0`). **O5** outcome deltas rounded to 2 decimals. **O6** Clear Mask / Erase All →
+`setMaskData(null)` → Apply hidden until something is drawn (it used to ship unmasked frames).
+
+**Sandbox results (report §0):** 24 geometry rows (fan MP4, E9 trapezoid + T0 DICOM, image batch × letterbox / crop ×
+original / 256 / 512 / 640×480): exact dims, the server's frame == the planned transform of the masked source **byte for
+byte**, no resampling at Original Size, round-trip 0, sidecar == manifest; per-frame vs batch parity byte-identical;
+`apply.done` 1094 ms vs 1196 ms. Tests: `outputTransform` 5, `outputParity` 1, `outcomeRounding` 2 (+ all earlier);
+`tsc` 12; both `dist/` files. **Findings (report §5):** `processBatchesInParallel` is dead code (defined, never called —
+the live size fallback is 512 × 512 in `processFrameBuffersInParallel`); image batches apply once per job (item 30);
+the Browser pane ran at dpr 2 this time, so the retina 2× export path was exercised and the server handled it. Driver:
+`scripts/output_eval/check.ts`. Docs: `docs/refactor/OUTPUT_ROUND1_{KICKOFF,RECON,SIGNOFF,REPORT}.md`. Not flag-gated;
+rollback one `git revert`. Next: runbook → deploy → Andre's O4 window + the co-indexing row → 2C.
+
+---
+
 ## Status — Auto-mask Round 2B-2 BUILT (2026-09-11, uncommitted — awaiting the runbook)
 
 The template-mask spoke's **proposal UI** is built behind a second flag **`AUTOMASK_UI`** (default off; `ui_enabled` stamped

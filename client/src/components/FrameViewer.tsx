@@ -234,17 +234,17 @@ export default function FrameViewer({ jobId, onContinueToDownload, onBackToInfer
   );
 
   // ── Aspect-mode warning gate ────────────────────────────────────────
-  // Bbox coords are stored in source-video pixel space. When outputSize is
-  // 'original' OR aspectRatioMode is 'letterbox', the displayed frame's
-  // content area still has the source-video aspect ratio (with possible
-  // black bars), so the SVG viewBox aligns. With 'crop' or 'stretch', the
-  // frame is geometrically warped and bbox positions can drift.
+  // Bbox coords are stored in the frame the AI spoke displayed. Output Round 1
+  // crops every output to the kept region first, so at any size other than
+  // 'original' the frame's content is the KEEP's aspect, not the source's, and
+  // the source-sized viewBox no longer aligns — letterbox included (the old
+  // "letterbox keeps the source aspect" premise no longer holds). At 'original'
+  // the output has the source dimensions and the viewer draws on that same frame.
   const aspectMaybeOff = useMemo(() => {
     const os = inferenceData?.outputSettings;
     if (!os) return false;
     const size = os.size || 'original';
-    const mode = os.aspectRatioMode || 'letterbox';
-    return size !== 'original' && mode !== 'letterbox';
+    return size !== 'original';
   }, [inferenceData?.outputSettings]);
 
   // ── Mode-aware prefetch window ──────────────────────────────────────

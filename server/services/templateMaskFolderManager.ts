@@ -10,6 +10,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { SPOKE_TEMPLATE_MASK_DIR, resolveWithinRoot } from './cleanup';
 
+/** Output Round 1: the per-job transform sidecar beside the masked frames (read by frameAccess.readOutputTransform). */
+export const OUTPUT_TRANSFORM_FILENAME = 'output_transform.json';
+
 export class TempFolderManager {
   private static readonly TEMP_BASE = SPOKE_TEMPLATE_MASK_DIR;
   
@@ -97,6 +100,17 @@ export class TempFolderManager {
   /**
    * Get all processed images from a job's temp folder
    */
+  /**
+   * Output Round 1 — the per-job output transform sidecar (`output_transform.json`), written after the last masked
+   * frame and before the job is marked complete, so a download can never see frames without it. A `.json` file is
+   * invisible to every frame listing (they match png/jpg/jpeg) and is swept with the frames (24 h).
+   */
+  static async saveOutputTransform(jobId: string, transform: unknown): Promise<string> {
+    const filePath = resolveWithinRoot(this.TEMP_BASE, jobId, OUTPUT_TRANSFORM_FILENAME);
+    await fs.writeFile(filePath, JSON.stringify(transform, null, 1));
+    return filePath;
+  }
+
   static async getProcessedImages(jobId: string): Promise<string[]> {
     const folderPath = this.getJobTempFolder(jobId);
     

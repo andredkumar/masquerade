@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useReducer, useMemo } from "react";
 import { useLocation } from "wouter";
 import { useJob } from "@/contexts/JobContext";
-import MaskingCanvas, { type ProposalEvent, type ProposalLayerProps } from "@/components/MaskingCanvas";
+import MaskingCanvas, { type ProposalEvent, type ProposalLayerProps, type MaskMode } from "@/components/MaskingCanvas";
 import AutomaskProposalBar from "@/components/AutomaskProposalBar";
 import MaskingTools from "@/components/MaskingTools";
 import ProcessingControls from "@/components/ProcessingControls";
@@ -37,6 +37,10 @@ export default function TemplateMaskSpokePage() {
   const [goneReason, setGoneReason] = useState<GoneReason>(null);
   const [maskData, setMaskData] = useState<MaskData | null>(null);
   const [selectedTool, setSelectedTool] = useState<string>("rectangle");
+  // Output Round 1 (O2): one Keep / Exclude toggle per job, default Exclude (today's behaviour). Locked to Exclude while
+  // an auto-mask proposal or accepted cone is on the canvas — the evenodd path already encodes keep-semantics and would
+  // invert under the swap (kickoff §2).
+  const [maskMode, setMaskMode] = useState<MaskMode>("exclude");
   const [canvasZoom, setCanvasZoom] = useState(75);
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastProcessedSettings, setLastProcessedSettings] = useState<OutputSettings | null>(null);
@@ -61,6 +65,8 @@ export default function TemplateMaskSpokePage() {
       setSelectedTool("select");
     }
   }, [proposalBody, session]);
+  const maskModeLocked = !!(session && !session.dismissed);
+  const effectiveMaskMode: MaskMode = maskModeLocked ? "exclude" : maskMode;
   const canvasProposal = useMemo<ProposalLayerProps | null>(
     () => (session && !session.dismissed ? { shape: session.current, bound: session.body.bound, margin: session.body.margin_px, mode: session.mode } : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -231,6 +237,13 @@ export default function TemplateMaskSpokePage() {
       : "Extracting frames…";
 
   const handleMaskUpdate = (newMaskData: MaskData) => {
+    // Output Round 1 (O6, sign-off §2): Clear Mask and Erase All report a maskData with no PNG. Before this round that
+    // left Apply enabled on a mask the server's coordinate fallback rendered as nothing — a download of unmasked
+    // frames labelled as masked. No PNG = no mask: Apply stays hidden until something is drawn, in both toggle modes.
+    if (!newMaskData.canvasDataUrl) {
+      setMaskData(null);
+      return;
+    }
     setMaskData(newMaskData);
     // 2B-2: in accepted mode the canvas reports one update for the accept hand-off (flagged by the 'accepted' event just
     // before it); any other update is a hand stroke unioned with the cone (sign-off §10-E) → the outcome becomes `edit`.
@@ -345,7 +358,7 @@ export default function TemplateMaskSpokePage() {
 
       <div className="flex h-[calc(100vh-65px)]">
         {/* Sidebar — same layout as home.tsx Steps 2-3 */}
-        <aside className="w-80 border-r border-border bg-card flex flex-col overflow-y-auto">
+        <aside className="w-80 shrink-0 border-r border-border bg-card flex flex-col overflow-y-auto">
           {/* Masking tools */}
           <div className="p-4 border-b border-border">
             <h2 className="text-lg font-semibold">Draw Mask</h2>
@@ -355,6 +368,9 @@ export default function TemplateMaskSpokePage() {
             onToolChange={setSelectedTool}
             maskData={maskData}
             onMaskUpdate={handleMaskUpdate}
+            maskMode={effectiveMaskMode}
+            onMaskModeChange={setMaskMode}
+            maskModeLocked={maskModeLocked}
           />
 
           {/* Processing controls */}
@@ -383,7 +399,7 @@ export default function TemplateMaskSpokePage() {
         </aside>
 
         {/* Main canvas area */}
-        <main className="flex-1 flex flex-col">
+        <main className="flex-1 min-w-0 flex flex-col">
           {session && !session.dismissed && (
             <div className="px-6 pt-4">
               <AutomaskProposalBar
@@ -401,7 +417,7 @@ export default function TemplateMaskSpokePage() {
               />
             </div>
           )}
-          <div className="flex-1 p-6 relative">
+          <div className="flex-1 min-h-0 p-6 relative overflow-auto">
             {frameStatus === "loading" ? (
               <div className="flex items-center justify-center h-full">
                 <Loader2 className="animate-spin text-muted-foreground" size={32} />
@@ -416,6 +432,7 @@ export default function TemplateMaskSpokePage() {
                 maskData={maskData}
                 proposal={canvasProposal}
                 onProposalEvent={handleProposalEvent}
+                maskMode={effectiveMaskMode}
               />
             )}
 

@@ -220,9 +220,9 @@ export default function ProcessingControls({
               <HelpCircle size={14} className="text-muted-foreground hover:text-foreground cursor-help" />
               <div className="invisible group-hover:visible absolute z-50 left-0 top-6 w-96 bg-popover border border-border rounded-md shadow-lg p-3 text-xs">
                 <div className="space-y-3">
-                  <div><strong>Stretch to Fit:</strong> Stretches image to exact output size (may distort proportions). Use when exact dimensions matter more than preserving natural proportions, like creating thumbnails for grid layouts.</div>
-                  <div><strong>Letterbox with Padding:</strong> Preserves aspect ratio, adds black bars if needed. Use when you need the full image visible without cropping, like creating video previews or displaying artwork.</div>
-                  <div><strong>Center Crop:</strong> Preserves aspect ratio, crops excess content. Use when you want the most important central content to fill the frame, like profile photos or product images.</div>
+                  <div>Every output is first cropped to the kept region — everything your mask leaves visible — so the cone sits where you expect, not where the scanner put it.</div>
+                  <div><strong>Letterbox with Padding:</strong> The kept region is centred with black padding. At Original Size it is centred without scaling, so pixel scale is identical across a dataset; at any other size it is scaled to fit inside the output.</div>
+                  <div><strong>Center Crop:</strong> The kept region fills the output; edges are cropped evenly. At Original Size this is identical to Letterbox — the kept region always fits its own frame.</div>
                 </div>
               </div>
             </div>
@@ -232,15 +232,13 @@ export default function ProcessingControls({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="stretch">Stretch to Fit</SelectItem>
               <SelectItem value="letterbox">Letterbox with Padding</SelectItem>
               <SelectItem value="crop">Center Crop</SelectItem>
             </SelectContent>
           </Select>
           <p className="text-xs text-muted-foreground">
-            {aspectRatioMode === 'stretch' && 'Stretches image to exact output size (may distort)'}
-            {aspectRatioMode === 'letterbox' && 'Preserves aspect ratio, adds black bars if needed'}
-            {aspectRatioMode === 'crop' && 'Preserves aspect ratio, crops excess content'}
+            {aspectRatioMode === 'letterbox' && (outputSize === 'original' ? 'Kept region centred without scaling' : 'Kept region scaled to fit, centred on black padding')}
+            {aspectRatioMode === 'crop' && (outputSize === 'original' ? 'Kept region centred without scaling (same as Letterbox at Original Size)' : 'Kept region fills the output; edges cropped evenly')}
           </p>
         </div>
 

@@ -14,6 +14,25 @@
 import path from 'path';
 import { promises as fs } from 'fs';
 import { SPOKE_TEMPLATE_MASK_DIR, TEMP_EXTRACTED_DIR, UPLOADS_DIR, resolveWithinRoot } from './cleanup';
+import type { OutputTransform } from './outputTransform';
+
+const OUTPUT_TRANSFORM_FILENAME = 'output_transform.json';
+
+/**
+ * Output Round 1 — read the per-job output transform the apply wrote beside the masked frames
+ * (`spokes/template_mask/<jobId>/output_transform.json`). null when absent (a job applied before this round, or a
+ * swept dir) or unreadable — the manifest then carries `output_transform: null`, which is the correct statement.
+ */
+export async function readOutputTransform(jobId: string, baseDir: string = SPOKE_TEMPLATE_MASK_DIR): Promise<OutputTransform | null> {
+  let absPath: string;
+  try { absPath = resolveWithinRoot(baseDir, jobId, OUTPUT_TRANSFORM_FILENAME); } catch { return null; }
+  try {
+    const t = JSON.parse(await fs.readFile(absPath, 'utf8')) as OutputTransform;
+    return t && typeof t === 'object' && t.crop && t.output ? t : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Resolve the absolute path of a single processed frame and validate it sits

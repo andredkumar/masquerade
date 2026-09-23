@@ -1,21 +1,31 @@
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { Circle, Square, Triangle, PaintbrushVertical, Eraser, Undo, Trash2, Info, MousePointer } from "lucide-react";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Circle, Square, Triangle, PaintbrushVertical, Eraser, Undo, Trash2, Info, MousePointer, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { MaskData } from "@shared/schema";
+import type { MaskMode } from "@/components/MaskingCanvas";
 
 interface MaskingToolsProps {
   selectedTool: string;
   onToolChange: (tool: string) => void;
   maskData: MaskData | null;
   onMaskUpdate: (maskData: MaskData) => void;
+  /** Output Round 1 (O2): Exclude = what you draw is blanked (default, today); Keep = what you draw is kept. */
+  maskMode?: MaskMode;
+  onMaskModeChange?: (mode: MaskMode) => void;
+  /** Locked to Exclude while an auto-mask proposal or accepted cone is on the canvas (kickoff §2). */
+  maskModeLocked?: boolean;
 }
 
 export default function MaskingTools({ 
   selectedTool, 
   onToolChange, 
   maskData, 
-  onMaskUpdate 
+  onMaskUpdate,
+  maskMode = 'exclude',
+  onMaskModeChange,
+  maskModeLocked = false
 }: MaskingToolsProps) {
 
   const presetShapes = [
@@ -44,6 +54,35 @@ export default function MaskingTools({
 
   return (
     <div className="p-6 border-b border-border">
+
+      {/* Output Round 1 (O2): Keep / Exclude — one toggle per job, default Exclude (today's behaviour) */}
+      <div className="mb-4">
+        <Label className="text-sm font-medium text-muted-foreground mb-2 block">
+          What you draw is
+        </Label>
+        <ToggleGroup
+          type="single"
+          variant="outline"
+          className="justify-start"
+          value={maskMode}
+          disabled={maskModeLocked}
+          onValueChange={(v) => { if (v === 'exclude' || v === 'keep') onMaskModeChange?.(v); }}
+          aria-label="Mask mode"
+          data-testid="mask-mode"
+        >
+          <ToggleGroupItem value="exclude" className="flex-1" data-testid="mask-mode-exclude">Blanked</ToggleGroupItem>
+          <ToggleGroupItem value="keep" className="flex-1" data-testid="mask-mode-keep">Kept</ToggleGroupItem>
+        </ToggleGroup>
+        <p className="mt-1 text-xs text-muted-foreground" data-testid="mask-mode-hint">
+          {maskModeLocked ? (
+            <span className="inline-flex items-center gap-1"><Lock size={12} /> Auto-mask active — the drawn region is blanked.</span>
+          ) : maskMode === 'keep' ? (
+            'Everything outside what you draw is blanked.'
+          ) : (
+            'What you draw is blanked; everything else stays.'
+          )}
+        </p>
+      </div>
       
       {/* Select Tool */}
       <div className="mb-4">

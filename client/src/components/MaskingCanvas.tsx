@@ -31,7 +31,11 @@ interface MaskingCanvasProps {
   maskData?: MaskData | null;
   proposal?: ProposalLayerProps | null;
   onProposalEvent?: (e: ProposalEvent) => void;
+  /** Output Round 1 (O2): what a drawn object means at export — 'exclude' (what you draw is blanked; today) or 'keep'. */
+  maskMode?: MaskMode;
 }
+
+export type MaskMode = 'exclude' | 'keep';
 
 const HANDLE_R = 8;
 
@@ -57,7 +61,8 @@ export default function MaskingCanvas({
   onZoomChange,
   maskData: externalMaskData,
   proposal = null,
-  onProposalEvent
+  onProposalEvent,
+  maskMode = 'exclude'
 }: MaskingCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -87,6 +92,11 @@ export default function MaskingCanvas({
   const draggingRef = useRef(false);            // fabric is transforming the handle: never reposition it
   const layerRenderedRef = useRef(false);
   const [frameLoaded, setFrameLoaded] = useState(0);
+  // Output Round 1 (O2): the export runs from fabric handlers registered once, so it reads the mode through a ref.
+  const maskModeRef = useRef<MaskMode>(maskMode);
+  maskModeRef.current = maskMode;
+  // Output Round 1 (O4): the frame's pixel size, so the canvas's laid-out box can equal its visual (zoomed) size.
+  const [frameDims, setFrameDims] = useState<{ w: number; h: number } | null>(null);
 
   const internalRemoval = (fn: () => void) => {
     internalRemovalRef.current = true;
@@ -360,6 +370,7 @@ export default function MaskingCanvas({
       canvas.sendToBack(img);
       canvas.renderAll();
       setFrameLoaded((n) => n + 1);        // 2B-2: the proposal layer is (re)added after the frame
+      setFrameDims({ w: imgWidth, h: imgHeight });   // Output Round 1 (O4)
     });
   }, [firstFrame]);
 
@@ -470,6 +481,19 @@ export default function MaskingCanvas({
       onProposalEventRef.current?.({ kind: 'rendered' });
     }
   }, [proposal, frameLoaded]);
+
+  // Output Round 1 (O2): a mode flip re-exports the current drawing with the swapped fills — nothing is re-drawn.
+  // The toggle is locked to Exclude while an _automask object is on the canvas (the spoke enforces it), so this never
+  // exports a proposal layer.
+  const maskModeSeen = useRef(maskMode);
+  useEffect(() => {
+    if (maskModeSeen.current === maskMode) return;
+    maskModeSeen.current = maskMode;
+    const canvas = fabricCanvasRef.current;
+    if (!canvas) return;
+    const hasUserObjects = canvas.getObjects().some((o: any) => o.type !== 'image' && !o._automask);
+    if (hasUserObjects) updateMaskFromCanvas();
+  }, [maskMode]);
 
   // Handle tool changes
   useEffect(() => {
@@ -1097,14 +1121,21 @@ export default function MaskingCanvas({
     const tempCtx = tempCanvas.getContext('2d');
     
     if (tempCtx) {
-      // Fill with black background (non-mask areas)
+      // Output Round 1 (O2): the server blanks red (r > 150, a > 128). Exclude = today's export exactly: the fillRect
+      // below is wiped by fabric's renderAll (it clears the canvas before drawing), so the background has always been
+      // TRANSPARENT, which the server reads as unmasked, with red objects on top. Keep = the fabric canvas itself gets a
+      // red background (the only fill renderAll preserves) and the objects are drawn black — the PNG leaves the browser
+      // already in the server's convention; nothing server-side changes.
+      const keepMode = maskModeRef.current === 'keep';
+      const inkColour = keepMode ? 'black' : 'red';
       tempCtx.fillStyle = 'black';
       tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
       
       // Create a temporary Fabric canvas for rendering
       const maskCanvas = new window.fabric.Canvas(tempCanvas, {
         width: canvasWidth,
-        height: canvasHeight
+        height: canvasHeight,
+        ...(keepMode ? { backgroundColor: 'red' } : {})
       });
       
       // Add all mask objects with red color for detection
@@ -1120,14 +1151,14 @@ export default function MaskingCanvas({
             originalStroke: obj.stroke
           });
           clonedObj.set({
-            fill: 'red',
-            stroke: 'red',
+            fill: inkColour,
+            stroke: inkColour,
             strokeWidth: obj.strokeWidth || 36
           });
         } else {
           clonedObj.set({
-            fill: 'red',
-            stroke: 'red',
+            fill: inkColour,
+            stroke: inkColour,
             strokeWidth: obj.strokeWidth || 1
           });
         }
@@ -1459,20 +1490,34 @@ export default function MaskingCanvas({
       </div>
 
 
-      {/* Main Canvas Area */}
-      <div 
-        ref={containerRef}
-        className="w-full h-full flex items-start justify-center bg-muted/20"
-        style={{ 
-          transform: `scale(${zoom / 100}) translate(${panOffset.x}px, ${panOffset.y}px)`,
-          transformOrigin: 'center top'
-        }}
-      >
-        <canvas
-          ref={canvasRef}
-          className="border border-border rounded-lg shadow-lg"
-          data-testid="masking-canvas"
-        />
+      {/* Main Canvas Area — Output Round 1 (O4): fabric's wrapper is laid out at the frame's pixel size and the
+          zoom is a CSS transform that changes nothing in layout, so a wide frame used to push the sidebar off the
+          page. The sized wrapper makes the laid-out box equal the visual (zoomed) box; the scroller inside the
+          root keeps the zoom / pan controls pinned while the canvas scrolls. Pointer mapping is unchanged
+          (fabric reads the upper canvas's bounding rect). */}
+      <div className="absolute inset-0 overflow-auto bg-muted/20" data-testid="masking-canvas-scroller">
+        <div
+          className="mx-auto"
+          style={frameDims ? { width: frameDims.w * (zoom / 100), height: frameDims.h * (zoom / 100) } : undefined}
+          data-testid="masking-canvas-frame"
+        >
+          <div
+            ref={containerRef}
+            className="flex items-start justify-center"
+            style={{
+              width: frameDims ? frameDims.w : undefined,
+              height: frameDims ? frameDims.h : undefined,
+              transform: `scale(${zoom / 100}) translate(${panOffset.x}px, ${panOffset.y}px)`,
+              transformOrigin: 'top left'
+            }}
+          >
+            <canvas
+              ref={canvasRef}
+              className="border border-border rounded-lg shadow-lg"
+              data-testid="masking-canvas"
+            />
+          </div>
+        </div>
       </div>
 
       {/* Canvas Info Overlay */}

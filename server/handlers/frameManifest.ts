@@ -1,4 +1,5 @@
 import type { AiLabel } from "@shared/schema";
+import { OUTPUT_TRANSFORM_CSV_COLUMNS, outputTransformCsvValues, type OutputTransform } from "../services/outputTransform";
 
 // ── Phase 6 (b)-lite: shared per-frame manifest + CSV core ───────────────────
 //
@@ -27,6 +28,12 @@ export interface PerFrameManifestInput {
   labels: AiLabel[];
   /** Output image format for the nominal `filename` field (e.g. 'png'). */
   outputFormat: string;
+  /**
+   * Output Round 1: the per-job output transform (crop → centre / contain / cover) the apply recorded beside the
+   * frames, or null for jobs applied before this round / raw-frame runs. Repeated on every CSV row as ten scalar
+   * columns (blank when null) so a pandas user never parses JSON out of a cell.
+   */
+  outputTransform?: OutputTransform | null;
 }
 
 // Derive split assignment from frame index (80/10/10 train/val/test).
@@ -52,7 +59,7 @@ function getLabelFrameConfidence(label: AiLabel, frameIdx: number): number | nul
  * manifest object and appends `csv` to its ZIP.
  */
 export function buildPerFrameManifestAndCsv(input: PerFrameManifestInput) {
-  const { frameCount, labels, outputFormat } = input;
+  const { frameCount, labels, outputFormat, outputTransform = null } = input;
 
   const frames = Array.from({ length: frameCount }, (_, i) => {
     // Each approved label carries THIS frame's individual confidence (from that
@@ -79,9 +86,10 @@ export function buildPerFrameManifestAndCsv(input: PerFrameManifestInput) {
   // metadata.csv — target/confidence columns are the semicolon-joined label sets.
   const aiTarget = labels.map(l => l.target).join('; ');
   const aiConfidence = labels.map(l => l.confidence !== null ? l.confidence.toString() : '').join('; ');
-  const csvHeaders = ['filename', 'frame_number', 'split', 'ai_target', 'ai_confidence'];
+  const csvHeaders = ['filename', 'frame_number', 'split', 'ai_target', 'ai_confidence', ...OUTPUT_TRANSFORM_CSV_COLUMNS];
+  const transformCells = outputTransformCsvValues(outputTransform);
   const csvRows = frames.map(f =>
-    [f.filename, f.frame_number, f.split, `"${aiTarget}"`, `"${aiConfidence}"`].join(',')
+    [f.filename, f.frame_number, f.split, `"${aiTarget}"`, `"${aiConfidence}"`, ...transformCells].join(',')
   );
   const csv = [csvHeaders.join(','), ...csvRows].join('\n');
 

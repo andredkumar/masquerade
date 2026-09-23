@@ -12,6 +12,7 @@ import { listRawFrameFiles, isCompletePngBuffer } from './frameAccess';
 import os from 'os';
 import { perfMark, perfSpan } from './perf';
 import { enqueueProposalAtReady } from './automask';
+import { keepBbox, planOutputTransform, applyOutputTransform, normaliseAspectMode, type OutputTransform, type KeepBbox } from './outputTransform';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -36,6 +37,8 @@ interface ApplyMask {
   /** Byte offsets `(y*width + x) * 3` of every masked pixel, ascending. */
   maskedOffsets: Uint32Array;
   maskedPixels: number;
+  /** Output Round 1: the keep's bounding box, derived once per apply by the caller (null = the mask blanks everything). */
+  keepBbox?: KeepBbox | null;
 }
 
 interface CoordinateTransformParams {
@@ -49,21 +52,10 @@ interface CoordinateTransformParams {
 export class VideoProcessor {
   private frameExtractor: FrameExtractor;
   private io: Server;
-  private outputDir: string;
 
   constructor(io: Server) {
     this.frameExtractor = new FrameExtractor();
     this.io = io;
-    this.outputDir = path.join(process.cwd(), 'output');
-    this.ensureOutputDir();
-  }
-
-  private async ensureOutputDir() {
-    try {
-      await fs.mkdir(this.outputDir, { recursive: true });
-    } catch (error) {
-      console.error('Failed to create output directory:', error);
-    }
   }
 
   /**
@@ -492,7 +484,7 @@ export class VideoProcessor {
 
       // Process batches in parallel — each batch gets a SLICE of the already
       // extracted frame buffers, so ffmpeg is never re-invoked here.
-      const processedFrames = await this.processFrameBuffersInParallel(
+      const { frames: processedFrames, transform: outputTransform } = await this.processFrameBuffersInParallel(
         jobId,
         extractedBuffers,
         batches,
@@ -528,6 +520,9 @@ export class VideoProcessor {
       }
       endWriteAll({ frames: savedCount, ext });
       console.log(`💾 Saved ${savedCount} processed frames to ${tempDir}`);
+      // Output Round 1: the transform sidecar goes beside the frames, after the last one and before 'completed'
+      // (sign-off D1) — a download can never see frames without it.
+      if (outputTransform) await TempFolderManager.saveOutputTransform(jobId, outputTransform);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
@@ -817,7 +812,13 @@ export class VideoProcessor {
       } else {
         outputSize = { width: 512, height: 512 };
       }
-      
+
+      // Output Round 1 (O1): plan the output transform once for the job record. The per-stack mask build inside
+      // processFrameBatch derives the same bbox from the same mask at the same dimensions; a mixed-dimension batch
+      // (backlog 29) clips per image and the record describes image 0.
+      const setupMask = await this.createMaskRgbaBuffer(maskData, firstImageDimensions.width, firstImageDimensions.height);
+      const imagesTransform = this.planApplyOutput(jobId, keepBbox(setupMask, firstImageDimensions.width, firstImageDimensions.height), firstImageDimensions.width, firstImageDimensions.height, outputSettings, outputSize);
+
       // Extension follows the encoder, not the upload (backlog 22).
       const outputExt: 'png' | 'jpg' = outputSettings.format === 'png' ? 'png' : 'jpg';
 
@@ -959,6 +960,8 @@ export class VideoProcessor {
       // correct subfolder structure and any optional add-ons requested via query params.
       const tempDir = TempFolderManager.getJobTempFolder(jobId);
       console.log(`💾 Image batch frames available at ${tempDir}`);
+      // Output Round 1: the transform sidecar, after the last frame and before 'completed' (sign-off D1).
+      await TempFolderManager.saveOutputTransform(jobId, imagesTransform);
 
       await storage.updateVideoJob(jobId, {
         status: 'completed',
@@ -1250,7 +1253,7 @@ export class VideoProcessor {
     maskData: MaskData,
     outputSettings: OutputSettings,
     prebuiltMask: ApplyMask | null = null,
-  ): Promise<Array<{ frameNumber: number; buffer: Buffer }>> {
+  ): Promise<{ frames: Array<{ frameNumber: number; buffer: Buffer }>; transform: OutputTransform | null }> {
     console.log(`=== PROCESSING ${extractedBuffers.length} PRE-EXTRACTED FRAMES IN ${batches.length} BATCH(ES) ===`);
 
     const processedFrames: Array<{ frameNumber: number; buffer: Buffer }> = [];
@@ -1266,11 +1269,24 @@ export class VideoProcessor {
     } else if (outputSettings.size === 'original') {
       const job = await storage.getVideoJob(jobId);
       outputSize = { width: job?.width || 512, height: job?.height || 512 };
+      // Output Round 1 (sign-off §3.2): the dimension fallback is a latent wrong-size path — say so, nothing more.
+      // (The transform itself takes the frame's real dimensions from the prebuilt mask, so the sidecar stays right.)
+      if (!job?.width || !job?.height) perfMark(jobId, 'apply.output', { warn: 'dims_fallback', outputSize });
     } else if (outputSettings.size && typeof outputSettings.size === 'string' && outputSettings.size.includes('x')) {
       const [w, h] = outputSettings.size.split('x').map(Number);
       outputSize = { width: w, height: h };
     } else {
       outputSize = { width: 512, height: 512 };
+    }
+
+    // Output Round 1 (O1): the keep bbox once per apply from the mask the apply already built; the plan (crop → centre /
+    // contain / cover) is shared with every stack through prebuiltMask.keepBbox and recorded beside the frames.
+    let transform: OutputTransform | null = null;
+    if (prebuiltMask) {
+      prebuiltMask.keepBbox = keepBbox(prebuiltMask.maskRgba, prebuiltMask.width, prebuiltMask.height);
+      transform = this.planApplyOutput(jobId, prebuiltMask.keepBbox, prebuiltMask.width, prebuiltMask.height, outputSettings, outputSize);
+    } else {
+      perfMark(jobId, 'apply.output', { warn: 'prebuild_failed', note: 'per-stack transform, no sidecar' });
     }
 
     const totalFrames = extractedBuffers.length;
@@ -1338,7 +1354,21 @@ export class VideoProcessor {
       });
     });
 
-    return processedFrames.sort((a, b) => a.frameNumber - b.frameNumber);
+    return { frames: processedFrames.sort((a, b) => a.frameNumber - b.frameNumber), transform };
+  }
+
+  /**
+   * Output Round 1 — one plan per apply: normalise the aspect mode (a stale 'stretch' becomes letterbox, logged once),
+   * plan the transform, emit the one `[PERF] apply.output` line. Pure apart from the log.
+   */
+  private planApplyOutput(jobId: string, bbox: KeepBbox | null, frameW: number, frameH: number, outputSettings: OutputSettings, outputSize: { width: number; height: number }): OutputTransform {
+    const { mode, stale } = normaliseAspectMode(outputSettings.aspectRatioMode);
+    const t = planOutputTransform(bbox, frameW, frameH, outputSettings.size, mode, outputSize);
+    perfMark(jobId, 'apply.output', {
+      bbox: t.bbox_empty ? 'empty' : t.crop, mode: t.mode, size: t.size, output: t.output, resampled: t.resampled,
+      scale: t.scale, offset: t.offset, source: t.source, ...(stale ? { warn: 'stretch_as_letterbox', received: outputSettings.aspectRatioMode } : {}),
+    });
+    return t;
   }
 
   private async updateProgress(jobId: string, progress: Partial<ProcessingProgress>) {
@@ -1684,6 +1714,13 @@ export class VideoProcessor {
         maskedPixelsTotal = -1; // counted per frame by the JS loop below
       }
       console.log(`🎭 Mask ${maskFits ? 'reused (prebuilt once per apply)' : 'rebuilt for this stack'}: ${maskRgba.length} bytes, applied to ${volumeDepth} layers`);
+
+      // Output Round 1 (O1): the keep bbox — from the prebuilt mask (derived once per apply) or from this stack's own
+      // build (image batches, or a stack whose frames differ from frame 0) — and the one plan every frame in the stack uses.
+      const stackBbox: KeepBbox | null = maskFits && prebuiltMask && prebuiltMask.keepBbox !== undefined
+        ? prebuiltMask.keepBbox
+        : keepBbox(maskRgba, volumeWidth, volumeHeight);
+      const stackTransform = planOutputTransform(stackBbox, volumeWidth, volumeHeight, firstTask.outputSettings.size, normaliseAspectMode(firstTask.outputSettings.aspectRatioMode).mode, firstTask.outputSize);
       
       // Step 3: Apply mask transformation to entire 3D volume simultaneously  
       console.log('⚡ Applying volumetric mask transformation...');
@@ -1753,37 +1790,9 @@ export class VideoProcessor {
           }
         });
 
-        // CORRECTED 3D PIPELINE: Apply aspect ratio first, then output size
-        // OUTPUT SETTINGS TAKE ABSOLUTE PRIORITY over mask data
-        const aspectMode = outputSettings.aspectRatioMode || 'letterbox';
-        console.log(`📐 3D Pipeline: Applying aspect ratio mode: ${aspectMode} for frame ${frameNumber} (from output settings)`);
-        
-        // Configure resize options based on aspect ratio mode first
-        let resizeOptions: any = { kernel: 'lanczos3' };
-        switch (aspectMode) {
-          case 'stretch':
-            resizeOptions.fit = 'fill';
-            break;
-          case 'letterbox':
-            resizeOptions.fit = 'contain';
-            resizeOptions.background = { r: 0, g: 0, b: 0, alpha: 1 };
-            break;
-          case 'crop':
-            resizeOptions.fit = 'cover';
-            break;
-          default:
-            resizeOptions.fit = 'contain';
-            resizeOptions.background = { r: 0, g: 0, b: 0, alpha: 1 };
-        }
-        
-        // Apply resize with aspect ratio preservation if size is different
-        if (outputSize.width > 0 && outputSize.height > 0 && 
-            (outputSize.width !== volumeWidth || outputSize.height !== volumeHeight)) {
-          processedImage = processedImage.resize(outputSize.width, outputSize.height, resizeOptions);
-          console.log(`📐 3D Frame ${frameNumber}: ${volumeWidth}x${volumeHeight} → ${outputSize.width}x${outputSize.height} (${aspectMode} mode)`);
-        } else {
-          console.log(`📐 3D Frame ${frameNumber}: Keeping original dimensions ${volumeWidth}x${volumeHeight}`);
-        }
+        // Output Round 1 (O1): crop to the keep first, then centre (size 'original', no resampling) / contain / cover —
+        // the one shared plan for the stack; the encoder below is unchanged.
+        processedImage = applyOutputTransform(processedImage, stackTransform);
         
         // Convert to final format (2B addendum §A.1). The encoder now follows
         // `outputSettings.format` instead of being unconditionally JPEG while the
@@ -1869,15 +1878,6 @@ export class VideoProcessor {
       // Load the frame image
       let image = Sharp(frameBuffer);
       
-      // DEBUGGING: Export frame #1 without processing for comparison
-      if (frameNumber === 0) {
-        const unprocessedBuffer = await image.png().toBuffer();
-        const fs = await import('fs');
-        const path = await import('path');
-        const debugPath = path.join('output', `debug_frame_${frameNumber}_original.png`);
-        await fs.promises.writeFile(debugPath, unprocessedBuffer);
-        console.log('🔍 SAVED UNPROCESSED FRAME:', debugPath);
-      }
       
       // Get image metadata to calculate mask coordinates
       const metadata = await image.metadata();
@@ -2033,37 +2033,10 @@ export class VideoProcessor {
         }
       });
 
-      // CORRECTED PIPELINE: Apply aspect ratio FIRST, then handle output size
-      // OUTPUT SETTINGS TAKE ABSOLUTE PRIORITY over mask data
-      const aspectMode = outputSettings.aspectRatioMode || 'letterbox';
-      console.log(`⚡ Pipeline: Applying aspect ratio mode: ${aspectMode} (from output settings, ignoring mask data)`);
-      
-      // Step 1: Apply aspect ratio handling first
-      let resizeOptions: any = {};
-      switch (aspectMode) {
-        case 'stretch':
-          resizeOptions = { fit: 'fill' };
-          break;
-        case 'letterbox':
-          resizeOptions = { 
-            fit: 'contain',
-            background: { r: 0, g: 0, b: 0, alpha: 1 }
-          };
-          break;
-        case 'crop':
-          resizeOptions = { fit: 'cover' };
-          break;
-        default:
-          resizeOptions = { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 1 } };
-      }
-
-      // Step 2: Apply output size with aspect ratio preservation
-      if (outputSettings.size !== 'original' && outputSize.width > 0 && outputSize.height > 0) {
-        console.log(`⚡ Pipeline resize: ${originalWidth}x${originalHeight} → ${outputSize.width}x${outputSize.height} (${aspectMode} mode)`);
-        processedImage = processedImage.resize(outputSize.width, outputSize.height, resizeOptions);
-      } else {
-        console.log('⚡ Pipeline: Original size - no resize needed');
-      }
+      // Output Round 1 (O1): crop to the keep first — the same plan the batch path uses (this per-frame path is the
+      // image-batch exception fallback); the encoder below is unchanged.
+      const frameTransform = planOutputTransform(keepBbox(maskRgba, originalWidth, originalHeight), originalWidth, originalHeight, outputSettings.size, normaliseAspectMode(outputSettings.aspectRatioMode).mode, outputSize);
+      processedImage = applyOutputTransform(processedImage, frameTransform);
 
       // PIPELINE STEP 3: encode to the requested output format (backlog 22).
       // Same constants as the batch encoder at :1783 — JPEG q90 default,
@@ -2074,27 +2047,6 @@ export class VideoProcessor {
         ? await processedImage.png({ compressionLevel: 3, adaptiveFiltering: false }).toBuffer()
         : await processedImage.jpeg({ quality: 90 }).toBuffer();
       
-      // DEBUGGING: Export processed frame #1 for comparison
-      if (frameNumber === 0) {
-        const fs = await import('fs');
-        const path = await import('path');
-        const debugPath = path.join('output', `debug_frame_${frameNumber}_processed.png`);
-        await fs.promises.writeFile(debugPath, processedBuffer);
-        console.log('🔍 SAVED PROCESSED FRAME:', debugPath);
-        
-        // Also save the mask buffer as an image for inspection
-        const maskDebugBuffer = await Sharp(maskRgba, {
-          raw: {
-            width: originalWidth,
-            height: originalHeight,
-            channels: 4 // RGBA
-          }
-        }).png().toBuffer();
-        const maskDebugPath = path.join('output', `debug_frame_${frameNumber}_mask.png`);
-        await fs.promises.writeFile(maskDebugPath, maskDebugBuffer);
-        console.log('🔍 SAVED MASK VISUALIZATION:', maskDebugPath);
-      }
-
       return {
         frameNumber,
         processedBuffer,
