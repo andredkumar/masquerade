@@ -104,6 +104,24 @@ export function applyOutputTransform(image: Sharp, t: OutputTransform): Sharp {
   return img.resize(t.output.w, t.output.h, { fit: t.mode === 'letterbox' ? 'contain' : 'cover', position: 'centre', background: BLACK, kernel: 'lanczos3' });
 }
 
+/**
+ * Output Round 1b (F2) — the masked offsets that can reach the output: those whose pixel lies inside the crop. Every
+ * other masked pixel is discarded by the `extract` a step later, so zeroing it is wasted work (in Keep mode ~98 % of the
+ * frame). Offsets are the apply mask's byte offsets `(y·frameW + x)·3`; order is preserved. A crop covering the whole
+ * frame returns the input array itself (the Remove-mode common case costs nothing).
+ */
+export function offsetsInCrop(offsets: Uint32Array, frameW: number, frameH: number, crop: KeepBbox): Uint32Array {
+  const x0 = crop.x, x1 = crop.x + crop.w, y0 = crop.y, y1 = crop.y + crop.h;
+  if (x0 <= 0 && y0 <= 0 && x1 >= frameW && y1 >= frameH) return offsets;
+  const inside = (o: number) => { const p = o / 3, x = p % frameW, y = (p - x) / frameW; return x >= x0 && x < x1 && y >= y0 && y < y1; };
+  let n = 0;
+  for (let k = 0; k < offsets.length; k++) if (inside(offsets[k])) n++;
+  const out = new Uint32Array(n);
+  let j = 0;
+  for (let k = 0; k < offsets.length; k++) if (inside(offsets[k])) out[j++] = offsets[k];
+  return out;
+}
+
 /** Output → source, the record's own convention (used by the eval and the manifest README). */
 export function outputToSource(t: OutputTransform, xOut: number, yOut: number): { x: number; y: number } {
   return { x: t.crop.x + (xOut - t.offset.x) / t.scale.x, y: t.crop.y + (yOut - t.offset.y) / t.scale.y };

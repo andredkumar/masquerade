@@ -1,6 +1,31 @@
 # Masquerade
 
-## Status — Output Round 1 BUILT (2026-09-16, uncommitted — awaiting the runbook)
+## Status — Output Round 1b BUILT (2026-09-23, uncommitted — awaiting the runbook)
+
+**The apply cost of the crop, measured then removed where it mattered.** Prod read `apply.done` 11.4 s vs 8.5 s after
+Output Round 1; step 1 (`OUTPUT_ROUND1B_STEP1.md`) measured the crop serially at **0.41–0.47 ms/frame (~5 % of the
+apply)**, so F1 (an Original-size row-copy fast path) was **not built** by the pre-committed rule, and the "34 %" turned
+out to be inside the box's own spread (identical old code ran 8.5 s and 11.1 s on consecutive applies). **F2 shipped:**
+`offsetsInCrop` (`outputTransform.ts`) keeps only the masked offsets inside the crop, once per apply in
+`planPrebuiltMask` (`videoProcessor.ts`); the batch per-stack fallback and the per-frame path scan the crop rectangle
+instead of the frame. Every pixel outside the crop is discarded by the `extract` anyway, so **no output byte changes**
+(32 cases × 3 paths, 46/46 and 348/348 real frames, 24/24 geometry rows, reference diff 0). Keep mode: 2 M offsets → 0,
+`mask_ms` 2.6 → 0 ms/frame serially (prod ~15 → ~0; expect the 46-frame 1080p Keep job ≈ 3.5–3.8 s from 4.26 s — the
+rest is `apply.mask_build`, backlog). Tests `outputF2` 3; tool `scripts/output_eval/serial_bench.ts`. Docs:
+`docs/refactor/OUTPUT_ROUND1B_{KICKOFF,STEP1,SIGNOFF,REPORT}.md`. Rollback one `git revert`.
+
+**Working-loop rule (binding):** per-frame perf rows run serially (`UV_THREADPOOL_SIZE=1`, sharp concurrency 1) or on
+prod, and time executed work: sharp pipelines are lazy, so a boundary around pipeline construction measures nothing,
+and per-frame wall means under a shared queue are waits, not costs. **The exception is `mask_ms`, which is synchronous:
+if it moves between two runs of identical work, suspect the box (CPU credits, contention) before the diff.**
+
+**Runbook conventions:** collect commands use `pm2 logs … --nostream` (without it pm2 never exits, and a `grep` feeding
+another stage block-buffers ~4 KB that is lost on ^C); multi-stage live tails use `grep --line-buffered` on every stage
+but the last.
+
+---
+
+## Status — Output Round 1 DEPLOYED (`2dea93e`, 2026-09-23; built 2026-09-16)
 
 **Every output now crops to the keep first** (`server/services/outputTransform.ts`: `keepBbox` from the mask raster the
 apply already builds, `planOutputTransform`, `applyOutputTransform` — one plan per apply, shared by the batch path, the

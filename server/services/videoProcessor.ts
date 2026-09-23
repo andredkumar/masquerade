@@ -12,7 +12,7 @@ import { listRawFrameFiles, isCompletePngBuffer } from './frameAccess';
 import os from 'os';
 import { perfMark, perfSpan } from './perf';
 import { enqueueProposalAtReady } from './automask';
-import { keepBbox, planOutputTransform, applyOutputTransform, normaliseAspectMode, type OutputTransform, type KeepBbox } from './outputTransform';
+import { keepBbox, planOutputTransform, applyOutputTransform, normaliseAspectMode, offsetsInCrop, type OutputTransform, type KeepBbox } from './outputTransform';
 
 interface TransformationMatrix {
   scaleX: number;
@@ -1283,8 +1283,7 @@ export class VideoProcessor {
     // contain / cover) is shared with every stack through prebuiltMask.keepBbox and recorded beside the frames.
     let transform: OutputTransform | null = null;
     if (prebuiltMask) {
-      prebuiltMask.keepBbox = keepBbox(prebuiltMask.maskRgba, prebuiltMask.width, prebuiltMask.height);
-      transform = this.planApplyOutput(jobId, prebuiltMask.keepBbox, prebuiltMask.width, prebuiltMask.height, outputSettings, outputSize);
+      transform = this.planPrebuiltMask(jobId, prebuiltMask, outputSettings, outputSize);
     } else {
       perfMark(jobId, 'apply.output', { warn: 'prebuild_failed', note: 'per-stack transform, no sidecar' });
     }
@@ -1355,6 +1354,20 @@ export class VideoProcessor {
     });
 
     return { frames: processedFrames.sort((a, b) => a.frameNumber - b.frameNumber), transform };
+  }
+
+  /**
+   * Output Round 1 + 1b — the once-per-apply step on the mask `buildApplyMask` produced (which is not edited): derive the
+   * keep bbox, plan the output transform, then (F2) keep only the masked offsets inside the crop — every offset outside
+   * it is discarded by the `extract` a step later, so this changes no output pixel and makes the per-frame offsets loop
+   * proportional to the crop instead of the frame (Keep mode: ~2 M offsets → the few inside the drawn region).
+   * `maskedPixels` stays the mask's own count (it is what `apply.mask_build` reported).
+   */
+  private planPrebuiltMask(jobId: string, prebuiltMask: ApplyMask, outputSettings: OutputSettings, outputSize: { width: number; height: number }): OutputTransform {
+    prebuiltMask.keepBbox = keepBbox(prebuiltMask.maskRgba, prebuiltMask.width, prebuiltMask.height);
+    const t = this.planApplyOutput(jobId, prebuiltMask.keepBbox, prebuiltMask.width, prebuiltMask.height, outputSettings, outputSize);
+    prebuiltMask.maskedOffsets = offsetsInCrop(prebuiltMask.maskedOffsets, prebuiltMask.width, prebuiltMask.height, t.crop);
+    return t;
   }
 
   /**
@@ -1760,16 +1773,22 @@ export class VideoProcessor {
           }
         } else {
           maskedPixels = 0;
-          // Apply the same mask to this frame layer
-          for (let i = 0; i < pixelsPerFrame; i++) {
-            const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha
+          // Output Round 1b (F2): scan only the crop rectangle — pixels outside it are discarded by the extract below,
+          // so blanking them changed nothing in the output. Same test, same writes, inside the crop.
+          const crop = stackTransform.crop;
+          for (let y = crop.y; y < crop.y + crop.h; y++) {
+            const row = y * volumeWidth;
+            for (let x = crop.x; x < crop.x + crop.w; x++) {
+              const i = row + x;
+              const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha
 
-            if (maskAlpha > 0) {
-              const pixelIndex = i * imageChannels;
-              framePixels[pixelIndex] = 0;     // Red = 0 (black)
-              framePixels[pixelIndex + 1] = 0; // Green = 0 (black)
-              framePixels[pixelIndex + 2] = 0; // Blue = 0 (black)
-              maskedPixels++;
+              if (maskAlpha > 0) {
+                const pixelIndex = i * imageChannels;
+                framePixels[pixelIndex] = 0;     // Red = 0 (black)
+                framePixels[pixelIndex + 1] = 0; // Green = 0 (black)
+                framePixels[pixelIndex + 2] = 0; // Blue = 0 (black)
+                maskedPixels++;
+              }
             }
           }
         }
@@ -1972,8 +1991,15 @@ export class VideoProcessor {
       
       let firstMaskedPixel = -1;
       let sampleMaskValues = [];
+
+      // Output Round 1 (O1) plan, computed before the mask loop so that (Round 1b, F2) the loop scans only the crop
+      // rectangle — pixels outside it are discarded by the extract below. Same plan the batch path uses (this per-frame
+      // path is the image-batch exception fallback).
+      const frameTransform = planOutputTransform(keepBbox(maskRgba, originalWidth, originalHeight), originalWidth, originalHeight, outputSettings.size, normaliseAspectMode(outputSettings.aspectRatioMode).mode, outputSize);
+      const frameCrop = frameTransform.crop;
       
-      for (let i = 0; i < totalPixels; i++) {
+      for (let y = frameCrop.y; y < frameCrop.y + frameCrop.h; y++) for (let x = frameCrop.x; x < frameCrop.x + frameCrop.w; x++) {
+        const i = y * originalWidth + x;
         const maskAlpha = maskRgba[i * 4 + 3]; // Get mask alpha from RGBA mask
         const maskRed = maskRgba[i * 4];       // Get mask red channel
         
@@ -2033,9 +2059,7 @@ export class VideoProcessor {
         }
       });
 
-      // Output Round 1 (O1): crop to the keep first — the same plan the batch path uses (this per-frame path is the
-      // image-batch exception fallback); the encoder below is unchanged.
-      const frameTransform = planOutputTransform(keepBbox(maskRgba, originalWidth, originalHeight), originalWidth, originalHeight, outputSettings.size, normaliseAspectMode(outputSettings.aspectRatioMode).mode, outputSize);
+      // Output Round 1 (O1): crop to the keep first (the plan above); the encoder below is unchanged.
       processedImage = applyOutputTransform(processedImage, frameTransform);
 
       // PIPELINE STEP 3: encode to the requested output format (backlog 22).
