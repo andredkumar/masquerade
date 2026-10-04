@@ -2414,7 +2414,7 @@ export class VideoProcessor {
                      maskR > maskB * redDominanceRatio;    // Red > 1.5x Blue
         
         // Sample pixel data for analysis
-        if (i % sampleInterval === 0 || (isDrawn && isRed)) {
+        if (i % sampleInterval === 0) {
           const x = i % frameWidth;
           const y = Math.floor(i / frameWidth);
           pixelAnalysisSample.push({
