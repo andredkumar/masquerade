@@ -116,13 +116,13 @@ test("applyOutputTransform: exact dims, keep centred, byte-identical at 'origina
 
 test('manifest core: ten transform columns on every row, blank without a transform; the header is stable', () => {
   const t = planOutputTransform({ x: 10, y: 20, w: 300, h: 200 }, 640, 480, 'original', 'letterbox', { width: 640, height: 480 });
-  const withT = buildPerFrameManifestAndCsv({ frameCount: 3, labels: [], outputFormat: 'jpg', outputTransform: t });
+  const withT = buildPerFrameManifestAndCsv({ filenames: [0, 1, 2].map((i) => `images/frame_00000${i}.jpg`), labels: [], outputTransform: t });
   const lines = withT.csv.split('\n');
   assert.equal(lines[0], ['filename', 'frame_number', 'split', 'ai_target', 'ai_confidence', ...OUTPUT_TRANSFORM_CSV_COLUMNS].join(','));
   assert.equal(lines.length, 4);
   for (const row of lines.slice(1)) assert.ok(row.endsWith(',' + outputTransformCsvValues(t).join(',')), row);
   assert.deepEqual(outputTransformCsvValues(t), ['10', '20', '300', '200', '1', '1', '170', '140', '640', '480']);
-  const without = buildPerFrameManifestAndCsv({ frameCount: 2, labels: [], outputFormat: 'jpg' });
+  const without = buildPerFrameManifestAndCsv({ filenames: ['images/frame_000000.jpg', 'images/frame_000001.jpg'], labels: [] });
   for (const row of without.csv.split('\n').slice(1)) assert.ok(row.endsWith(',' + OUTPUT_TRANSFORM_CSV_COLUMNS.map(() => '').join(',')), row);
   assert.deepEqual(without.frames.map((f) => f.frame_number), [0, 1]);
 });

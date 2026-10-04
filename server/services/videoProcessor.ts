@@ -614,6 +614,19 @@ export class VideoProcessor {
   }
 
   /**
+   * Output Round 2 — how many pixels this mask blanks at w × h. Builds the raster with `createMaskRgbaBuffer`, the
+   * function the apply itself uses, and counts alpha > 0, the test `buildApplyMask` applies below: there is no second
+   * threshold. The apply guard (`applyGuard.checkApplyMask`) refuses on the two bounds. Throws what the builder throws.
+   */
+  async countMaskedPixels(maskData: MaskData, width: number, height: number): Promise<{ masked: number; total: number }> {
+    const maskRgba = await this.createMaskRgbaBuffer(maskData, width, height);
+    const total = width * height;
+    let masked = 0;
+    for (let i = 0; i < total; i++) if (maskRgba[i * 4 + 3] > 0) masked++;
+    return { masked, total };
+  }
+
+  /**
    * 2B-3a — build the apply's mask raster once, from frame 0's dimensions.
    *
    * Returns null (rather than throwing) if anything goes wrong; the caller then

@@ -1,8 +1,67 @@
 # Masquerade
 
-## Status — Output Round 1b BUILT (2026-09-23, uncommitted — awaiting the runbook)
+## Status — Output Round 2 BUILT (committed, not deployed — awaiting the runbook; 2026-10-04, `4f0c071` + the round commit)
 
-**The apply cost of the crop, measured then removed where it mattered.** Prod read `apply.done` 11.4 s vs 8.5 s after
+**Two commits, one deploy, one `git revert` each.** Docs: `docs/refactor/OUTPUT_ROUND2_{KICKOFF,RECON,SIGNOFF,REPORT}.md`.
+
+- **Commit 1 `4f0c071` — `createMaskFromBase64` stopped allocating a debug object per masked pixel** (`videoProcessor.ts:2417`,
+  `|| (isDrawn && isRed)` dropped; only the interval samples feed the log). Keep 1080p `createMaskRgbaBuffer` 202 → 14 ms,
+  `buildApplyMask` 214 → 15 ms serially, **mask buffers byte-identical** (`maskBuildIdentity.test.ts`, a 5-mask old-vs-new A/B incl. a
+  dpr-2 Keep export, 24 geometry rows reference diff 0). **This closes queue item 3 — with a corrected attribution: the cost of
+  Keep's `apply.mask_build` was the per-pixel debug array, not the 2 M offsets** (the offsets scan is ~24 ms of it; the 1b docs
+  were wrong).
+- **Commit 2 — the server refuses a mask that blanks nothing or everything.** `VideoProcessor.countMaskedPixels` (public; calls
+  `createMaskRgbaBuffer`, counts alpha > 0 — no second threshold) + `server/services/applyGuard.ts` (`decideApply`,
+  `checkApplyMask`). Called from `applyTemplateMask` **before anything is persisted** (a refusal writes no job update, no
+  `templateMask` state, no files; the `io` check and `new VideoProcessor(io)` moved above the persist) **and** from the legacy
+  `POST /api/videos/:jobId/process` (now guarded; **still awaiting 7B-1**, the `[DEADROUTE-HIT]` line stays). Dims: raw frame 0 on
+  disk (video / DICOM) or image 0 (batches), else the job record; none resolvable or the count throws → **refuse `unverifiable`**
+  (fail closed). 422 body `{success:false,error}` with three messages (`mask_blanks_nothing`, `mask_blanks_everything`,
+  `unverifiable`); PERF `apply.validate {ms, masked_px, total_px, w, h, dims_source}` on every counted apply, `apply.refused
+  {reason, …}` on every refusal. **Client (`ProcessingControls.tsx` only):** the toast shows the body's `error` (no status prefix, no
+  JSON) and `onStartProcessing` + the posthog capture moved into `onSuccess`, so a refused apply never shows "Processing Started"
+  or disables Apply (consequence: `automask.outcome` and `lastProcessedSettings` are recorded one round trip later and only for
+  accepted applies).
+- **Manifest filenames (backlog 27 DONE).** `buildPerFrameManifestAndCsv` takes `filenames: string[]` and synthesizes nothing;
+  both wrappers build the ZIP entry names once (`imageEntryName`, `images/frame_%06d.<ext>`, ext from the file on disk) and use
+  the list for the core and for `archive.file`. Whole-job `masquerade_version` `'1.0'` → `'1.1'`; the run manifest gained
+  `masquerade_version: '1.1'` and `images_included` (what was written, whatever was asked); a raw-input run names `.png`; one
+  README sentence. **Phase 6's D1 byte-identity guarantee ends here, on purpose.**
+- **Known wart, for the UI round:** a re-apply on an already-`complete` job clears `isProcessing` at once
+  (`template-mask-spoke.tsx:214-219`: the status is still `complete` until the refetch lands). Pre-existing, unchanged.
+- **Dead code, added to queue item 5:** `createTransformedMask` and `convertToRgbaBuffer` (`videoProcessor.ts`) have no callers
+  and carry a second copy of the mask threshold; the live chain is `createMaskRgbaBuffer` → `createMaskFromBase64`.
+- Expectations on prod (to confirm in the runbook): Keep 1080p `apply.mask_build` ~1.8 s → ~0.3 s, `apply.validate` ~0.3–0.4 s;
+  Remove applies ~0.25 s slower (the price of the backstop). Runbook gate: `apply.validate ms` ≤ 500 on the 1080p Keep job.
+  Tests: `maskBuildIdentity` 1, `applyGuard` 5, `frameManifestNames` 3; tools `scripts/output_eval/{round2_check,guard_bench}.ts`.
+
+---
+
+## Status — Output Round 1a + 1b DEPLOYED + VERIFIED (2026-09-23, `2259932` + `51289ae`)
+
+**Prod is `51289ae`.** Everything from Output Round 1 (`2dea93e`), 1a and 1b is live; `AUTOMASK=1` and `AUTOMASK_UI=1` are
+set in pm2's env. EBS snapshot `pre-output-round1a-1b 2026-09-23`.
+
+**1a (`2259932`, client) closed a de-identification leak Output Round 1 introduced.** After a Remove → Keep → Remove
+flip of the What-you-draw-is toggle, the Remove export carried the drawn shapes in **black** and the server blanked
+**0 px** — frames shipped unmasked while the canvas and toggle said Remove. Cause: `fabric.util.object.clone` is
+**shallow** in fabric 5.3.0, so the export clone shares the on-canvas object's render cache; the Keep export repainted
+that cache black, and a later `set({fill:'red'})` on the clone was not a change, so nothing was marked dirty and the
+stale black cache was blitted into the PNG. Fix: clones marked `dirty` before export, originals marked `dirty` after
+(fresh Remove byte-identical to before; Remove-after-flip byte-identical to a fresh Remove). Same commit: the
+`_aiOverlay` preview removes the old overlay at effect start (also on Clear / Erase) and cancels superseded `fromURL`
+loads; toggle labels are **Keep / Remove**. **Lesson (binding):** a report or kickoff that says "only the preview is
+wrong, what Apply sends is correct" is a claim to measure, not to assume — measure the PNG the server receives.
+
+**Prod verification (2026-09-23):** L1 on job `f370a3b9` (Kidney 1920 × 1080): Remove `masked_px` **30 618** → flip Keep
+2 042 980 → flip Remove **30 618** (A = C exactly); two shapes 62 026; Keep outputs centred; E9 DICOM trapezoid centred
+at offset (56, 191); `manifest.json` carries `output_transform` (reference clip crop (268, 0) 996 × 796 → offset (270, 0)).
+**Audit:** `grep '"masked_px":0,'` over the full log since `2dea93e` → **empty** (no fully unmasked apply ever shipped).
+Reference clip `apply.done` 10.5 / 10.0 s back to back: **~10 s is this clip's baseline on this box**; the old "8.5 s"
+was the fast end of an 8.5–11.1 s spread on identical code. Credit mode is **unlimited** (throttling ruled out). Keep
+applies are now dominated by `apply.mask_build` (2.2–2.6 s of ~4.5 s on 46 × 1080p frames) — backlog.
+
+**1b (`51289ae`, server) — the apply cost of the crop, measured then removed where it mattered.** Prod read `apply.done` 11.4 s vs 8.5 s after
 Output Round 1; step 1 (`OUTPUT_ROUND1B_STEP1.md`) measured the crop serially at **0.41–0.47 ms/frame (~5 % of the
 apply)**, so F1 (an Original-size row-copy fast path) was **not built** by the pre-committed rule, and the "34 %" turned
 out to be inside the box's own spread (identical old code ran 8.5 s and 11.1 s on consecutive applies). **F2 shipped:**
@@ -21,7 +80,19 @@ if it moves between two runs of identical work, suspect the box (CPU credits, co
 
 **Runbook conventions:** collect commands use `pm2 logs … --nostream` (without it pm2 never exits, and a `grep` feeding
 another stage block-buffers ~4 KB that is lost on ^C); multi-stage live tails use `grep --line-buffered` on every stage
-but the last.
+but the last. **Node tooling for this repo runs in Andre's macOS Terminal only** — `node_modules` carries the
+darwin-arm64 esbuild binary; running `npm install` from a Linux shell into this tree would break the Mac build.
+
+**Next, in order:**
+1. ~~**Output Round 2 — fail-closed apply + manifest filenames**~~ — **BUILT 2026-10-04 (see the block at the top); awaiting the
+   runbook + deploy.**
+2. **UI simplification** — Andre (2026-09-23): the tool is highly technical, with too many toggles and boxes; make the
+   interface friendlier, cleaner and more streamlined. Planned in its own conversation after Output Round 2's kickoff;
+   start from a UI inventory, not from code.
+3. ~~Keep-mode `apply.mask_build` cost~~ — **closed by Output Round 2 commit 1** (the cost was the per-pixel debug array in
+   `createMaskFromBase64`, not the offsets; no in-crop-offsets rework needed).
+4. Auto-mask 2C (B4 template library, B6 temporal support) once the `automask.outcome` pivot has a week of real sessions.
+5. Dead code: `processBatchesInParallel`, `createTransformedMask`, `convertToRgbaBuffer`, `maskWorker.ts` (the latter carries 7 of the 12 tsc errors).
 
 ---
 
@@ -52,11 +123,11 @@ byte**, no resampling at Original Size, round-trip 0, sidecar == manifest; per-f
 the live size fallback is 512 × 512 in `processFrameBuffersInParallel`); image batches apply once per job (item 30);
 the Browser pane ran at dpr 2 this time, so the retina 2× export path was exercised and the server handled it. Driver:
 `scripts/output_eval/check.ts`. Docs: `docs/refactor/OUTPUT_ROUND1_{KICKOFF,RECON,SIGNOFF,REPORT}.md`. Not flag-gated;
-rollback one `git revert`. Next: runbook → deploy → Andre's O4 window + the co-indexing row → 2C.
+rollback one `git revert`. **Superseded:** its Keep / Blanked export had the shallow-clone leak fixed in 1a above.
 
 ---
 
-## Status — Auto-mask Round 2B-2 BUILT (2026-09-11, uncommitted — awaiting the runbook)
+## Status — Auto-mask Round 2B-2 DEPLOYED (`c909d36`, 2026-09-12; `AUTOMASK_UI=1` on prod; built 2026-09-11)
 
 The template-mask spoke's **proposal UI** is built behind a second flag **`AUTOMASK_UI`** (default off; `ui_enabled` stamped
 on every proposal body at serve time, never into `automask.json`): on open, frame 1 with the proposed cone drawn as one
@@ -79,7 +150,8 @@ hold schedule proven with real timers (first repeat 401 ms, 39 steps/s after 1.5
 apex would leave the position range; `shapeDeltas` now null only across fan ↔ non-fan (it *was* null for trap ↔ rect);
 `sonosite_011_clip10` is the B7 case, not a withheld clip. **Traps for the next session:** killing the dev server
 sweeps all of `temp_extracted/`; the Browser pane is a hidden tab (throttled timers); `uploads/`, `temp_extracted/`,
-`spokes/` are not gitignored — commit by the report's §7 path list. Docs: `docs/refactor/AUTOMASK_ROUND2B2_KICKOFF.md`,
+`spokes/` are gitignored since `c909d36` (the lines appear twice in `.gitignore` — harmless); still commit by explicit
+paths. Docs: `docs/refactor/AUTOMASK_ROUND2B2_KICKOFF.md`,
 `_PLAN.md`, `_SIGNOFF.md`, `_REPORT.md`. Rollback: one `git revert`. Next: runbook → deploy → Andre's display row →
 flag decision → 2C (B4 template library, B6 temporal).
 
@@ -431,7 +503,7 @@ production.** `tsc` baseline unchanged at **17** (10 `frameExtractor.ts` + 7 `ma
   denote the same sorted-position `i`, because inference wrote `mask_<i>` while iterating the exact
   `listFrameFiles`/`listRawFrameFiles` array the download resolver re-reads (same deterministic
   function, same dir), and one mask is written per base frame unconditionally.
-- **`filename` in `frames[]` is nominal** (synthesized `frame_%04d.<outputFormat>`), NOT a literal
+- ⚠️ **Superseded by Output Round 2 (2026-10-04): `filename` is now the literal ZIP entry path.** *(was:)* **`filename` in `frames[]` is nominal** (synthesized `frame_%04d.<outputFormat>`), NOT a literal
   ZIP path — the whole-job builder already had 4-pad manifest vs 6-pad `images/` and a possibly
   different `ext`. Propagated knowingly to preserve D1 field-compatibility. One CSV parser works
   for both ZIPs.
@@ -783,7 +855,7 @@ round's own first entry — item 21 below is a pointer to it rather than a dupli
 24. **Stack scheduling** — 58 stacks in flight against a 4-thread libuv pool inflates `apply.frame.decode_ms` into queue-wait. Maybe ~2× left in the ~8 s apply. Round 2C established that ~8 s is close to the decode+encode floor for 348 frames on one physical core, so this is the only remaining software lever; diminishing, and only worth it if apply time matters again. → `docs/refactor/ROUND2C_REPORT.md`.
 25. **Small open items.** `ANTHROPIC_API_KEY` still unset on prod (7A-4). The orphan base64 `firstFrame` in the upload response has been dead since Phase 4b — nothing consumes it. `MemStorage` (rollback target only) doesn't mirror `totalFrames` to `jobsV2`, so the 2B-1 reuse guard would trip if anyone reverted the 5C-2 cutover — documented rather than fixed, since `storage.ts` is A3-frozen (`docs/refactor/ROUND2B3B_REPORT.md` §1.6).
 26. **Product: usage/tier model** — keyed on frames × resolution × format, all three of which are already on the job record. Raised when the JPEG-vs-PNG disk question came up (2B addendum); no design yet.
-27. **Manifest filenames don't resolve inside the export ZIP.** `buildPerFrameManifestAndCsv` emits `frame_%04d.<fmt>` (`frameManifest.ts:72`) while the ZIP writes `images/frame_%06d.<ext>` (`routes.ts:803`) — wrong zero-pad width and no `images/` prefix, in both `manifest.json` and `metadata.csv`. Affects both download paths (whole-job `:687`, per-run `:1815`). Changes manifest bytes, so it breaks the Phase 6 D1 byte-identical guarantee deliberately and needs its own commit. Found during item 22 recon (`docs/refactor/ITEM22_RECON.md` §6.3) and deliberately kept out of that commit.
+27. ~~**Manifest filenames don't resolve inside the export ZIP.**~~ `buildPerFrameManifestAndCsv` emits `frame_%04d.<fmt>` (`frameManifest.ts:72`) while the ZIP writes `images/frame_%06d.<ext>` (`routes.ts:803`) — wrong zero-pad width and no `images/` prefix, in both `manifest.json` and `metadata.csv`. Affects both download paths (whole-job `:687`, per-run `:1815`). Changes manifest bytes, so it breaks the Phase 6 D1 byte-identical guarantee deliberately and needs its own commit. Found during item 22 recon (`docs/refactor/ITEM22_RECON.md` §6.3) and deliberately kept out of that commit. → **DONE in Output Round 2 (2026-10-04, built, not yet deployed):** `filename` is now the ZIP entry, `images/frame_%06d.<ext>`, in both downloads' `manifest.json` and `metadata.csv`; whole-job `masquerade_version` 1.1; the run manifest has `masquerade_version` and `images_included`.
 28. ~~**Image-batch jobs 410 at the template-mask canvas — the image feature is unreachable**~~ — **DONE (2026-09-04).** The spoke painted from `GET /api/jobs/:id/frames/0` (raw branch), which reads only `temp_extracted/<jobId>/`; image batches never populate it (no extraction — multer writes `uploads/<hash>`, job goes straight to `ready`), so every image job hit the trailing 410 and showed "Frames are no longer available. The server may have restarted." — false on both counts. The canvas could not paint, so no mask could be drawn, so **Apply was unreachable through the UI for every image batch**, `.jpg` and `.png` alike; Apply itself was always fine (`templateMaskApply.ts:82`), sitting behind a door that would not open. Broken since Phase 4b (`c66ca4e`), when the spoke stopped using the upload response's base64 `firstFrame` (= why item 25 lists that field as dead). Confirmed in prod on job `e5ed44ed` 2026-09-04. **Fix:** an image-batch branch in the raw path of the frames endpoint (`routes.ts:1626`) serving frame *n* from `uploads/<fileList[n].filename>`, detected via `jobV2.source.type === 'image_batch'` (never the legacy `jobType`), resolved by the new pure `resolveImageBatchFrame` (`frameAccess.ts:172`) through `resolveWithinRoot(UPLOADS_DIR, …)`, 404 past the end, 410 for a missing file, original bytes with no re-encode. Indexed **strictly by `fileList` order** — the same order `processImages` masks in (`videoProcessor.ts:827-846`), so canvas frame *i* is provably the source of masked output *i*; a sorted directory listing would silently mis-pair them, and the regression test is built to fail that implementation. Declared mimetypes are allowlisted rather than reflected (`fileFilter` admits a `.png` declared `text/html`, which would be stored XSS from the app's own origin). Both 410s now carry a `reason` (`uploads_swept` | `frames_swept`) and the spoke renders copy per cause, so "the server may have restarted" is only claimed when that is a live possibility. `uploads/`'s 2 h retention is unchanged: an image job older than that still fails, but now the canvas fails the same way Apply already does instead of at minute zero. Tests: `server/services/__tests__/imageBatchFrames.test.ts` (6 cases, `npx tsx`, no DB). Plan: `docs/refactor/ITEM28_IMAGE_BATCH_FRAMES_PLAN.md`; report: `docs/refactor/ITEM28_REPORT.md`. **Unblocks the item 22 deploy runbook §5, rows I1-I8.**
 29. **Mixed-dimension image batches mask the wrong region on every frame but the first.** The template mask is one set of absolute pixel coordinates, drawn against image 0 and applied unchanged to every frame (`videoProcessor.ts:1895` — "ABSOLUTE PIXEL COORDINATES - No transformation required"). In a batch whose images differ in size the rectangle lands somewhere else on each one: possibly off the burned-in identifier it was drawn over, possibly off the canvas entirely. **PHI-leak shape, not cosmetic.** Latent since the absolute-coordinate rewrite and unreachable until item 28 made the canvas paint. Needs either a per-image coordinate transform or a uniform-dimension guard at upload. Until it is fixed, use a **uniform-dimension** batch for item 22's runbook rows I1-I8 or they measure two bugs at once. Found 2026-09-04 while verifying item 28 (`docs/refactor/ITEM28_REPORT.md` §4).
 30. **Image jobs cannot be re-opened after Apply — the canvas 410s once the originals are reclaimed.** `processImages` deletes the uploaded originals in its `finally` on reaching a terminal state (`uploadPathsToReclaim`, `videoProcessor.ts:756` → `deleteUploadFile` `:1024`), so the moment Apply succeeds the files item 28 serves from are gone and `GET /api/jobs/:id/frames/:n` returns 410 `uploads_swept`. The user cannot adjust the mask and re-apply, and revisiting the spoke says the uploads are gone even though the masked output is on disk. **Video has no equivalent problem** — its canvas paints from `temp_extracted/`, retained 6 h, which is what makes the 2B redo loop work; image batches have no unmasked copy once uploads are reclaimed. Not a regression from item 28 (before it the canvas never painted at all) — the next layer of the same gap, newly visible. Two candidate fixes, probably both: (a) stop eagerly reclaiming image uploads and let the 2 h sweep take them, giving a redo window — note the video path already retains unmasked raw frames for **6 h**, so this is strictly less PHI exposure than what is already accepted; (b) have the spoke fall back to `?source=template_mask` when the raw source is gone but masked frames exist (= backlog item 20, now more valuable than when it was ranked). Found 2026-09-04 verifying items 22/28 on prod job `77c6389f` (uploaded 22:45, 410 within minutes — not the 2 h sweep).

@@ -154,3 +154,29 @@ For the fallback branch it is a genuine bytes change (PNG → JPEG q90).
 in prod on the fallback path; dev cruft, separate cleanup).
 
 **Rollback:** single commit, `git revert`. No data implications, no schema change.
+
+---
+
+## 7. On-box verification (2026-09-04, post-deploy)
+
+Deployed as `8f067a7` (item 22) alongside `dc45954` (item 28, which is what made the image path
+reachable at all). Verified on prod job `77c6389f-43cd-41f3-aa59-ee258fdb2c95` — a 10-image batch,
+632×1080, uploaded as **PNG** (`frame_000015.png … frame_000036.png`), default output settings:
+
+```
+$ file spokes/template_mask/77c6389f-.../*
+image_001_frame_000015.jpg: JPEG image data, baseline, precision 8, 632x1080, components 3
+… (10 files, all .jpg, all JPEG)
+```
+
+**PASS.** Every file is named `.jpg` and is genuinely JPEG, including the ones uploaded as `.png` —
+the exact case that pre-fix produced `image_001_frame_000015.png` holding JPEG bytes. Real user data,
+not a synthetic batch.
+
+**Still owed:** the ZIP check (`unzip` + `file /tmp/zipcheck/images/*`), and the PNG-selected run.
+Neither is expected to differ — ZIP entry names derive from the on-disk extension, which is now
+correct — but neither has been observed.
+
+**Found while verifying:** an applied image job cannot be re-opened; `processImages` reclaims the
+uploaded originals on completion, so the canvas 410s immediately afterwards. Filed as **backlog item
+30**, not a regression from either commit.

@@ -10,6 +10,22 @@ import { useToast } from "@/hooks/use-toast";
 import type { MaskData, OutputSettings } from "@shared/schema";
 import { posthog } from "@/lib/posthog";
 
+/**
+ * `apiRequest` throws `Error("<status>: <body text>")` (queryClient.ts). The server's refusals (Output Round 2: a 422 for a
+ * mask that blanks nothing or everything) carry a user-facing sentence in the JSON body's `error`; show that, without the
+ * status prefix or the JSON. Anything else is rethrown unchanged.
+ */
+function serverMessageOrSame(err: unknown): unknown {
+  if (!(err instanceof Error)) return err;
+  const m = /^\d{3}: ([\s\S]*)$/.exec(err.message);
+  if (!m) return err;
+  try {
+    const body = JSON.parse(m[1]);
+    if (body && typeof body.error === 'string' && body.error) return new Error(body.error);
+  } catch { /* not JSON */ }
+  return err;
+}
+
 interface ProcessingControlsProps {
   jobId: string | null;
   maskData: MaskData | null;
@@ -91,15 +107,32 @@ export default function ProcessingControls({
       }
 
       // Phase 4b: canonical URL for template-mask apply
-      const response = await apiRequest('POST', `/api/jobs/${jobId}/template-mask/apply`, {
-        maskData,
-        outputSettings: settings,
-        samplingFps,
-      });
+      let response: Response;
+      try {
+        response = await apiRequest('POST', `/api/jobs/${jobId}/template-mask/apply`, {
+          maskData,
+          outputSettings: settings,
+          samplingFps,
+        });
+      } catch (err) {
+        throw serverMessageOrSame(err);
+      }
       
       return response.json();
     },
-    onSuccess: () => {
+    onSuccess: (_data, settings) => {
+      // Output Round 2: the job is marked processing (and the apply counted) only once the server ACCEPTED the apply —
+      // a refused apply (422) did not start, so the spoke must not show "Processing Started" or disable Apply.
+      onStartProcessing(settings);
+
+      posthog.capture('mask_processing_started', {
+        job_id: jobId,
+        mask_type: maskData?.type,
+        output_size: outputSize,
+        output_format: outputFormat,
+        aspect_ratio_mode: aspectRatioMode
+      });
+
       toast({
         title: "Processing Started",
         description: "Your video is being processed. You can monitor progress below.",
@@ -128,15 +161,6 @@ export default function ProcessingControls({
     };
 
     processingMutation.mutate(outputSettings);
-    onStartProcessing(outputSettings);
-    
-    posthog.capture('mask_processing_started', {
-      job_id: jobId,
-      mask_type: maskData?.type,
-      output_size: outputSize,
-      output_format: outputFormat,
-      aspect_ratio_mode: aspectRatioMode
-    });
   };
 
   const estimateProcessingTime = () => {

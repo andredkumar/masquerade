@@ -37,8 +37,9 @@ import fs from "fs";
 import { promises as fsPromises } from "fs";
 import archiver from "archiver";
 import { applyTemplateMask } from "./handlers/templateMaskApply";
-import { buildPerFrameManifestAndCsv } from "./handlers/frameManifest";
+import { buildPerFrameManifestAndCsv, imageEntryName } from "./handlers/frameManifest";
 import { perfMark, perfSpan } from "./services/perf";
+import { checkApplyMask } from "./services/applyGuard";
 import { getOrComputeProposal, enqueueProposalAtReady } from "./services/automask";
 import { automaskUiEnabled } from "./services/automaskFlag";
 import { handleOutcome } from "./services/automaskOutcome";
@@ -588,6 +589,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
+      // Output Round 2 (R1): the same fail-closed guard as the canonical apply — this route starts processing with a
+      // body-supplied mask too, so it must not be a second door (deletion stays 7B-1, gated on the prod log).
+      const guard = await checkApplyMask(videoProcessor, req.params.jobId, job, maskData);
+      if (!guard.ok) {
+        return res.status(guard.status).json({ error: guard.error });
+      }
+
       // Check job type and process accordingly
       if (job.jobType === 'images') {
         // Process image batch
@@ -727,23 +735,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       // 2B addendum §A.2 — default output format is JPEG. This fallback is only
-      // reached if a job somehow has frames on disk but no outputSettings; the
-      // manifest schema is unchanged (D1).
+      // reached if a job somehow has frames on disk but no outputSettings; it feeds the manifest's top-level
+      // `output_format` field only (the per-frame `filename` is the ZIP entry name, below).
       const outputFormat = (job as any).outputSettings?.format || 'jpg';
-      // Phase 6 (b)-lite: per-frame frames[] + metadata.csv now come from the
-      // shared core. The whole-job wrapper feeds it the same inputs it used
-      // inline before, so manifest.json / metadata.csv stay byte-identical (D1).
+      // Output Round 2 (backlog 27): the ZIP entry names are built ONCE, from the extension of each file on disk, and
+      // used for both the manifest core and `archive.file` below — `frames[].filename` and the CSV `filename` column are
+      // the entry path, never a separately computed name. Phase 6's byte-identity guarantee (D1) ends here, on purpose.
+      const entryNames = frameFiles.map((f, i) => imageEntryName(i, fileExt(f)));
       // Output Round 1: the transform the apply recorded beside these frames (null for jobs applied before the round).
       const outputTransform = await readOutputTransform(job.id);
       const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
-        frameCount: frameFiles.length,
+        filenames: entryNames,
         labels: approvedLabels,
-        outputFormat,
         outputTransform,
       });
 
       const manifest: Record<string, any> = {
-        masquerade_version: '1.0',
+        masquerade_version: '1.1',
         export_timestamp: new Date().toISOString(),
         job_id: job.id,
         source_filename: job.filename,
@@ -795,6 +803,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `manifest.json`,
         `  Per-frame AI label data including target structure, confidence score,`,
         `  and approval status. This is the primary AI output for programmatic use.`,
+        `  filename in manifest.json and metadata.csv is the path of that frame inside this ZIP.`,
         `  output_transform maps output pixels back to the source frame: every frame was cropped to the`,
         `  kept region (crop, in source px) and then centred or scaled; x_src = crop.x + (x_out - offset.x) / scale.x.`,
         ``,
@@ -854,11 +863,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       );
       for (let i = 0; i < frameFiles.length; i++) {
         const filename = frameFiles[i];
-        const ext = fileExt(filename);
         // Sorted-list position is the canonical frame number across the whole ZIP.
         const paddedNum = String(i).padStart(6, '0');
         const framePath = path.join(tempDir, filename);
-        archive.file(framePath, { name: `images/frame_${paddedNum}.${ext}` });
+        archive.file(framePath, { name: entryNames[i] });
 
         if (includeMasks) {
           for (let li = 0; li < approvedLabels.length; li++) {
@@ -1919,19 +1927,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Output Round 1: the run's frames are the masked output only when the run consumed it; raw-frame runs have no
       // transform (null), which is the correct statement for them.
       const runOutputTransform = run.inputSource === 'template_mask' ? await readOutputTransform(req.params.jobId) : null;
+
+      // §B: payload-only toggle to include the base frames the AI ran on. It gates only whether `images/` entries are
+      // WRITTEN; frames[] / metadata.csv below are toggle-independent (§B.4).
+      const includeBaseFrames = req.query.includeBaseFrames === 'true';
+
+      // Base frames (masked-first / raw-fallback), listed whether or not they are included: their on-disk extensions
+      // decide the entry names the manifest carries (Output Round 2, backlog 27), so the names are the same either way.
+      // run.inputSource is the recorded truth of which source this run consumed, so the user always gets the frames the
+      // AI actually ran on (§B.1 invariant). Mirrors the Phase 4b-ii inference resolver (listFrameFiles → listRawFrameFiles).
+      let baseDir: string;
+      let baseFiles: string[];
+      if (run.inputSource === 'raw') {
+        const raw = await listRawFrameFiles(req.params.jobId);
+        baseDir = raw.dir; baseFiles = raw.files;
+      } else {
+        const masked = await listFrameFiles(req.params.jobId);
+        if (masked.files.length > 0) {
+          baseDir = masked.dir; baseFiles = masked.files;
+        } else {
+          const raw = await listRawFrameFiles(req.params.jobId);
+          baseDir = raw.dir; baseFiles = raw.files;
+        }
+      }
+      if (includeBaseFrames && baseFiles.length !== maskFiles.length) {
+        console.warn(`[run-download] job ${req.params.jobId} run ${run.id}: ${baseFiles.length} base frames on disk for ${maskFiles.length} masks`);
+      }
+      // images/frame_%06d.<ext> — the whole-job builder's naming, so the two ZIPs share one images/ layout. ext comes
+      // from the base file when it exists; when the frames are already swept, a raw-input run's frames are PNG and
+      // anything else follows the job's output format.
+      const swept = run.inputSource === 'raw' ? 'png' : runOutputFormat;
+      const entryNames = maskFiles.map((_, i) => imageEntryName(i, baseFiles[i]?.match(/\.(\w+)$/)?.[1] || swept));
       const { frames: manifestFrames, csv } = buildPerFrameManifestAndCsv({
-        frameCount: maskFiles.length,
+        filenames: entryNames,
         labels: approvedRunLabels,
-        outputFormat: runOutputFormat,
         outputTransform: runOutputTransform,
       });
 
-      // §B: payload-only toggle to include the base frames the AI ran on. Does not
-      // affect frames[]/metadata.csv above — those are toggle-independent (§B.4).
-      const includeBaseFrames = req.query.includeBaseFrames === 'true';
-
       // Build manifest for this run (frames[] is additive over the pre-Phase-6 shape)
       const manifest = {
+        masquerade_version: '1.1',
         jobId: req.params.jobId,
         runId: run.id,
         runName: run.name,
@@ -1949,6 +1984,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         maskCount: maskFiles.length,
         overlayCount: overlayFiles.length,
         output_transform: runOutputTransform,
+        // What was written, whatever was asked: a request for base frames that finds none on disk says false.
+        images_included: includeBaseFrames && baseFiles.length > 0,
         frames: manifestFrames,
       };
 
@@ -1979,32 +2016,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
       archive.append(csv, { name: 'metadata.csv' });
 
-      // §B: base-frame payload (masked-first / raw-fallback), under images/.
+      // §B: base-frame payload under images/ — the entries the manifest's filenames name (the listing is above).
       if (includeBaseFrames) {
-        // run.inputSource is the recorded truth of which source this run consumed,
-        // so the user always gets the frames the AI actually ran on (§B.1 invariant).
-        // Mirrors the Phase 4b-ii inference resolver (listFrameFiles → listRawFrameFiles).
-        let baseDir: string;
-        let baseFiles: string[];
-        if (run.inputSource === 'raw') {
-          const raw = await listRawFrameFiles(req.params.jobId);
-          baseDir = raw.dir; baseFiles = raw.files;
-        } else {
-          const masked = await listFrameFiles(req.params.jobId);
-          if (masked.files.length > 0) {
-            baseDir = masked.dir; baseFiles = masked.files;
-          } else {
-            const raw = await listRawFrameFiles(req.params.jobId);
-            baseDir = raw.dir; baseFiles = raw.files;
-          }
-        }
-        // images/frame_%06d.<ext> — same naming convention as the whole-job builder,
-        // so a whole-job ZIP and a run ZIP share a consistent images/ layout.
         for (let i = 0; i < baseFiles.length; i++) {
-          const filename = baseFiles[i];
-          const ext = (filename.match(/\.(\w+)$/)?.[1]) || 'png';
-          const paddedNum = String(i).padStart(6, '0');
-          archive.file(path.join(baseDir, filename), { name: `images/frame_${paddedNum}.${ext}` });
+          const ext = (baseFiles[i].match(/\.(\w+)$/)?.[1]) || 'png';
+          archive.file(path.join(baseDir, baseFiles[i]), { name: imageEntryName(i, ext) });
         }
       }
 

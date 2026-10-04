@@ -15,6 +15,7 @@ import { storage } from '../storage';
 import { VideoProcessor } from '../services/videoProcessor';
 import { TempFolderManager } from '../services/templateMaskFolderManager';
 import { perfMark } from '../services/perf';
+import { checkApplyMask } from '../services/applyGuard';
 
 export type TemplateMaskApplyResult =
   | { ok: true; jobId: string }
@@ -56,6 +57,20 @@ export async function applyTemplateMask(
     return { ok: false, status: 404, error: 'Job not found' };
   }
 
+  if (!io) {
+    return { ok: false, status: 500, error: 'Socket.IO not available' };
+  }
+
+  const videoProcessor = new VideoProcessor(io);
+
+  // Output Round 2 (R1): refuse a mask that blanks nothing or everything BEFORE anything is persisted — no job update,
+  // no templateMask state, no files. A 422 here reaches the user as a message; an async refusal could not (TemplateMaskState
+  // stores none).
+  const guard = await checkApplyMask(videoProcessor, jobId, job, maskData);
+  if (!guard.ok) {
+    return { ok: false, status: guard.status, error: guard.error };
+  }
+
   // Persist mask + output settings on the job
   await storage.updateVideoJob(jobId, { maskData, outputSettings });
 
@@ -72,12 +87,6 @@ export async function applyTemplateMask(
   } catch (err) {
     console.error('Failed to set templateMask state to applying:', err);
   }
-
-  if (!io) {
-    return { ok: false, status: 500, error: 'Socket.IO not available' };
-  }
-
-  const videoProcessor = new VideoProcessor(io);
 
   if (job.jobType === 'images') {
     const fileList = job.fileList as any[];

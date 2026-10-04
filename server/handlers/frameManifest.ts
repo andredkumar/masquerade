@@ -15,19 +15,26 @@ import { OUTPUT_TRANSFORM_CSV_COLUMNS, outputTransformCsvValues, type OutputTran
 // Contract:
 //   • Callers MUST approval-filter labels before calling (D2 is enforced by the
 //     caller, never here — this core embeds exactly the labels it is handed).
-//   • The frame set is expressed purely as a count; frame numbering is the
-//     sorted-list POSITION `i` (0..frameCount-1), the same key inference wrote
+//   • The frame set is the list of ZIP entry names, one per frame in order; frame numbering is the
+//     sorted-list POSITION `i` (0..filenames.length-1), the same key inference wrote
 //     mask_<i>.png / overlay_<i>.png with.
-//   • `filename` is the field-compatible synthesized form `frame_%04d.<fmt>`
-//     (nominal, matching the whole-job builder — NOT a literal ZIP path).
+//   • `filename` is `filenames[i]`, verbatim: the exact path of frame i INSIDE the ZIP (Output Round 2, backlog 27).
+//     The wrappers build that list once (`imageEntryName`) and use it for both this core and `archive.file`, so the
+//     manifest can never name a file the ZIP does not contain. This core synthesizes no names.
+
+/** The ZIP entry for frame `i`: `images/frame_%06d.<ext>`. The one place the name is built. */
+export function imageEntryName(i: number, ext: string): string {
+  return `images/frame_${String(i).padStart(6, '0')}.${ext}`;
+}
 
 export interface PerFrameManifestInput {
-  /** Number of frames to enumerate (sorted-list positions 0..frameCount-1). */
-  frameCount: number;
+  /**
+   * One ZIP entry name per frame, in order (sorted-list positions 0..length-1). Becomes `frames[i].filename` and the
+   * CSV `filename` column unchanged.
+   */
+  filenames: string[];
   /** Labels to embed per-frame. Callers MUST approval-filter first (D2). */
   labels: AiLabel[];
-  /** Output image format for the nominal `filename` field (e.g. 'png'). */
-  outputFormat: string;
   /**
    * Output Round 1: the per-job output transform (crop → centre / contain / cover) the apply recorded beside the
    * frames, or null for jobs applied before this round / raw-frame runs. Repeated on every CSV row as ten scalar
@@ -59,9 +66,9 @@ function getLabelFrameConfidence(label: AiLabel, frameIdx: number): number | nul
  * manifest object and appends `csv` to its ZIP.
  */
 export function buildPerFrameManifestAndCsv(input: PerFrameManifestInput) {
-  const { frameCount, labels, outputFormat, outputTransform = null } = input;
+  const { filenames, labels, outputTransform = null } = input;
 
-  const frames = Array.from({ length: frameCount }, (_, i) => {
+  const frames = filenames.map((filename, i) => {
     // Each approved label carries THIS frame's individual confidence (from that
     // label's own frameResults), so multi-label exports show distinct scores
     // per label per frame rather than a shared value.
@@ -76,7 +83,7 @@ export function buildPerFrameManifestAndCsv(input: PerFrameManifestInput) {
     }));
     return {
       frame_number: i,
-      filename: `frame_${String(i).padStart(4, '0')}.${outputFormat}`,
+      filename,
       split: determineSplit(i),
       has_mask: true,
       ai_labels: perFrameLabels,
