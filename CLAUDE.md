@@ -1,6 +1,52 @@
 # Masquerade
 
-## Status — Output Round 2 BUILT (committed, not deployed — awaiting the runbook; 2026-10-04, `4f0c071` + the round commit)
+## Status — Output Round 2 DEPLOYED (2026-10-09, `4f0c071` + `3a410cf`, runbook `45f1366`; built 2026-10-04)
+
+**Prod is `3a410cf` (+ the docs commit `45f1366`).** Runbook: `docs/refactor/OUTPUT_ROUND2_DEPLOY_RUNBOOK.md`.
+
+**Verified on prod (2026-10-09), from the `[PERF]` log:**
+- **Backstop without the client (B1–B4):** three crafted masks (transparent, fully red, malformed data URL) × both routes on job
+  `0b2a0e92` (Kidney 1920 × 1080) → six 422s with the sign-off messages; `GET /api/jobs/:id` md5 identical before and after; nothing
+  under `spokes/template_mask/<job>/`; six `apply.refused` lines (4 `mask_blanks_nothing` at 0 px, 2 `mask_blanks_everything` at
+  2 073 600). The legacy route emits no `apply.request` mark (as before). Its three `[DEADROUTE-HIT]` lines from that test carry
+  `ua=curl` — **exclude them from the 7B-1 evidence.**
+- **Cost gate (N1), Keep 1080p:** `apply.validate` **98–191 ms across nine applies, median ~107 ms** (gate 500; estimate was
+  0.3–0.45 s). `apply.mask_build` **112–292 ms (was ~1.8 s)**; `apply.done` **1.7–2.7 s on 46 frames (was ~3.5–4.5 s)**.
+- **Remove 1080p (N2):** the guard adds ~90 ms (estimate was ~0.25 s); `apply.done` ~1.8 s.
+- **Reference clip, accepted cone (N3, `afa22a7a`):** `dims_source frame0` 1536 × 796, validate 152 ms, `apply.done` 9.85 s (inside
+  the box's 8.5–11 s spread), one `automask.outcome accept`, fired after the server accepted (D6).
+- **E9 DICOM (N4, `0fd16429`):** `frame0` 1164 × 873, outcome `edit`.
+- **Whole-frame drags (U3, `bc4a73cc`):** Keep left a 24 896-px edge strip blanked, Remove blanked 2 048 704 px; neither hit a
+  bound, both applied normally — as predicted.
+
+**Not verified on prod — assumed good by Andre (2026-10-09), recheck opportunistically:**
+- **The refusal through the browser (U1).** Every prod refusal was a `curl` call; the off-image Keep drag kept a 6 059-px sliver
+  and applied normally (correct for that mask). The toast / no "Processing Started" card / clicks-still-work path (report finding 3)
+  is proven only in the sandbox. To trigger: Keep → drag the rectangle past the **canvas** edge until it disappears → Apply.
+- The `apply.mask_build` `"masked_px":0,` audit since the deploy (must be empty), the prod manifest check (5.4), and an image batch
+  showing `dims_source image0` (N5). All three were green in the sandbox.
+
+**Ops incident, 2026-10-07 → 10-09 — the domain lapsed.** `masqueradeimage.com` went to `clientHold` at Amazon Registrar on
+2026-10-07 07:44 UTC because the registration was not renewed; the whole site was NXDOMAIN worldwide while the server kept running.
+Andre renewed 2026-10-09; the hold lifted at 02:18 UTC and Route 53 answered `3.136.48.97` at once; local caches (macOS, Chrome)
+held the NXDOMAIN for a while after. **Lessons:** keep Auto-renew on in Route 53 → Registered domains; AWS billing/domain notices
+did not reach the Gmail account, so check which address the AWS account uses. Diagnose an NXDOMAIN with the registry first
+(`https://rdap.verisign.com/com/v1/domain/masqueradeimage.com` → `status`), then Google DNS
+(`https://dns.google/resolve?name=masqueradeimage.com&type=A`). If certbot renewal fell inside the outage, `sudo certbot renew`.
+
+**Next, in order:**
+1. **UI simplification** — its own conversation, starting from a control inventory (`docs/refactor/UI_SIMPLIFICATION_NOTE.md`).
+   Fold in: Keep mode with nothing left on the canvas still shows Apply (the server now refuses it, the UI should not offer it);
+   the re-apply `isProcessing` wart below.
+2. **Run download falls back to raw frames** for a run made on masked frames when `spokes/template_mask/<job>/` is empty
+   (`routes.ts`, the run-download base-frame listing). Pre-existing, narrow (raw sweeps at 6 h, masked at 24 h), but the same
+   fail-open class as this round: a masked-input run should ship masked frames or none. Small round.
+3. 7B-1 — delete `POST /api/videos/:jobId/process` on the `[DEADROUTE-HIT]` evidence (minus the three `curl` hits above).
+4. Auto-mask 2C (B4 template library, B6 temporal support).
+5. Dead code: `processBatchesInParallel`, `maskWorker.ts`, `createTransformedMask`, `convertToRgbaBuffer`.
+6. `ANTHROPIC_API_KEY` still unset on prod (backlog 25). Build-the-mask-once is **not** needed: the gate passed by ~4×.
+
+**Build record (2026-10-04):**
 
 **Two commits, one deploy, one `git revert` each.** Docs: `docs/refactor/OUTPUT_ROUND2_{KICKOFF,RECON,SIGNOFF,REPORT}.md`.
 
